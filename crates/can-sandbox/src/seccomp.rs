@@ -1,0 +1,689 @@
+//! Seccomp BPF filter generation and application.
+//!
+//! Generates classic BPF programs from [`SeccompProfile`] definitions and
+//! applies them via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
+//!
+//! Design:
+//! - **Deny-list model**: default action is ALLOW; listed syscalls are blocked.
+//! - **Architecture validation**: the filter rejects syscalls from unexpected
+//!   architectures (prevents bypasses via x32 ABI on x86_64).
+//! - **No external dependencies**: raw BPF bytecode assembled from `libc`
+//!   primitives only.
+//!
+//! The filter structure (in BPF execution order):
+//! ```text
+//! [0]  load seccomp_data.arch
+//! [1]  if arch != AUDIT_ARCH_X86_64 → KILL_PROCESS
+//! [2]  load seccomp_data.nr (syscall number)
+//! [3]  if nr == denied_syscall_0 → action (KILL_PROCESS or ERRNO)
+//! [4]  if nr == denied_syscall_1 → action
+//! ...
+//! [N]  return ALLOW
+//! ```
+
+use can_policy::SeccompProfile;
+
+/// Errors from seccomp filter operations.
+#[derive(Debug, thiserror::Error)]
+pub enum SeccompError {
+    #[error("unknown syscall in profile: {0}")]
+    UnknownSyscall(String),
+
+    #[error("empty filter (no syscalls to deny)")]
+    EmptyFilter,
+
+    #[error("prctl(PR_SET_NO_NEW_PRIVS) failed: {0}")]
+    NoNewPrivs(std::io::Error),
+
+    #[error("prctl(PR_SET_SECCOMP) failed: {0}")]
+    SetSeccomp(std::io::Error),
+
+    #[error("seccomp not supported on this architecture")]
+    UnsupportedArch,
+}
+
+/// What action to take when a denied syscall is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyAction {
+    /// Kill the entire process (SECCOMP_RET_KILL_PROCESS).
+    KillProcess,
+
+    /// Return EPERM to the caller (SECCOMP_RET_ERRNO | EPERM).
+    /// More graceful — allows the process to handle the error.
+    Errno,
+
+    /// Log the syscall but allow it to proceed (SECCOMP_RET_LOG).
+    /// Used in monitor mode to observe what would be blocked without
+    /// actually blocking it. Logged syscalls appear in kernel audit log
+    /// (dmesg / journalctl).
+    Log,
+}
+
+// --- Architecture constants ---
+// AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
+// = 62 | 0x80000000 | 0x40000000 = 0xC000_003E
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E;
+
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7;
+
+// Offset of `arch` field in `struct seccomp_data` (bytes).
+const OFFSET_ARCH: u32 = 4;
+// Offset of `nr` field in `struct seccomp_data` (bytes).
+const OFFSET_NR: u32 = 0;
+
+// SECCOMP_RET_LOG: allow the syscall but log it via audit.
+// Available since Linux 4.14. Not yet exposed by all versions of the libc crate.
+const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+
+/// Build a BPF filter program from a seccomp profile.
+///
+/// Returns the raw `sock_filter` instructions. The filter uses a deny-list
+/// approach: syscalls in `deny_syscalls` trigger `action`, everything else
+/// is allowed.
+pub fn build_filter(
+    profile: &SeccompProfile,
+    action: DenyAction,
+) -> Result<Vec<libc::sock_filter>, SeccompError> {
+    let denied_nrs = resolve_syscall_numbers(&profile.deny_syscalls)?;
+
+    if denied_nrs.is_empty() {
+        return Err(SeccompError::EmptyFilter);
+    }
+
+    let deny_ret = match action {
+        DenyAction::KillProcess => libc::SECCOMP_RET_KILL_PROCESS,
+        DenyAction::Errno => libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+        DenyAction::Log => SECCOMP_RET_LOG,
+    };
+
+    let mut filter: Vec<libc::sock_filter> = vec![
+        // [0] Load architecture: BPF_LD | BPF_W | BPF_ABS, offset = arch
+        bpf_stmt(
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            OFFSET_ARCH,
+        ),
+        // [1] Validate architecture: if arch == native → skip kill, else fall through.
+        bpf_jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            AUDIT_ARCH_NATIVE,
+            1, // jt: skip over the next kill instruction
+            0, // jf: fall through to kill
+        ),
+        // [2] Architecture mismatch → kill
+        bpf_stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_KILL_PROCESS,
+        ),
+        // [3] Load syscall number: BPF_LD | BPF_W | BPF_ABS, offset = nr
+        bpf_stmt(
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            OFFSET_NR,
+        ),
+    ];
+
+    // [4..N-1] For each denied syscall, emit a conditional jump.
+    // If nr == denied → jump to deny return.
+    // If no match → fall through to next check, or to ALLOW at the end.
+    //
+    // Layout after checks: [ALLOW] [DENY]
+    // So for check at index i with `remaining = n-1-i` checks after it:
+    //   jt = remaining + 1 (skip remaining checks + ALLOW → land on DENY)
+    //   jf = 0 (fall through to next check, or to ALLOW if last)
+    for (i, &nr) in denied_nrs.iter().enumerate() {
+        let remaining = (denied_nrs.len() - 1 - i) as u8;
+        filter.push(bpf_jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            nr as u32,
+            remaining + 1, // jt: skip remaining checks + ALLOW → DENY
+            0,             // jf: fall through to next check or ALLOW
+        ));
+    }
+
+    // [N] Default: allow (reached when no check matched).
+    filter.push(bpf_stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        libc::SECCOMP_RET_ALLOW,
+    ));
+
+    // [N+1] Deny action (reached when a check matched and jumped here).
+    filter.push(bpf_stmt((libc::BPF_RET | libc::BPF_K) as u16, deny_ret));
+
+    Ok(filter)
+}
+
+/// Apply a BPF filter to the current process.
+///
+/// This sets `PR_SET_NO_NEW_PRIVS` (required for unprivileged seccomp)
+/// and then installs the filter via `PR_SET_SECCOMP`.
+///
+/// # Safety
+///
+/// Must be called after all setup is complete and right before `execvp`.
+/// Once applied, the filter cannot be removed.
+pub fn apply_filter(filter: &[libc::sock_filter]) -> Result<(), SeccompError> {
+    // PR_SET_NO_NEW_PRIVS is required for unprivileged SECCOMP_MODE_FILTER.
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(SeccompError::NoNewPrivs(std::io::Error::last_os_error()));
+    }
+
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut libc::sock_filter,
+    };
+
+    let ret = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &prog as *const libc::sock_fprog,
+        )
+    };
+    if ret != 0 {
+        return Err(SeccompError::SetSeccomp(std::io::Error::last_os_error()));
+    }
+
+    Ok(())
+}
+
+/// Load a profile by name and apply its seccomp filter.
+///
+/// Convenience function that combines profile lookup, filter generation,
+/// and application.
+pub fn load_and_apply(profile_name: &str, action: DenyAction) -> Result<(), SeccompError> {
+    let profile = SeccompProfile::builtin(profile_name)
+        .ok_or_else(|| SeccompError::UnknownSyscall(format!("unknown profile: {profile_name}")))?;
+
+    if profile.deny_syscalls.is_empty() {
+        tracing::debug!(
+            profile = profile_name,
+            "profile has no denied syscalls, skipping seccomp"
+        );
+        return Ok(());
+    }
+
+    let filter = build_filter(&profile, action)?;
+    tracing::info!(
+        profile = profile_name,
+        instructions = filter.len(),
+        denied_syscalls = profile.deny_syscalls.len(),
+        "applying seccomp filter"
+    );
+
+    apply_filter(&filter)
+}
+
+/// Check whether the kernel supports seccomp filter mode.
+pub fn is_supported() -> bool {
+    // PR_GET_SECCOMP returns 0 if seccomp is disabled, 2 if filter mode,
+    // or -1/EINVAL if not supported at all.
+    let ret = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+    // ret >= 0 means seccomp is available (0 = disabled, 2 = filter active).
+    // ret == -1 with EINVAL means kernel doesn't support it.
+    ret >= 0
+}
+
+// --- BPF instruction helpers ---
+
+fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code, jt, jf, k }
+}
+
+// --- Syscall name to number mapping ---
+
+/// Resolve a list of syscall names to their numeric values.
+///
+/// Returns an error if any name is unrecognized.
+fn resolve_syscall_numbers(names: &[String]) -> Result<Vec<i64>, SeccompError> {
+    names.iter().map(|name| syscall_number(name)).collect()
+}
+
+/// Map a syscall name to its number on the current architecture.
+///
+/// This uses `libc::SYS_*` constants which are architecture-specific.
+fn syscall_number(name: &str) -> Result<i64, SeccompError> {
+    let nr = match name {
+        // Process lifecycle
+        "fork" => libc::SYS_fork,
+        "vfork" => libc::SYS_vfork,
+        "clone" => libc::SYS_clone,
+        "clone3" => libc::SYS_clone3,
+        "execve" => libc::SYS_execve,
+        "execveat" => libc::SYS_execveat,
+        "kill" => libc::SYS_kill,
+        "tkill" => libc::SYS_tkill,
+        "tgkill" => libc::SYS_tgkill,
+        "exit" => libc::SYS_exit,
+        "exit_group" => libc::SYS_exit_group,
+        "wait4" => libc::SYS_wait4,
+        "waitid" => libc::SYS_waitid,
+
+        // Process control
+        "ptrace" => libc::SYS_ptrace,
+        "prctl" => libc::SYS_prctl,
+        "seccomp" => libc::SYS_seccomp,
+        "personality" => libc::SYS_personality,
+
+        // File I/O
+        "open" => libc::SYS_open,
+        "openat" => libc::SYS_openat,
+        "openat2" => libc::SYS_openat2,
+        "creat" => libc::SYS_creat,
+        "close" => libc::SYS_close,
+        "read" => libc::SYS_read,
+        "write" => libc::SYS_write,
+        "readv" => libc::SYS_readv,
+        "writev" => libc::SYS_writev,
+        "pread64" => libc::SYS_pread64,
+        "pwrite64" => libc::SYS_pwrite64,
+        "lseek" => libc::SYS_lseek,
+        "dup" => libc::SYS_dup,
+        "dup2" => libc::SYS_dup2,
+        "dup3" => libc::SYS_dup3,
+        "fcntl" => libc::SYS_fcntl,
+        "flock" => libc::SYS_flock,
+        "fsync" => libc::SYS_fsync,
+        "fdatasync" => libc::SYS_fdatasync,
+        "truncate" => libc::SYS_truncate,
+        "ftruncate" => libc::SYS_ftruncate,
+
+        // File metadata
+        "stat" => libc::SYS_stat,
+        "fstat" => libc::SYS_fstat,
+        "lstat" => libc::SYS_lstat,
+        "newfstatat" => libc::SYS_newfstatat,
+        "access" => libc::SYS_access,
+        "faccessat" => libc::SYS_faccessat,
+        "faccessat2" => libc::SYS_faccessat2,
+        "chmod" => libc::SYS_chmod,
+        "fchmod" => libc::SYS_fchmod,
+        "fchmodat" => libc::SYS_fchmodat,
+        "chown" => libc::SYS_chown,
+        "fchown" => libc::SYS_fchown,
+        "lchown" => libc::SYS_lchown,
+        "fchownat" => libc::SYS_fchownat,
+
+        // Directory operations
+        "mkdir" => libc::SYS_mkdir,
+        "mkdirat" => libc::SYS_mkdirat,
+        "rmdir" => libc::SYS_rmdir,
+        "rename" => libc::SYS_rename,
+        "renameat" => libc::SYS_renameat,
+        "renameat2" => libc::SYS_renameat2,
+        "link" => libc::SYS_link,
+        "linkat" => libc::SYS_linkat,
+        "unlink" => libc::SYS_unlink,
+        "unlinkat" => libc::SYS_unlinkat,
+        "symlink" => libc::SYS_symlink,
+        "symlinkat" => libc::SYS_symlinkat,
+        "readlink" => libc::SYS_readlink,
+        "readlinkat" => libc::SYS_readlinkat,
+        "getdents" => libc::SYS_getdents,
+        "getdents64" => libc::SYS_getdents64,
+
+        // Memory
+        "mmap" => libc::SYS_mmap,
+        "mprotect" => libc::SYS_mprotect,
+        "munmap" => libc::SYS_munmap,
+        "mremap" => libc::SYS_mremap,
+        "madvise" => libc::SYS_madvise,
+        "brk" => libc::SYS_brk,
+        "sbrk" => {
+            return Err(SeccompError::UnknownSyscall(
+                "sbrk (not a syscall)".to_string(),
+            ));
+        }
+        "mlock" => libc::SYS_mlock,
+        "mlock2" => libc::SYS_mlock2,
+        "munlock" => libc::SYS_munlock,
+        "mlockall" => libc::SYS_mlockall,
+        "munlockall" => libc::SYS_munlockall,
+
+        // Network
+        "socket" => libc::SYS_socket,
+        "connect" => libc::SYS_connect,
+        "accept" => libc::SYS_accept,
+        "accept4" => libc::SYS_accept4,
+        "bind" => libc::SYS_bind,
+        "listen" => libc::SYS_listen,
+        "sendto" => libc::SYS_sendto,
+        "recvfrom" => libc::SYS_recvfrom,
+        "sendmsg" => libc::SYS_sendmsg,
+        "recvmsg" => libc::SYS_recvmsg,
+        "shutdown" => libc::SYS_shutdown,
+        "getsockopt" => libc::SYS_getsockopt,
+        "setsockopt" => libc::SYS_setsockopt,
+        "getsockname" => libc::SYS_getsockname,
+        "getpeername" => libc::SYS_getpeername,
+        "socketpair" => libc::SYS_socketpair,
+
+        // Signals
+        "rt_sigaction" => libc::SYS_rt_sigaction,
+        "rt_sigprocmask" => libc::SYS_rt_sigprocmask,
+        "rt_sigreturn" => libc::SYS_rt_sigreturn,
+        "sigaltstack" => libc::SYS_sigaltstack,
+
+        // Time
+        "nanosleep" => libc::SYS_nanosleep,
+        "clock_nanosleep" => libc::SYS_clock_nanosleep,
+        "clock_gettime" => libc::SYS_clock_gettime,
+        "clock_getres" => libc::SYS_clock_getres,
+        "gettimeofday" => libc::SYS_gettimeofday,
+        "settimeofday" => libc::SYS_settimeofday,
+
+        // Polling / async
+        "poll" => libc::SYS_poll,
+        "ppoll" => libc::SYS_ppoll,
+        "select" => libc::SYS_select,
+        "pselect6" => libc::SYS_pselect6,
+        "epoll_create" => libc::SYS_epoll_create,
+        "epoll_create1" => libc::SYS_epoll_create1,
+        "epoll_ctl" => libc::SYS_epoll_ctl,
+        "epoll_wait" => libc::SYS_epoll_wait,
+        "epoll_pwait" => libc::SYS_epoll_pwait,
+        "eventfd" => libc::SYS_eventfd,
+        "eventfd2" => libc::SYS_eventfd2,
+        "timerfd_create" => libc::SYS_timerfd_create,
+        "timerfd_settime" => libc::SYS_timerfd_settime,
+        "timerfd_gettime" => libc::SYS_timerfd_gettime,
+
+        // IPC
+        "pipe" => libc::SYS_pipe,
+        "pipe2" => libc::SYS_pipe2,
+        "shmget" => libc::SYS_shmget,
+        "shmat" => libc::SYS_shmat,
+        "shmctl" => libc::SYS_shmctl,
+        "shmdt" => libc::SYS_shmdt,
+        "semget" => libc::SYS_semget,
+        "semop" => libc::SYS_semop,
+        "semctl" => libc::SYS_semctl,
+        "msgget" => libc::SYS_msgget,
+        "msgsnd" => libc::SYS_msgsnd,
+        "msgrcv" => libc::SYS_msgrcv,
+        "msgctl" => libc::SYS_msgctl,
+
+        // Process info
+        "getpid" => libc::SYS_getpid,
+        "getppid" => libc::SYS_getppid,
+        "getuid" => libc::SYS_getuid,
+        "getgid" => libc::SYS_getgid,
+        "geteuid" => libc::SYS_geteuid,
+        "getegid" => libc::SYS_getegid,
+        "gettid" => libc::SYS_gettid,
+        "getpgid" => libc::SYS_getpgid,
+        "setpgid" => libc::SYS_setpgid,
+        "setsid" => libc::SYS_setsid,
+        "getgroups" => libc::SYS_getgroups,
+        "setgroups" => libc::SYS_setgroups,
+        "setuid" => libc::SYS_setuid,
+        "setgid" => libc::SYS_setgid,
+        "setreuid" => libc::SYS_setreuid,
+        "setregid" => libc::SYS_setregid,
+        "setresuid" => libc::SYS_setresuid,
+        "setresgid" => libc::SYS_setresgid,
+
+        // Filesystem (privileged)
+        "mount" => libc::SYS_mount,
+        "umount2" => libc::SYS_umount2,
+        "pivot_root" => libc::SYS_pivot_root,
+        "chroot" => libc::SYS_chroot,
+        "swapon" => libc::SYS_swapon,
+        "swapoff" => libc::SYS_swapoff,
+
+        // Namespace / container
+        "unshare" => libc::SYS_unshare,
+        "setns" => libc::SYS_setns,
+
+        // System
+        "reboot" => libc::SYS_reboot,
+        "kexec_load" => libc::SYS_kexec_load,
+        "init_module" => libc::SYS_init_module,
+        "finit_module" => libc::SYS_finit_module,
+        "delete_module" => libc::SYS_delete_module,
+        "acct" => libc::SYS_acct,
+        "syslog" => libc::SYS_syslog,
+
+        // I/O
+        "ioctl" => libc::SYS_ioctl,
+        "io_setup" => libc::SYS_io_setup,
+        "io_submit" => libc::SYS_io_submit,
+        "io_getevents" => libc::SYS_io_getevents,
+        "io_destroy" => libc::SYS_io_destroy,
+        "io_uring_setup" => libc::SYS_io_uring_setup,
+        "io_uring_enter" => libc::SYS_io_uring_enter,
+        "io_uring_register" => libc::SYS_io_uring_register,
+
+        // Misc
+        "futex" => libc::SYS_futex,
+        "set_tid_address" => libc::SYS_set_tid_address,
+        "set_robust_list" => libc::SYS_set_robust_list,
+        "get_robust_list" => libc::SYS_get_robust_list,
+        "sched_yield" => libc::SYS_sched_yield,
+        "sched_getaffinity" => libc::SYS_sched_getaffinity,
+        "sched_setaffinity" => libc::SYS_sched_setaffinity,
+        "getcwd" => libc::SYS_getcwd,
+        "chdir" => libc::SYS_chdir,
+        "fchdir" => libc::SYS_fchdir,
+        "umask" => libc::SYS_umask,
+        "uname" => libc::SYS_uname,
+        "sysinfo" => libc::SYS_sysinfo,
+        "getrandom" => libc::SYS_getrandom,
+        "memfd_create" => libc::SYS_memfd_create,
+        "copy_file_range" => libc::SYS_copy_file_range,
+        "sendfile" => libc::SYS_sendfile,
+        "splice" => libc::SYS_splice,
+        "tee" => libc::SYS_tee,
+
+        // Arch-specific
+        "arch_prctl" => libc::SYS_arch_prctl,
+
+        _ => return Err(SeccompError::UnknownSyscall(name.to_string())),
+    };
+    Ok(nr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_filter_for_generic_profile() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let n_denied = profile.deny_syscalls.len();
+        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+
+        // Structure: 3 (arch load+check+kill) + 1 (load nr) + N (deny checks) + 1 (deny ret) + 1 (allow ret)
+        let expected_len = 3 + 1 + n_denied + 1 + 1;
+        assert_eq!(filter.len(), expected_len, "unexpected filter length");
+        assert!(
+            n_denied >= 14,
+            "generic profile should deny at least the always-deny set"
+        );
+    }
+
+    #[test]
+    fn build_filter_for_python_profile() {
+        let profile = SeccompProfile::builtin("python").unwrap();
+        let n_denied = profile.deny_syscalls.len();
+        let filter = build_filter(&profile, DenyAction::Errno).unwrap();
+
+        let expected_len = 3 + 1 + n_denied + 1 + 1;
+        assert_eq!(filter.len(), expected_len);
+        // Python should deny more than generic (adds ptrace, io_uring, etc.)
+        let generic = SeccompProfile::builtin("generic").unwrap();
+        assert!(
+            n_denied > generic.deny_syscalls.len(),
+            "python should be stricter than generic"
+        );
+    }
+
+    #[test]
+    fn empty_deny_list_returns_error() {
+        let profile = SeccompProfile {
+            name: "empty".to_string(),
+            description: "no denies".to_string(),
+            allow_syscalls: vec![],
+            deny_syscalls: vec![],
+        };
+        let result = build_filter(&profile, DenyAction::KillProcess);
+        assert!(matches!(result, Err(SeccompError::EmptyFilter)));
+    }
+
+    #[test]
+    fn unknown_syscall_returns_error() {
+        let profile = SeccompProfile {
+            name: "bad".to_string(),
+            description: "has unknown".to_string(),
+            allow_syscalls: vec![],
+            deny_syscalls: vec!["totally_fake_syscall".to_string()],
+        };
+        let result = build_filter(&profile, DenyAction::KillProcess);
+        assert!(matches!(result, Err(SeccompError::UnknownSyscall(_))));
+    }
+
+    #[test]
+    fn filter_starts_with_arch_check() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+
+        // First instruction: load arch
+        assert_eq!(
+            filter[0].code,
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16
+        );
+        assert_eq!(filter[0].k, OFFSET_ARCH);
+
+        // Second: compare arch
+        assert_eq!(
+            filter[1].code,
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
+        );
+        assert_eq!(filter[1].k, AUDIT_ARCH_NATIVE);
+    }
+
+    #[test]
+    fn filter_ends_with_deny_action() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+
+        // Layout: [...checks...] [ALLOW] [DENY]
+        // Last instruction is DENY, second-to-last is ALLOW.
+        let last = filter.last().unwrap();
+        assert_eq!(last.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(last.k, libc::SECCOMP_RET_KILL_PROCESS);
+
+        let allow = &filter[filter.len() - 2];
+        assert_eq!(allow.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(allow.k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn deny_action_kill_uses_correct_return() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+
+        // Last instruction is the deny action.
+        let deny = filter.last().unwrap();
+        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(deny.k, libc::SECCOMP_RET_KILL_PROCESS);
+    }
+
+    #[test]
+    fn deny_action_errno_uses_eperm() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter = build_filter(&profile, DenyAction::Errno).unwrap();
+
+        let deny = filter.last().unwrap();
+        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(deny.k, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
+    }
+
+    #[test]
+    fn deny_action_log_uses_ret_log() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter = build_filter(&profile, DenyAction::Log).unwrap();
+
+        let deny = filter.last().unwrap();
+        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(deny.k, super::SECCOMP_RET_LOG);
+    }
+
+    #[test]
+    fn syscall_number_known_syscalls() {
+        // Spot-check a few well-known syscall numbers on x86_64.
+        assert_eq!(syscall_number("read").unwrap(), 0);
+        assert_eq!(syscall_number("write").unwrap(), 1);
+        assert_eq!(syscall_number("execve").unwrap(), 59);
+        assert_eq!(syscall_number("reboot").unwrap(), 169);
+    }
+
+    #[test]
+    fn syscall_number_rejects_unknown() {
+        assert!(syscall_number("not_a_real_syscall").is_err());
+    }
+
+    #[test]
+    fn all_builtin_profiles_compile() {
+        for name in SeccompProfile::builtin_names() {
+            let profile = SeccompProfile::builtin(name).unwrap();
+            if !profile.deny_syscalls.is_empty() {
+                let filter = build_filter(&profile, DenyAction::KillProcess);
+                assert!(
+                    filter.is_ok(),
+                    "profile {name} failed to compile: {:?}",
+                    filter.err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_supported_returns_bool() {
+        // On any Linux system this should return true.
+        // We just verify it doesn't panic.
+        let _ = is_supported();
+    }
+
+    #[test]
+    fn jump_offsets_are_correct() {
+        // Build a minimal filter with 3 denied syscalls and verify
+        // the jump target offsets.
+        let profile = SeccompProfile {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            allow_syscalls: vec![],
+            deny_syscalls: vec![
+                "reboot".to_string(),
+                "mount".to_string(),
+                "ptrace".to_string(),
+            ],
+        };
+        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+
+        // Instructions: [load_arch, cmp_arch, kill_arch, load_nr, cmp0, cmp1, cmp2, allow_ret, deny_ret]
+        // Indices:       0          1         2          3        4     5     6     7          8
+
+        // cmp0 (index 4): if match, skip 2 remaining + 1 (allow) → land on deny_ret (index 8)
+        assert_eq!(filter[4].jt, 3); // skip cmp1, cmp2, allow → deny_ret
+        assert_eq!(filter[4].jf, 0);
+
+        // cmp1 (index 5): if match, skip 1 remaining + 1 (allow) → land on deny_ret
+        assert_eq!(filter[5].jt, 2);
+        assert_eq!(filter[5].jf, 0);
+
+        // cmp2 (index 6): if match, skip 0 remaining + 1 (allow) → deny_ret
+        assert_eq!(filter[6].jt, 1);
+        assert_eq!(filter[6].jf, 0); // fall through to allow_ret
+    }
+}

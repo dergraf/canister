@@ -1,4 +1,8 @@
+use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
+
+use ipnet::IpNet;
 
 use crate::config::{FilesystemConfig, NetworkConfig};
 
@@ -54,18 +58,29 @@ pub fn check_domain(domain: &str, config: &NetworkConfig) -> AccessDecision {
     AccessDecision::Deny
 }
 
-/// Check whether an IP address (as string) is allowed by the network config.
+/// Check whether an IP address is allowed by the network config.
 ///
-/// Currently supports exact match only. CIDR matching comes in Phase 3.
+/// Supports both exact IP matches and CIDR notation (e.g., `10.0.0.0/8`).
 pub fn check_ip(ip: &str, config: &NetworkConfig) -> AccessDecision {
     if !config.deny_all {
         return AccessDecision::Allow;
     }
 
+    let addr: IpAddr = match IpAddr::from_str(ip) {
+        Ok(a) => a,
+        Err(_) => return AccessDecision::Deny,
+    };
+
     for allowed in &config.allow_ips {
-        // TODO(Phase 3): proper CIDR matching
-        if ip == allowed {
-            return AccessDecision::Allow;
+        // Try parsing as a CIDR network first, then as an exact IP.
+        if let Ok(network) = IpNet::from_str(allowed) {
+            if network.contains(&addr) {
+                return AccessDecision::Allow;
+            }
+        } else if let Ok(exact) = IpAddr::from_str(allowed) {
+            if addr == exact {
+                return AccessDecision::Allow;
+            }
         }
     }
 
@@ -148,5 +163,40 @@ mod tests {
         };
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("192.168.1.1", &config), AccessDecision::Deny);
+    }
+
+    #[test]
+    fn ip_cidr_match() {
+        let config = NetworkConfig {
+            allow_domains: vec![],
+            allow_ips: vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()],
+            deny_all: true,
+        };
+        assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
+        assert_eq!(check_ip("10.255.255.255", &config), AccessDecision::Allow);
+        assert_eq!(check_ip("192.168.1.42", &config), AccessDecision::Allow);
+        assert_eq!(check_ip("192.168.2.1", &config), AccessDecision::Deny);
+        assert_eq!(check_ip("172.16.0.1", &config), AccessDecision::Deny);
+    }
+
+    #[test]
+    fn ip_invalid_input_denied() {
+        let config = NetworkConfig {
+            allow_domains: vec![],
+            allow_ips: vec!["10.0.0.0/8".to_string()],
+            deny_all: true,
+        };
+        assert_eq!(check_ip("not-an-ip", &config), AccessDecision::Deny);
+    }
+
+    #[test]
+    fn ip_ipv6_cidr() {
+        let config = NetworkConfig {
+            allow_domains: vec![],
+            allow_ips: vec!["fd00::/8".to_string()],
+            deny_all: true,
+        };
+        assert_eq!(check_ip("fd00::1", &config), AccessDecision::Allow);
+        assert_eq!(check_ip("2001:db8::1", &config), AccessDecision::Deny);
     }
 }
