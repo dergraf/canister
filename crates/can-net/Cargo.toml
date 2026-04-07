@@ -11,3 +11,5 @@ can-policy.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 nix.workspace = true
+ipnet.workspace = true
+libc.workspace = true
