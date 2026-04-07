@@ -1,0 +1,101 @@
+# Canister sandbox AppArmor profile
+#
+# This profile grants the `can` binary permission to use mount, pivot_root,
+# and capabilities inside unprivileged user namespaces. Without this profile,
+# Ubuntu 24.04+ systems with kernel.apparmor_restrict_unprivileged_userns=1
+# will block Canister's filesystem isolation.
+#
+# The profile follows the same pattern as bubblewrap (bwrap):
+# - The main binary gets mount/pivot_root/capability permissions
+# - Child processes (sandboxed commands) have capabilities denied
+# - Children are stacked against a restricted sub-profile
+#
+# Installation:
+#   can setup          (auto-detects binary path, requires sudo)
+#
+# Manual installation:
+#   1. Copy this to /etc/apparmor.d/canister
+#   2. Edit the profile path to match your `can` binary location
+#   3. sudo apparmor_parser -r /etc/apparmor.d/canister
+#
+# To verify:
+#   can check
+#
+# To uninstall:
+#   can setup --remove
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# NOTE: The path below must match where `can` is installed.
+# `can setup` will generate this with the correct path automatically.
+profile canister __CANISTER_BIN_PATH__ flags=(attach_disconnected) {
+  # Grant capabilities needed for namespace + filesystem setup
+  allow capability,
+
+  # File access (read/write/link/lock/mmap)
+  allow file rwlkm /{**,},
+
+  # Networking (for slirp4netns, DNS proxy)
+  allow network,
+  allow unix,
+
+  # Signals (parent-child coordination)
+  allow signal,
+
+  # Process tracing (seccomp user_notif, strace-like debugging)
+  allow ptrace,
+
+  # User namespace creation
+  allow userns,
+
+  # Mount operations (tmpfs, bind mounts, proc)
+  allow mount,
+  allow umount,
+
+  # pivot_root for filesystem isolation
+  allow pivot_root,
+
+  # DBus (not needed, but harmless to allow)
+  allow dbus,
+
+  # Message queues and io_uring (BEAM VM uses these)
+  allow mqueue,
+  allow io_uring,
+
+  # Children executed inside the sandbox get stacked against the
+  # restricted sub-profile, which strips capabilities.
+  allow px /** -> canister//&canister_sandboxed,
+
+  # Site-specific additions and overrides.
+  include if exists <local/canister>
+}
+
+# Restricted sub-profile for sandboxed child processes.
+# Children can do normal file/network/signal operations but
+# capabilities are denied (they run as unprivileged inside the namespace).
+profile canister_sandboxed flags=(attach_disconnected) {
+  # Normal operations allowed
+  allow file rwlkm /{**,},
+  allow network,
+  allow unix,
+  allow signal,
+  allow ptrace,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow dbus,
+  allow mqueue,
+  allow io_uring,
+
+  # Stack children recursively
+  allow pix /** -> &canister_sandboxed,
+
+  # Deny capabilities for sandboxed processes
+  audit deny capability,
+
+  # Site-specific additions and overrides.
+  include if exists <local/canister_sandboxed>
+}

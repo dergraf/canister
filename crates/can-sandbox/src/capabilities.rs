@@ -1,7 +1,9 @@
 use std::path::Path;
 
+use crate::setup;
+
 /// Detected kernel capabilities for sandboxing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KernelCapabilities {
     /// Can create unprivileged user namespaces.
     pub user_namespaces: bool,
@@ -24,6 +26,14 @@ pub struct KernelCapabilities {
     /// Seccomp BPF is available.
     pub seccomp_bpf: bool,
 
+    /// AppArmor restricts unprivileged user namespaces.
+    /// When true, mount operations inside user namespaces are blocked
+    /// unless the canister AppArmor profile is installed.
+    pub apparmor_restricts_userns: bool,
+
+    /// Whether the canister AppArmor profile is installed and active.
+    pub canister_profile_installed: bool,
+
     /// Kernel version string.
     pub kernel_version: String,
 }
@@ -31,14 +41,26 @@ pub struct KernelCapabilities {
 impl KernelCapabilities {
     /// Detect available kernel capabilities.
     pub fn detect() -> Self {
+        let apparmor_restricts = setup::apparmor_restricts_userns();
+        let profile_status = setup::detect_profile_status();
+        let profile_installed = matches!(
+            profile_status,
+            setup::ProfileStatus::NotNeeded | setup::ProfileStatus::Installed { .. }
+        );
+
+        // Mount namespaces work if AppArmor doesn't restrict, or if our profile is installed.
+        let mount_ns = !apparmor_restricts || profile_installed;
+
         Self {
             user_namespaces: check_user_namespaces(),
             pid_namespaces: check_pid_namespaces(),
-            mount_namespaces: true, // available if user ns works
+            mount_namespaces: mount_ns,
             network_namespaces: check_network_namespaces(),
             cgroups_v2: check_cgroups_v2(),
             overlayfs: check_overlayfs(),
             seccomp_bpf: check_seccomp(),
+            apparmor_restricts_userns: apparmor_restricts,
+            canister_profile_installed: profile_installed,
             kernel_version: get_kernel_version(),
         }
     }
@@ -48,33 +70,33 @@ impl KernelCapabilities {
         let mut lines = Vec::new();
         lines.push(format!("Kernel: {}", self.kernel_version));
         lines.push(format!(
-            "  User namespaces:    {}",
+            "  User namespaces:   {}",
             status(self.user_namespaces)
         ));
         lines.push(format!(
-            "  PID namespaces:     {}",
+            "  PID namespaces:    {}",
             status(self.pid_namespaces)
         ));
-        lines.push(format!(
-            "  Mount namespaces:   {}",
-            status(self.mount_namespaces)
-        ));
+        lines.push(format!("  Mount namespaces:  {}", fmt_mount_ns(self)));
         lines.push(format!(
             "  Network namespaces: {}",
             status(self.network_namespaces)
         ));
-        lines.push(format!("  Cgroups v2:         {}", status(self.cgroups_v2)));
-        lines.push(format!("  OverlayFS:          {}", status(self.overlayfs)));
-        lines.push(format!(
-            "  Seccomp BPF:        {}",
-            status(self.seccomp_bpf)
-        ));
+        lines.push(format!("  Cgroups v2:        {}", status(self.cgroups_v2)));
+        lines.push(format!("  OverlayFS:         {}", status(self.overlayfs)));
+        lines.push(format!("  Seccomp BPF:       {}", status(self.seccomp_bpf)));
+
         lines.join("\n")
     }
 
     /// Returns true if the minimum requirements for sandboxing are met.
     pub fn meets_minimum(&self) -> bool {
         self.user_namespaces && self.pid_namespaces
+    }
+
+    /// Returns true if full filesystem isolation (pivot_root) can be used.
+    pub fn can_pivot_root(&self) -> bool {
+        self.mount_namespaces
     }
 }
 
@@ -86,13 +108,20 @@ fn status(available: bool) -> &'static str {
     }
 }
 
+fn fmt_mount_ns(caps: &KernelCapabilities) -> &'static str {
+    if caps.apparmor_restricts_userns && !caps.canister_profile_installed {
+        "BLOCKED by AppArmor (run `sudo can setup` to fix)"
+    } else if caps.mount_namespaces {
+        "available"
+    } else {
+        "NOT available"
+    }
+}
+
 fn check_user_namespaces() -> bool {
-    // Check if unprivileged user namespaces are enabled.
     if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
         return content.trim() == "1";
     }
-    // If the file doesn't exist, user namespaces may still be available
-    // (newer kernels don't have this sysctl). Check by trying to read max_user_namespaces.
     if let Ok(content) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
         if let Ok(max) = content.trim().parse::<u64>() {
             return max > 0;
@@ -106,7 +135,6 @@ fn check_pid_namespaces() -> bool {
 }
 
 fn check_network_namespaces() -> bool {
-    // Network namespaces require user namespace support.
     check_user_namespaces()
 }
 
@@ -125,7 +153,6 @@ fn check_seccomp() -> bool {
     if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/seccomp/actions_avail") {
         return content.contains("log");
     }
-    // Fallback: check /proc/self/status for Seccomp field
     if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
         return content.contains("Seccomp:");
     }
