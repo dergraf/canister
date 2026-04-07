@@ -1,0 +1,577 @@
+//! Filesystem isolation for the sandbox.
+//!
+//! Creates an ephemeral root filesystem using tmpfs and bind mounts.
+//! The sandboxed process gets a minimal filesystem with only whitelisted
+//! paths visible. All writes go to tmpfs and are discarded on exit.
+//!
+//! # Approach
+//!
+//! Rather than using overlayfs directly (which has complex permission
+//! requirements even in user namespaces), we use a simpler and more
+//! reliable approach:
+//!
+//! 1. Mount a tmpfs as the new root
+//! 2. Create a minimal directory skeleton (`/bin`, `/lib`, `/usr`, `/tmp`, etc.)
+//! 3. Bind-mount whitelisted host paths read-only into the new root
+//! 4. Mount a fresh `/proc` (for PID namespace)
+//! 5. `pivot_root` to swap to the new root
+//! 6. Unmount the old root
+//!
+//! This gives us:
+//! - **Ephemeral writes**: anything written to tmpfs vanishes on exit
+//! - **Minimal surface**: only whitelisted paths are visible
+//! - **No root required**: works in unprivileged user namespaces
+
+use std::path::{Path, PathBuf};
+
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::unistd::pivot_root;
+
+use can_policy::config::FilesystemConfig;
+
+/// Errors from filesystem setup.
+#[derive(Debug, thiserror::Error)]
+pub enum OverlayError {
+    #[error("mount failed for {path}: {source}")]
+    Mount { path: String, source: nix::Error },
+
+    #[error("mkdir failed for {path}: {source}")]
+    Mkdir {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error("pivot_root failed: {0}")]
+    PivotRoot(nix::Error),
+
+    #[error("chdir failed: {0}")]
+    Chdir(nix::Error),
+
+    #[error("umount failed for {path}: {source}")]
+    Umount { path: String, source: nix::Error },
+}
+
+/// Standard directories to create in the sandbox root.
+/// These provide a minimal Linux filesystem skeleton.
+const SKELETON_DIRS: &[&str] = &[
+    "bin",
+    "dev",
+    "etc",
+    "lib",
+    "lib64",
+    "proc",
+    "run",
+    "sbin",
+    "sys",
+    "tmp",
+    "usr",
+    "usr/bin",
+    "usr/lib",
+    "usr/lib64",
+    "usr/sbin",
+    "usr/share",
+    "var",
+    "var/tmp",
+];
+
+/// Paths that are always bind-mounted read-only into the sandbox
+/// for basic operation (binaries, shared libraries, dynamic linker, etc.).
+/// These are mounted regardless of the whitelist config.
+const ESSENTIAL_BIND_MOUNTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/share",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/resolv.conf",
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/localtime",
+    "/etc/alternatives",
+];
+
+/// Attempt filesystem isolation, falling back gracefully if mounts are blocked.
+///
+/// `command_prefix` is the auto-detected package-manager prefix for the
+/// command binary (e.g. `/nix/store`, `/opt/homebrew`). If present, it is
+/// bind-mounted read-only into the sandbox.
+///
+/// Returns `true` if full isolation was applied, `false` if running in degraded mode.
+pub fn try_setup_filesystem(
+    config: &FilesystemConfig,
+    command_prefix: Option<&Path>,
+) -> Result<bool, OverlayError> {
+    match setup_filesystem(config, command_prefix) {
+        Ok(()) => Ok(true),
+        Err(OverlayError::Mount { ref path, source }) if is_permission_error(source) => {
+            tracing::error!(
+                path,
+                "mount operation blocked by AppArmor. \
+                 Filesystem isolation is DISABLED — the sandboxed process has full host filesystem access. \
+                 Run `sudo can setup` to install the AppArmor profile and enable isolation."
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Check if a nix error is a permission error (EACCES or EPERM).
+fn is_permission_error(err: nix::Error) -> bool {
+    matches!(err, nix::Error::EACCES | nix::Error::EPERM)
+}
+
+/// Set up the sandbox filesystem with full isolation.
+///
+/// This must be called from within the child process, after namespaces
+/// have been created and UID/GID maps written.
+///
+/// Creates a tmpfs root, bind-mounts essentials + whitelisted paths,
+/// mounts /proc, and does pivot_root.
+///
+/// Returns `Err` if mount operations are blocked (e.g., by AppArmor).
+pub fn setup_filesystem(
+    config: &FilesystemConfig,
+    command_prefix: Option<&Path>,
+) -> Result<(), OverlayError> {
+    let sandbox_root = PathBuf::from("/tmp/canister-root");
+
+    // 0. Break mount propagation. First make slave (allowed from shared),
+    //    then make private. This prevents mounts from propagating back to
+    //    the host and is required for mount operations in a user namespace.
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_SLAVE,
+        None::<&str>,
+    )
+    .map_err(|source| OverlayError::Mount {
+        path: "/ (make slave)".to_string(),
+        source,
+    })?;
+
+    // 1. Create the sandbox root directory.
+    mkdir_p(&sandbox_root)?;
+
+    // 2. Mount a tmpfs as the sandbox root.
+    mount_tmpfs(&sandbox_root)?;
+
+    // 3. Create the directory skeleton.
+    create_skeleton(&sandbox_root)?;
+
+    // 4. Bind-mount essential system paths (read-only).
+    bind_mount_essentials(&sandbox_root)?;
+
+    // 5. Bind-mount user-configured whitelist paths (read-only).
+    bind_mount_whitelist(&sandbox_root, config)?;
+
+    // 5b. Bind-mount auto-detected command prefix (read-only).
+    if let Some(prefix) = command_prefix {
+        bind_mount_command_prefix(&sandbox_root, prefix, config)?;
+    }
+
+    // 6. Create a writable /tmp inside the sandbox.
+    let sandbox_tmp = sandbox_root.join("tmp");
+    mount_tmpfs(&sandbox_tmp)?;
+
+    // 7. Mount a fresh /proc for PID namespace.
+    mount_proc(&sandbox_root)?;
+
+    // 8. Create minimal /dev entries.
+    setup_minimal_dev(&sandbox_root)?;
+
+    // 9. Pivot root: make sandbox_root the new /.
+    do_pivot_root(&sandbox_root)?;
+
+    tracing::debug!("filesystem isolation complete");
+    Ok(())
+}
+
+/// Mount a tmpfs at the given path.
+fn mount_tmpfs(target: &Path) -> Result<(), OverlayError> {
+    tracing::debug!(target = %target.display(), "mounting tmpfs");
+    mount(
+        Some("tmpfs"),
+        target,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("size=256m,mode=0755"),
+    )
+    .map_err(|source| OverlayError::Mount {
+        path: target.display().to_string(),
+        source,
+    })
+}
+
+/// Create the minimal directory skeleton in the sandbox root.
+fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
+    for dir in SKELETON_DIRS {
+        mkdir_p(&root.join(dir))?;
+    }
+    Ok(())
+}
+
+/// Bind-mount essential system paths into the sandbox root.
+fn bind_mount_essentials(root: &Path) -> Result<(), OverlayError> {
+    for source in ESSENTIAL_BIND_MOUNTS {
+        let source_path = Path::new(source);
+        if !source_path.exists() {
+            tracing::debug!(path = source, "essential path not found, skipping");
+            continue;
+        }
+
+        let target = root.join(source.trim_start_matches('/'));
+
+        // Ensure target parent exists.
+        if let Some(parent) = target.parent() {
+            mkdir_p(parent)?;
+        }
+
+        // Create mount point: directory or file depending on source.
+        if source_path.is_dir() {
+            mkdir_p(&target)?;
+        } else {
+            // Create an empty file as a mount point.
+            touch(&target)?;
+        }
+
+        bind_mount_ro(source_path, &target)?;
+    }
+    Ok(())
+}
+
+/// Bind-mount user-configured whitelist paths into the sandbox.
+fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
+    for source in &config.allow {
+        if !source.exists() {
+            tracing::warn!(path = %source.display(), "whitelist path not found, skipping");
+            continue;
+        }
+
+        // Check if this path is denied.
+        let denied = config.deny.iter().any(|d| source.starts_with(d));
+        if denied {
+            tracing::warn!(path = %source.display(), "whitelist path is also in deny list, skipping");
+            continue;
+        }
+
+        let rel = source.strip_prefix("/").unwrap_or(source);
+        let target = root.join(rel);
+
+        if let Some(parent) = target.parent() {
+            mkdir_p(parent)?;
+        }
+
+        if source.is_dir() {
+            mkdir_p(&target)?;
+        } else {
+            touch(&target)?;
+        }
+
+        bind_mount_ro(source, &target)?;
+        tracing::debug!(source = %source.display(), target = %target.display(), "whitelisted path mounted");
+    }
+    Ok(())
+}
+
+/// Bind-mount the auto-detected command prefix into the sandbox.
+///
+/// This mounts the entire prefix tree (e.g. `/nix/store`, `/opt/homebrew`)
+/// read-only. Paths already covered by essential bind mounts or the user
+/// whitelist are skipped.
+fn bind_mount_command_prefix(
+    root: &Path,
+    prefix: &Path,
+    config: &FilesystemConfig,
+) -> Result<(), OverlayError> {
+    if !prefix.exists() {
+        tracing::debug!(path = %prefix.display(), "command prefix not found, skipping");
+        return Ok(());
+    }
+
+    // Skip if the prefix is already fully covered by a user whitelist entry.
+    // Only skip when a whitelist entry is an ancestor of (or equal to) the prefix,
+    // meaning the prefix is entirely contained within an already-mounted tree.
+    // Do NOT skip when a whitelist entry is a *child* of the prefix — that only
+    // covers a subtree, not the whole prefix.
+    let already_covered = config
+        .allow
+        .iter()
+        .any(|allowed| prefix.starts_with(allowed));
+    if already_covered {
+        tracing::debug!(path = %prefix.display(), "command prefix already covered by whitelist, skipping");
+        return Ok(());
+    }
+
+    // Check if denied by policy.
+    let denied = config.deny.iter().any(|d| prefix.starts_with(d));
+    if denied {
+        tracing::warn!(
+            path = %prefix.display(),
+            "command prefix is in deny list, skipping (command may fail)"
+        );
+        return Ok(());
+    }
+
+    let rel = prefix.strip_prefix("/").unwrap_or(prefix);
+    let target = root.join(rel);
+
+    if let Some(parent) = target.parent() {
+        mkdir_p(parent)?;
+    }
+
+    if prefix.is_dir() {
+        mkdir_p(&target)?;
+    } else {
+        touch(&target)?;
+    }
+
+    bind_mount_ro(prefix, &target)?;
+    tracing::debug!(
+        prefix = %prefix.display(),
+        target = %target.display(),
+        "command prefix mounted"
+    );
+
+    Ok(())
+}
+
+/// Mount /proc inside the sandbox for the new PID namespace.
+fn mount_proc(root: &Path) -> Result<(), OverlayError> {
+    let proc_path = root.join("proc");
+    mkdir_p(&proc_path)?;
+
+    tracing::debug!("mounting /proc in sandbox");
+    mount(
+        Some("proc"),
+        &proc_path,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|source| OverlayError::Mount {
+        path: proc_path.display().to_string(),
+        source,
+    })
+}
+
+/// Create minimal /dev with null, zero, urandom, etc.
+///
+/// In a user namespace, we can't mknod, so we bind-mount from the host.
+fn setup_minimal_dev(root: &Path) -> Result<(), OverlayError> {
+    let dev_dir = root.join("dev");
+    mkdir_p(&dev_dir)?;
+
+    // Mount a tmpfs for /dev.
+    mount(
+        Some("tmpfs"),
+        &dev_dir,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("size=1m,mode=0755"),
+    )
+    .map_err(|source| OverlayError::Mount {
+        path: dev_dir.display().to_string(),
+        source,
+    })?;
+
+    // Bind-mount essential device nodes from host.
+    let devices = &["null", "zero", "urandom", "random", "tty"];
+    for dev in devices {
+        let host_dev = Path::new("/dev").join(dev);
+        let sandbox_dev = dev_dir.join(dev);
+
+        if host_dev.exists() {
+            touch(&sandbox_dev)?;
+            bind_mount_ro(&host_dev, &sandbox_dev)?;
+        }
+    }
+
+    // Create /dev/stdin, /dev/stdout, /dev/stderr as symlinks.
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/0", dev_dir.join("stdin"));
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/1", dev_dir.join("stdout"));
+    let _ = std::os::unix::fs::symlink("/proc/self/fd/2", dev_dir.join("stderr"));
+    let _ = std::os::unix::fs::symlink("/proc/self/fd", dev_dir.join("fd"));
+
+    // Create /dev/shm.
+    let shm_dir = dev_dir.join("shm");
+    mkdir_p(&shm_dir)?;
+    mount(
+        Some("tmpfs"),
+        &shm_dir,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("size=64m"),
+    )
+    .map_err(|source| OverlayError::Mount {
+        path: shm_dir.display().to_string(),
+        source,
+    })?;
+
+    Ok(())
+}
+
+/// Pivot the root filesystem to the sandbox root.
+///
+/// After this, the old root is no longer accessible.
+fn do_pivot_root(new_root: &Path) -> Result<(), OverlayError> {
+    // Create a directory for the old root inside new_root.
+    let old_root_dir = new_root.join("oldroot");
+    mkdir_p(&old_root_dir)?;
+
+    tracing::debug!(
+        new_root = %new_root.display(),
+        "pivoting root"
+    );
+
+    // pivot_root requires that new_root is a mount point.
+    // Our tmpfs mount satisfies this.
+    pivot_root(new_root, &old_root_dir).map_err(OverlayError::PivotRoot)?;
+
+    // Change directory to the new root.
+    nix::unistd::chdir("/").map_err(OverlayError::Chdir)?;
+
+    // Unmount the old root (lazily, in case something still references it).
+    umount2("/oldroot", MntFlags::MNT_DETACH).map_err(|source| OverlayError::Umount {
+        path: "/oldroot".to_string(),
+        source,
+    })?;
+
+    // Remove the old root mount point.
+    let _ = std::fs::remove_dir("/oldroot");
+
+    Ok(())
+}
+
+/// Create a read-only bind mount.
+///
+/// In user namespaces, remounting a bind mount as read-only requires
+/// preserving all existing restrictive flags from the source mount.
+/// The kernel rejects remounts that would drop flags set on the source.
+/// We read the source mount flags via /proc/self/mountinfo and include
+/// them in the remount call.
+fn bind_mount_ro(source: &Path, target: &Path) -> Result<(), OverlayError> {
+    // First bind mount (needs MS_BIND).
+    mount(
+        Some(source),
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|source_err| OverlayError::Mount {
+        path: format!("{} -> {}", source.display(), target.display()),
+        source: source_err,
+    })?;
+
+    // Read the mount flags from the now-mounted target and preserve them
+    // when remounting as read-only.
+    let source_flags = read_mount_flags(target);
+
+    mount(
+        None::<&str>,
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | source_flags,
+        None::<&str>,
+    )
+    .map_err(|source_err| OverlayError::Mount {
+        path: format!("{} (remount ro)", target.display()),
+        source: source_err,
+    })?;
+
+    Ok(())
+}
+
+/// Read mount flags for a given path from /proc/self/mountinfo.
+///
+/// Returns the restrictive flags (nosuid, nodev, noexec, relatime, etc.)
+/// that must be preserved when remounting in a user namespace.
+fn read_mount_flags(path: &Path) -> MsFlags {
+    // Default flags to include if we can't read mountinfo.
+    let default_flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RELATIME;
+
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return default_flags;
+    };
+
+    // Canonicalize the target path for matching.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let target_str = canonical.to_string_lossy();
+
+    // Find the mount entry for this path (best = longest matching mount point).
+    let mut best_flags = default_flags;
+    let mut best_len = 0;
+
+    for line in mountinfo.lines() {
+        // mountinfo format:
+        // id parent_id major:minor root mount_point options ... - fstype source super_options
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        let mount_point = fields[4];
+        let options = fields[5];
+
+        // Check if this mount point is a prefix of our target.
+        if target_str.starts_with(mount_point) && mount_point.len() > best_len {
+            best_len = mount_point.len();
+            best_flags = parse_mount_options(options);
+        }
+    }
+
+    best_flags
+}
+
+/// Parse mount options string into MsFlags.
+fn parse_mount_options(options: &str) -> MsFlags {
+    let mut flags = MsFlags::empty();
+    for opt in options.split(',') {
+        match opt {
+            "nosuid" => flags |= MsFlags::MS_NOSUID,
+            "nodev" => flags |= MsFlags::MS_NODEV,
+            "noexec" => flags |= MsFlags::MS_NOEXEC,
+            "relatime" => flags |= MsFlags::MS_RELATIME,
+            "noatime" => flags |= MsFlags::MS_NOATIME,
+            "nodiratime" => flags |= MsFlags::MS_NODIRATIME,
+            "ro" => flags |= MsFlags::MS_RDONLY,
+            _ => {} // ignore other options
+        }
+    }
+    flags
+}
+
+/// Create directory and all parents (like `mkdir -p`).
+fn mkdir_p(path: &Path) -> Result<(), OverlayError> {
+    std::fs::create_dir_all(path).map_err(|source| OverlayError::Mkdir {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// Create an empty file (touch).
+fn touch(path: &Path) -> Result<(), OverlayError> {
+    if let Some(parent) = path.parent() {
+        mkdir_p(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| OverlayError::Mkdir {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(())
+}
