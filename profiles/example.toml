@@ -31,5 +31,5 @@ memory_mb = 512
 cpu_percent = 50
 
 [profile]
-# Seccomp profile: "generic", "python", or "node".
+# Seccomp profile: "generic", "python", "node", or "elixir".
 name = "python"

@@ -10,7 +10,7 @@ mod commands;
     name = "can",
     about = "Canister: a lightweight sandbox for running untrusted code safely",
     version,
-    propagate_version = true,
+    propagate_version = true
 )]
 struct Cli {
     /// Enable verbose (debug) logging.
@@ -45,6 +45,13 @@ enum Commands {
     /// Check available kernel capabilities for sandboxing.
     Check,
 
+    /// Install or manage the AppArmor profile for filesystem isolation.
+    Setup {
+        /// Remove the AppArmor profile instead of installing it.
+        #[arg(long)]
+        remove: bool,
+    },
+
     /// List available seccomp profiles.
     Profiles,
 }
@@ -53,7 +60,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize logging.
-    if cli.verbose {
+    // In monitor mode, use debug level for full visibility.
+    let is_monitor = matches!(&cli.command, Commands::Run { monitor: true, .. });
+    if is_monitor {
+        can_log::init_monitor();
+    } else if cli.verbose {
         can_log::init_verbose();
     } else {
         can_log::init();
@@ -67,6 +78,7 @@ fn main() -> ExitCode {
             command,
         } => commands::run(config, profile, monitor, command),
         Commands::Check => commands::check(),
+        Commands::Setup { remove } => commands::setup(remove),
         Commands::Profiles => commands::profiles(),
     };
 

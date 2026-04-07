@@ -8,7 +8,9 @@ description = "Core sandbox runtime: namespaces, seccomp, overlayfs, cgroups"
 
 [dependencies]
 can-policy.workspace = true
+can-net.workspace = true
 can-log.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 nix.workspace = true
+libc.workspace = true
