@@ -1,0 +1,72 @@
+# Canister sandbox configuration for Elixir/Erlang workloads.
+#
+# Works with system-installed Elixir and with Nix/asdf/mise-installed
+# versions -- the sandbox auto-detects and mounts the package prefix.
+#
+# Usage:
+#   can run --config profiles/elixir.toml -- mix test
+#   can run --config profiles/elixir.toml -- iex -S mix
+#   can run --config profiles/elixir.toml -- mix phx.server
+
+[filesystem]
+# Paths the sandboxed BEAM process can access.
+# The BEAM needs access to the Erlang/OTP installation and Elixir libs.
+allow = [
+    "/usr/lib",
+    "/usr/bin",
+    "/usr/local/lib",
+    "/usr/local/bin",
+    "/lib",
+    "/tmp/workspace",
+]
+deny = ["/etc/shadow", "/root"]
+
+[network]
+# Allow hex.pm for dependency fetching and common Elixir registries.
+allow_domains = [
+    "hex.pm",
+    "repo.hex.pm",
+    "builds.hex.pm",
+    "github.com",
+]
+deny_all = true
+
+[process]
+# BEAM spawns many lightweight processes via OS threads; the default
+# scheduler count equals the CPU core count. 256 is generous for most
+# mix tasks and development servers.
+max_pids = 256
+# Allow the BEAM VM and common Elixir/Erlang entry points.
+allow_execve = [
+    "/usr/local/bin/elixir",
+    "/usr/local/bin/mix",
+    "/usr/local/bin/iex",
+    "/usr/local/lib/erlang/erts-15.0/bin/beam.smp",
+]
+# Environment variables the BEAM commonly needs.
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "MIX_ENV",
+    "MIX_HOME",
+    "HEX_HOME",
+    "ERL_AFLAGS",
+    "ELIXIR_ERL_OPTIONS",
+    "RELEASE_COOKIE",
+    "RELEASE_NODE",
+    "RELEASE_DISTRIBUTION",
+    "SECRET_KEY_BASE",
+    "DATABASE_URL",
+    "PHX_HOST",
+    "PHX_SERVER",
+    "PORT",
+]
+
+[resources]
+memory_mb = 1024
+cpu_percent = 100
+
+[profile]
+name = "elixir"
