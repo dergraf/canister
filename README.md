@@ -1,5 +1,6 @@
 <p align="center">
-  <strong>canister</strong><br>
+  <img width="300" alt="canister" src="https://github.com/user-attachments/assets/476d2ac9-d390-4798-b329-dd371162cd99" /><br>
+<strong>canister</strong><br>
   <em>A lightweight sandbox for running untrusted code safely on Linux.</em>
 </p>
 
@@ -285,18 +286,6 @@ mise run fmt           # check
 mise run fmt-fix       # fix
 ```
 
-## Roadmap
-
-- [x] Phase 1: Namespace core + CLI skeleton
-- [x] Phase 2: Filesystem isolation (overlay + pivot_root)
-- [x] Phase 3: Network isolation (slirp4netns + DNS proxy)
-- [x] Phase 4: Seccomp BPF profiles
-- [x] Phase 5: Process control + environment filtering
-- [x] Phase 6: Monitor mode + Elixir/Erlang profile
-- [x] Phase 6b: Package manager support (Nix, Homebrew, Guix, Snap, etc.)
-- [ ] Phase 7: Resource limits (cgroups v2)
-- [ ] Phase 8: Testing, docs, release
-
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
