@@ -1,0 +1,20 @@
+[package]
+name = "can-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI binary for the Canister sandbox"
+
+[[bin]]
+name = "can"
+path = "src/main.rs"
+
+[dependencies]
+can-sandbox.workspace = true
+can-policy.workspace = true
+can-net.workspace = true
+can-log.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/can-cli",
+    "crates/can-sandbox",
+    "crates/can-policy",
+    "crates/can-net",
+    "crates/can-log",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+authors = ["Canister Contributors"]
+description = "A lightweight, self-contained sandbox for running untrusted code safely"
+repository = "https://github.com/canister-sandbox/canister"
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Linux syscalls
+nix = { version = "0.29", features = ["sched", "mount", "user", "process", "signal", "fs"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Internal crates
+can-sandbox = { path = "crates/can-sandbox" }
+can-policy = { path = "crates/can-policy" }
+can-net = { path = "crates/can-net" }
+can-log = { path = "crates/can-log" }

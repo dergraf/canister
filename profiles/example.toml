@@ -1,0 +1,35 @@
+# Example Canister sandbox configuration.
+#
+# Usage: can run --config example.toml python3 script.py
+
+[filesystem]
+# Paths the sandboxed process can access.
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp/workspace"]
+# Paths explicitly denied (checked before allow).
+deny = ["/etc/shadow", "/root"]
+
+[network]
+# Whitelisted domains (resolved via internal DNS proxy).
+allow_domains = ["pypi.org", "files.pythonhosted.org"]
+# Whitelisted IPs or CIDRs.
+allow_ips = []
+# Default-deny all network access except listed above.
+deny_all = true
+
+[process]
+# Max child PIDs.
+max_pids = 64
+# Executables the sandbox may exec.
+allow_execve = ["/usr/bin/python3"]
+# Environment variables passed through from host.
+env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
+
+[resources]
+# Memory limit in MB.
+memory_mb = 512
+# CPU limit as percentage of one core.
+cpu_percent = 50
+
+[profile]
+# Seccomp profile: "generic", "python", or "node".
+name = "python"

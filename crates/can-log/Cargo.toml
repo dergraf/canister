@@ -1,0 +1,11 @@
+[package]
+name = "can-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Logging: human-readable TTY output, JSON when piped"
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true

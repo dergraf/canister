@@ -1,0 +1,13 @@
+[package]
+name = "can-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Network layer: DNS proxy, veth setup, firewall rules"
+
+[dependencies]
+can-policy.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+nix.workspace = true

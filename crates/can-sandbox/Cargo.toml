@@ -1,0 +1,14 @@
+[package]
+name = "can-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core sandbox runtime: namespaces, seccomp, overlayfs, cgroups"
+
+[dependencies]
+can-policy.workspace = true
+can-log.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+nix.workspace = true

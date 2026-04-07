@@ -1,0 +1,34 @@
+[tools]
+rust = "1.93"
+
+[tasks.build]
+description = "Build all crates"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "Run tests with cargo-nextest"
+run = "cargo nextest run --workspace"
+
+[tasks.test-std]
+description = "Run tests with cargo test (fallback)"
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "Run clippy lints"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --all --check"
+
+[tasks.fmt-fix]
+description = "Fix formatting"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "Type-check all crates"
+run = "cargo check --workspace --all-targets"
+
+[tasks.audit]
+description = "Audit dependencies"
+run = "cargo deny check"
