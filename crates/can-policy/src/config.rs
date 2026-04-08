@@ -343,12 +343,38 @@ impl RecipeFile {
     /// - `strict` → `false`
     /// - `deny_all` → `true`
     /// - `seccomp_mode` → `AllowList`
+    ///
+    /// Expands environment variables (`$HOME`, `$USER`, etc.) in:
+    /// - `filesystem.allow` / `filesystem.deny`
+    /// - `process.allow_execve`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
-            filesystem: self.filesystem,
+            filesystem: FilesystemConfig {
+                allow: self
+                    .filesystem
+                    .allow
+                    .into_iter()
+                    .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
+                    .collect(),
+                deny: self
+                    .filesystem
+                    .deny
+                    .into_iter()
+                    .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
+                    .collect(),
+            },
             network: self.network,
-            process: self.process,
+            process: ProcessConfig {
+                max_pids: self.process.max_pids,
+                allow_execve: self
+                    .process
+                    .allow_execve
+                    .into_iter()
+                    .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
+                    .collect(),
+                env_passthrough: self.process.env_passthrough,
+            },
             resources: self.resources,
             syscalls: self.syscalls,
         })
@@ -442,6 +468,81 @@ impl RecipeFile {
             .map(|m| m.match_prefix.as_slice())
             .unwrap_or(&[])
     }
+
+    /// Get the match_prefix patterns with environment variables expanded.
+    pub fn match_prefixes_expanded(&self) -> Vec<String> {
+        self.match_prefixes()
+            .iter()
+            .map(|s| expand_env_vars(s))
+            .collect()
+    }
+}
+
+/// Expand environment variables in a string.
+///
+/// Supports two forms:
+/// - `$NAME` — bare variable (terminated by non-alphanumeric, non-underscore)
+/// - `${NAME}` — braced variable
+///
+/// Unknown or unset variables are replaced with an empty string.
+/// Literal `$$` is escaped to a single `$`.
+///
+/// This is intentionally simple — no default values, no nested expansion.
+/// Used for recipe paths like `$HOME/.cargo/bin`.
+pub fn expand_env_vars(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            result.push(ch);
+            continue;
+        }
+
+        // $$ → literal $
+        if chars.peek() == Some(&'$') {
+            chars.next();
+            result.push('$');
+            continue;
+        }
+
+        // ${NAME} — braced form
+        if chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut name = String::new();
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                name.push(c);
+            }
+            if let Ok(val) = std::env::var(&name) {
+                result.push_str(&val);
+            }
+            continue;
+        }
+
+        // $NAME — bare form (alphanumeric + underscore)
+        let mut name = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                name.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if name.is_empty() {
+            // Lone $ at end of string or before non-identifier char
+            result.push('$');
+        } else if let Ok(val) = std::env::var(&name) {
+            result.push_str(&val);
+        }
+        // Unset variables expand to empty string (no output).
+    }
+
+    result
 }
 
 /// Merge two `Vec<T>` by appending, deduplicating (preserving first occurrence order).
@@ -1009,5 +1110,116 @@ name = "elixir"
         // Overlay metadata wins (elixir has no match_prefix).
         assert_eq!(merged.display_name("fallback"), "elixir");
         assert!(merged.match_prefixes().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Environment variable expansion tests
+    // ---------------------------------------------------------------
+    // Environment variable expansion tests
+    //
+    // SAFETY: Tests use unique variable names prefixed with _CANISTER_TEST_
+    // and are not safety-critical. The unsafe blocks are needed because
+    // Rust 2024 marks set_var/remove_var as unsafe (not thread-safe).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn expand_env_vars_no_vars() {
+        assert_eq!(expand_env_vars("/usr/lib"), "/usr/lib");
+    }
+
+    #[test]
+    fn expand_env_vars_home() {
+        // SAFETY: unique test-only env var, no concurrent readers.
+        unsafe { std::env::set_var("_CANISTER_TEST_HOME", "/home/testuser") };
+        assert_eq!(
+            expand_env_vars("$_CANISTER_TEST_HOME/.cargo/bin"),
+            "/home/testuser/.cargo/bin"
+        );
+        unsafe { std::env::remove_var("_CANISTER_TEST_HOME") };
+    }
+
+    #[test]
+    fn expand_env_vars_braced() {
+        unsafe { std::env::set_var("_CANISTER_TEST_USER", "alice") };
+        assert_eq!(
+            expand_env_vars("/home/${_CANISTER_TEST_USER}/.local"),
+            "/home/alice/.local"
+        );
+        unsafe { std::env::remove_var("_CANISTER_TEST_USER") };
+    }
+
+    #[test]
+    fn expand_env_vars_multiple() {
+        unsafe { std::env::set_var("_CT_A", "aaa") };
+        unsafe { std::env::set_var("_CT_B", "bbb") };
+        assert_eq!(expand_env_vars("$_CT_A/$_CT_B"), "aaa/bbb");
+        unsafe { std::env::remove_var("_CT_A") };
+        unsafe { std::env::remove_var("_CT_B") };
+    }
+
+    #[test]
+    fn expand_env_vars_unset_becomes_empty() {
+        unsafe { std::env::remove_var("_CANISTER_SURELY_UNSET") };
+        assert_eq!(
+            expand_env_vars("/prefix/$_CANISTER_SURELY_UNSET/suffix"),
+            "/prefix//suffix"
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_double_dollar_escapes() {
+        assert_eq!(expand_env_vars("cost: $$100"), "cost: $100");
+    }
+
+    #[test]
+    fn expand_env_vars_lone_dollar_preserved() {
+        assert_eq!(expand_env_vars("a $ b"), "a $ b");
+    }
+
+    #[test]
+    fn expand_env_vars_in_sandbox_config() {
+        unsafe { std::env::set_var("_CANISTER_TEST_HOME2", "/home/bob") };
+        let recipe = parse_recipe(
+            r#"
+[filesystem]
+allow = ["$_CANISTER_TEST_HOME2/.cargo"]
+deny = ["$_CANISTER_TEST_HOME2/.ssh"]
+
+[process]
+allow_execve = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
+"#,
+        );
+        let config = recipe.into_sandbox_config().unwrap();
+        assert_eq!(
+            config.filesystem.allow,
+            vec![PathBuf::from("/home/bob/.cargo")]
+        );
+        assert_eq!(
+            config.filesystem.deny,
+            vec![PathBuf::from("/home/bob/.ssh")]
+        );
+        assert_eq!(
+            config.process.allow_execve,
+            vec![PathBuf::from("/home/bob/.cargo/bin/rustc")]
+        );
+        unsafe { std::env::remove_var("_CANISTER_TEST_HOME2") };
+    }
+
+    #[test]
+    fn expand_env_vars_match_prefixes_expanded() {
+        unsafe { std::env::set_var("_CANISTER_TEST_HOME3", "/home/carol") };
+        let recipe = parse_recipe(
+            r#"
+[recipe]
+name = "cargo"
+match_prefix = ["$_CANISTER_TEST_HOME3/.cargo"]
+"#,
+        );
+        assert_eq!(recipe.match_prefixes(), &["$_CANISTER_TEST_HOME3/.cargo"]);
+        assert_eq!(
+            recipe.match_prefixes_expanded(),
+            vec!["/home/carol/.cargo".to_string()]
+        );
+        unsafe { std::env::remove_var("_CANISTER_TEST_HOME3") };
     }
 }
