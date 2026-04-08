@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -26,9 +25,15 @@ struct Cli {
 enum Commands {
     /// Run a command inside the sandbox.
     Run {
-        /// Path to a recipe TOML file.
+        /// Recipe name or path. Can be repeated for composition.
+        ///
+        /// If the argument contains `/` or ends with `.toml`, it is treated
+        /// as a file path. Otherwise it is looked up by name across the
+        /// recipe search path (e.g., `-r nix` resolves to `nix.toml`).
+        ///
+        /// Multiple recipes are merged left-to-right.
         #[arg(short, long)]
-        recipe: Option<PathBuf>,
+        recipe: Vec<String>,
 
         /// Run in monitor mode: log access attempts without enforcing.
         #[arg(short, long)]
@@ -79,7 +84,7 @@ fn main() -> ExitCode {
             monitor,
             strict,
             command,
-        } => commands::run(recipe, monitor, strict, command),
+        } => commands::run(&recipe, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipes => recipes::list(),

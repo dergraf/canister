@@ -64,6 +64,7 @@ pub fn list() -> Result<i32> {
             let desc = recipe.description();
 
             let extras = format_syscall_extras(&recipe.syscalls);
+            let prefixes = recipe.match_prefixes();
 
             if desc.is_empty() {
                 println!("  {name:<20} {extras:<30} {}", path.display());
@@ -73,6 +74,10 @@ pub fn list() -> Result<i32> {
                     "",
                     path.display()
                 );
+            }
+
+            if !prefixes.is_empty() {
+                println!("  {:<20} match: {}", "", prefixes.join(", "));
             }
         }
     }

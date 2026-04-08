@@ -40,7 +40,7 @@ pub fn check_path(path: &Path, config: &FilesystemConfig) -> AccessDecision {
 
 /// Check whether a domain is allowed by the network config.
 pub fn check_domain(domain: &str, config: &NetworkConfig) -> AccessDecision {
-    if !config.deny_all {
+    if !config.deny_all() {
         return AccessDecision::Allow;
     }
 
@@ -62,7 +62,7 @@ pub fn check_domain(domain: &str, config: &NetworkConfig) -> AccessDecision {
 ///
 /// Supports both exact IP matches and CIDR notation (e.g., `10.0.0.0/8`).
 pub fn check_ip(ip: &str, config: &NetworkConfig) -> AccessDecision {
-    if !config.deny_all {
+    if !config.deny_all() {
         return AccessDecision::Allow;
     }
 
@@ -134,7 +134,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec!["pypi.org".to_string()],
             allow_ips: vec![],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(check_domain("pypi.org", &config), AccessDecision::Allow);
         assert_eq!(
@@ -149,7 +149,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec![],
-            deny_all: false,
+            deny_all: Some(false),
         };
         assert_eq!(check_domain("anything.com", &config), AccessDecision::Allow);
     }
@@ -159,7 +159,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.1".to_string()],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("192.168.1.1", &config), AccessDecision::Deny);
@@ -170,7 +170,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("10.255.255.255", &config), AccessDecision::Allow);
@@ -184,7 +184,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(check_ip("not-an-ip", &config), AccessDecision::Deny);
     }
@@ -194,7 +194,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec!["fd00::/8".to_string()],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(check_ip("fd00::1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("2001:db8::1", &config), AccessDecision::Deny);

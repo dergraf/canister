@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -6,7 +7,8 @@ use serde::Deserialize;
 /// Top-level sandbox configuration.
 ///
 /// This is the resolved, validated form used by the sandbox runtime.
-/// Produced from `RecipeFile::into_sandbox_config()`.
+/// All `Option` fields are guaranteed to be `Some` after resolution
+/// via `RecipeFile::into_sandbox_config()`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
@@ -63,9 +65,12 @@ pub struct NetworkConfig {
     pub allow_ips: Vec<String>,
 
     /// If true, deny all network access except explicitly allowed.
-    /// Defaults to true (secure by default).
-    #[serde(default = "default_true")]
-    pub deny_all: bool,
+    /// Defaults to true (secure by default) when resolved.
+    ///
+    /// `None` in a recipe means "not specified" — the merge preserves
+    /// the earlier value. `into_sandbox_config()` resolves `None` to `true`.
+    #[serde(default)]
+    pub deny_all: Option<bool>,
 }
 
 impl Default for NetworkConfig {
@@ -73,8 +78,15 @@ impl Default for NetworkConfig {
         Self {
             allow_domains: Vec::new(),
             allow_ips: Vec::new(),
-            deny_all: true,
+            deny_all: None,
         }
+    }
+}
+
+impl NetworkConfig {
+    /// Return the effective `deny_all` value (defaults to `true`).
+    pub fn deny_all(&self) -> bool {
+        self.deny_all.unwrap_or(true)
     }
 }
 
@@ -146,8 +158,11 @@ impl fmt::Display for SeccompMode {
 #[serde(deny_unknown_fields)]
 pub struct SyscallConfig {
     /// Seccomp enforcement mode: "allow-list" (default) or "deny-list".
+    ///
+    /// `None` means "not specified" — merge preserves earlier value,
+    /// `into_sandbox_config()` resolves to `AllowList`.
     #[serde(default)]
-    pub seccomp_mode: SeccompMode,
+    pub seccomp_mode: Option<SeccompMode>,
 
     // --- Absolute fields (baseline only) ---
     /// Absolute allow list — the complete set of permitted syscalls.
@@ -175,6 +190,11 @@ pub struct SyscallConfig {
 }
 
 impl SyscallConfig {
+    /// Return the effective seccomp mode (defaults to `AllowList`).
+    pub fn seccomp_mode(&self) -> SeccompMode {
+        self.seccomp_mode.unwrap_or_default()
+    }
+
     /// Returns true if this config uses absolute allow/deny fields (baseline mode).
     pub fn is_baseline(&self) -> bool {
         !self.allow.is_empty() || !self.deny.is_empty()
@@ -196,10 +216,6 @@ impl SyscallConfig {
         }
         Ok(())
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl SandboxConfig {
@@ -251,12 +267,26 @@ pub struct RecipeMeta {
     /// Opaque version string (for humans, not parsed).
     #[serde(default)]
     pub version: Option<String>,
+
+    /// Path prefixes that trigger auto-detection of this recipe.
+    ///
+    /// When running a binary whose resolved path starts with one of these
+    /// prefixes, this recipe is automatically composed into the recipe stack.
+    /// Supports environment variable expansion (`$HOME`, `$USER`, etc.).
+    ///
+    /// Example: `["/nix/store"]` for the Nix package manager.
+    #[serde(default)]
+    pub match_prefix: Vec<String>,
 }
 
 /// A recipe file — the only entry point for parsing policy TOML files.
 ///
 /// Files without a `[recipe]` section are valid — the field defaults
 /// to `None` and the file is treated as a plain policy.
+///
+/// Recipes support composition via `merge()` — multiple recipes are
+/// layered left-to-right with `Option` fields using last-wins-if-set
+/// semantics and `Vec` fields using union semantics.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeFile {
@@ -265,8 +295,12 @@ pub struct RecipeFile {
     pub recipe: Option<RecipeMeta>,
 
     /// Strict mode: fail hard instead of degrading gracefully.
+    ///
+    /// `None` means "not specified" — merge preserves earlier value.
+    /// Uses OR semantics: any `Some(true)` wins. Resolved to `bool`
+    /// via `into_sandbox_config()`.
     #[serde(default)]
-    pub strict: bool,
+    pub strict: Option<bool>,
 
     /// Filesystem access policy.
     #[serde(default)]
@@ -304,15 +338,85 @@ impl RecipeFile {
     }
 
     /// Resolve into a `SandboxConfig`.
+    ///
+    /// Fills in defaults for all `Option` fields:
+    /// - `strict` → `false`
+    /// - `deny_all` → `true`
+    /// - `seccomp_mode` → `AllowList`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
-            strict: self.strict,
+            strict: self.strict.unwrap_or(false),
             filesystem: self.filesystem,
             network: self.network,
             process: self.process,
             resources: self.resources,
             syscalls: self.syscalls,
         })
+    }
+
+    /// Merge another recipe on top of this one (layered composition).
+    ///
+    /// **Merge rules:**
+    /// - `Vec` fields: union (deduplicated, preserving order)
+    /// - `strict`: OR — any `Some(true)` wins
+    /// - `Option<T>` scalars: last `Some(x)` wins; `None` preserves base
+    /// - `RecipeMeta`: overlay wins if present
+    pub fn merge(self, overlay: RecipeFile) -> RecipeFile {
+        RecipeFile {
+            // Metadata: overlay wins if present.
+            recipe: overlay.recipe.or(self.recipe),
+
+            // Strict: OR — any Some(true) wins.
+            strict: match (self.strict, overlay.strict) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (_, s @ Some(_)) => s,
+                (s, None) => s,
+            },
+
+            // Filesystem: union of paths.
+            filesystem: FilesystemConfig {
+                allow: union_vecs(self.filesystem.allow, overlay.filesystem.allow),
+                deny: union_vecs(self.filesystem.deny, overlay.filesystem.deny),
+            },
+
+            // Network: union of lists, deny_all is last-Some-wins.
+            network: NetworkConfig {
+                allow_domains: union_vecs(
+                    self.network.allow_domains,
+                    overlay.network.allow_domains,
+                ),
+                allow_ips: union_vecs(self.network.allow_ips, overlay.network.allow_ips),
+                deny_all: overlay.network.deny_all.or(self.network.deny_all),
+            },
+
+            // Process: union of lists, max_pids is last-Some-wins.
+            process: ProcessConfig {
+                max_pids: overlay.process.max_pids.or(self.process.max_pids),
+                allow_execve: union_vecs(self.process.allow_execve, overlay.process.allow_execve),
+                env_passthrough: union_vecs(
+                    self.process.env_passthrough,
+                    overlay.process.env_passthrough,
+                ),
+            },
+
+            // Resources: last-Some-wins.
+            resources: ResourceConfig {
+                memory_mb: overlay.resources.memory_mb.or(self.resources.memory_mb),
+                cpu_percent: overlay.resources.cpu_percent.or(self.resources.cpu_percent),
+            },
+
+            // Syscalls: seccomp_mode is last-Some-wins, extras are unioned.
+            // Absolute fields (allow/deny) are also unioned — this supports
+            // merging a baseline on top of another, though in practice only
+            // one recipe should use absolute fields.
+            syscalls: SyscallConfig {
+                seccomp_mode: overlay.syscalls.seccomp_mode.or(self.syscalls.seccomp_mode),
+                allow: union_vecs(self.syscalls.allow, overlay.syscalls.allow),
+                deny: union_vecs(self.syscalls.deny, overlay.syscalls.deny),
+                allow_extra: union_vecs(self.syscalls.allow_extra, overlay.syscalls.allow_extra),
+                deny_extra: union_vecs(self.syscalls.deny_extra, overlay.syscalls.deny_extra),
+            },
+        }
     }
 
     /// Get the display name for this recipe.
@@ -330,6 +434,26 @@ impl RecipeFile {
             .and_then(|m| m.description.as_deref())
             .unwrap_or("")
     }
+
+    /// Get the match_prefix patterns for auto-detection.
+    pub fn match_prefixes(&self) -> &[String] {
+        self.recipe
+            .as_ref()
+            .map(|m| m.match_prefix.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// Merge two `Vec<T>` by appending, deduplicating (preserving first occurrence order).
+fn union_vecs<T: Clone + Eq + std::hash::Hash>(base: Vec<T>, overlay: Vec<T>) -> Vec<T> {
+    let mut seen = HashSet::with_capacity(base.len() + overlay.len());
+    let mut result = Vec::with_capacity(base.len() + overlay.len());
+    for item in base.into_iter().chain(overlay) {
+        if seen.insert(item.clone()) {
+            result.push(item);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -349,7 +473,7 @@ allow_domains = ["pypi.org"]
         let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.filesystem.allow.len(), 2);
         assert_eq!(config.network.allow_domains, vec!["pypi.org"]);
-        assert!(config.network.deny_all); // default
+        assert!(config.network.deny_all()); // default
         assert!(config.syscalls.allow_extra.is_empty());
     }
 
@@ -383,13 +507,13 @@ allow_extra = ["ptrace"]
         assert_eq!(config.resources.memory_mb, Some(512));
         assert_eq!(config.process.max_pids, Some(64));
         assert_eq!(config.syscalls.allow_extra, vec!["ptrace"]);
-        assert_eq!(config.syscalls.seccomp_mode, SeccompMode::AllowList);
+        assert_eq!(config.syscalls.seccomp_mode(), SeccompMode::AllowList);
     }
 
     #[test]
     fn default_deny_config() {
         let config = SandboxConfig::default_deny();
-        assert!(config.network.deny_all);
+        assert!(config.network.deny_all());
         assert!(config.filesystem.allow.is_empty());
         assert!(config.network.allow_domains.is_empty());
         assert!(config.syscalls.allow_extra.is_empty());
@@ -476,7 +600,7 @@ deny_extra = ["personality", "seccomp"]
         let config = recipe.into_sandbox_config().unwrap();
         assert!(config.syscalls.allow_extra.is_empty());
         assert!(config.syscalls.deny_extra.is_empty());
-        assert_eq!(config.syscalls.seccomp_mode, SeccompMode::AllowList);
+        assert_eq!(config.syscalls.seccomp_mode(), SeccompMode::AllowList);
     }
 
     #[test]
@@ -589,5 +713,301 @@ deny_extra = ["ptrace"]
             "default baseline should have >=14 denied syscalls, got {}",
             config.syscalls.deny.len()
         );
+    }
+
+    // ---- Merge tests ----
+
+    /// Helper to create a minimal recipe from TOML.
+    fn parse_recipe(toml: &str) -> RecipeFile {
+        RecipeFile::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn merge_filesystem_union() {
+        let base = parse_recipe(
+            r#"
+[filesystem]
+allow = ["/usr/lib", "/usr/bin"]
+deny = ["/etc/shadow"]
+"#,
+        );
+        let overlay = parse_recipe(
+            r#"
+[filesystem]
+allow = ["/usr/bin", "/tmp/workspace"]
+deny = ["/root"]
+"#,
+        );
+        let merged = base.merge(overlay);
+        assert_eq!(
+            merged.filesystem.allow,
+            vec![
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/tmp/workspace"),
+            ]
+        );
+        assert_eq!(
+            merged.filesystem.deny,
+            vec![PathBuf::from("/etc/shadow"), PathBuf::from("/root")]
+        );
+    }
+
+    #[test]
+    fn merge_strict_or_semantics() {
+        // None + None = None (resolved to false)
+        let a = parse_recipe("");
+        let b = parse_recipe("");
+        assert_eq!(a.merge(b).strict, None);
+
+        // None + Some(false) = Some(false)
+        let a = parse_recipe("");
+        let b = parse_recipe("strict = false");
+        assert_eq!(a.merge(b).strict, Some(false));
+
+        // Some(false) + Some(true) = Some(true) (OR)
+        let a = parse_recipe("strict = false");
+        let b = parse_recipe("strict = true");
+        assert_eq!(a.merge(b).strict, Some(true));
+
+        // Some(true) + Some(false) = Some(true) (OR — true can never be overridden)
+        let a = parse_recipe("strict = true");
+        let b = parse_recipe("strict = false");
+        assert_eq!(a.merge(b).strict, Some(true));
+
+        // Some(true) + None = Some(true)
+        let a = parse_recipe("strict = true");
+        let b = parse_recipe("");
+        assert_eq!(a.merge(b).strict, Some(true));
+    }
+
+    #[test]
+    fn merge_deny_all_last_wins() {
+        // None + None = None (resolved to true by default)
+        let a = parse_recipe("");
+        let b = parse_recipe("");
+        assert_eq!(a.merge(b).network.deny_all, None);
+
+        // None + Some(false) = Some(false)
+        let a = parse_recipe("");
+        let b = parse_recipe("[network]\ndeny_all = false");
+        assert_eq!(a.merge(b).network.deny_all, Some(false));
+
+        // Some(true) + Some(false) = Some(false) (last wins)
+        let a = parse_recipe("[network]\ndeny_all = true");
+        let b = parse_recipe("[network]\ndeny_all = false");
+        assert_eq!(a.merge(b).network.deny_all, Some(false));
+
+        // Some(false) + None = Some(false) (None preserves base)
+        let a = parse_recipe("[network]\ndeny_all = false");
+        let b = parse_recipe("");
+        assert_eq!(a.merge(b).network.deny_all, Some(false));
+    }
+
+    #[test]
+    fn merge_network_domains_union() {
+        let a = parse_recipe(
+            r#"
+[network]
+allow_domains = ["pypi.org", "github.com"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[network]
+allow_domains = ["github.com", "hex.pm"]
+"#,
+        );
+        let merged = a.merge(b);
+        assert_eq!(
+            merged.network.allow_domains,
+            vec!["pypi.org", "github.com", "hex.pm"]
+        );
+    }
+
+    #[test]
+    fn merge_seccomp_mode_last_wins() {
+        let a = parse_recipe(
+            r#"
+[syscalls]
+seccomp_mode = "allow-list"
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[syscalls]
+seccomp_mode = "deny-list"
+"#,
+        );
+        assert_eq!(
+            a.merge(b).syscalls.seccomp_mode,
+            Some(SeccompMode::DenyList)
+        );
+
+        // None preserves base.
+        let a = parse_recipe(
+            r#"
+[syscalls]
+seccomp_mode = "deny-list"
+"#,
+        );
+        let b = parse_recipe("");
+        assert_eq!(
+            a.merge(b).syscalls.seccomp_mode,
+            Some(SeccompMode::DenyList)
+        );
+    }
+
+    #[test]
+    fn merge_syscall_extras_union() {
+        let a = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace", "personality"]
+deny_extra = ["reboot"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["personality", "seccomp"]
+deny_extra = ["mount"]
+"#,
+        );
+        let merged = a.merge(b);
+        assert_eq!(
+            merged.syscalls.allow_extra,
+            vec!["ptrace", "personality", "seccomp"]
+        );
+        assert_eq!(merged.syscalls.deny_extra, vec!["reboot", "mount"]);
+    }
+
+    #[test]
+    fn merge_resources_last_wins() {
+        let a = parse_recipe(
+            r#"
+[resources]
+memory_mb = 512
+cpu_percent = 50
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[resources]
+memory_mb = 1024
+"#,
+        );
+        let merged = a.merge(b);
+        assert_eq!(merged.resources.memory_mb, Some(1024)); // overlay wins
+        assert_eq!(merged.resources.cpu_percent, Some(50)); // base preserved
+    }
+
+    #[test]
+    fn merge_process_union_and_last_wins() {
+        let a = parse_recipe(
+            r#"
+[process]
+max_pids = 64
+allow_execve = ["/usr/bin/python3"]
+env_passthrough = ["PATH", "HOME"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[process]
+max_pids = 256
+env_passthrough = ["HOME", "LANG"]
+"#,
+        );
+        let merged = a.merge(b);
+        assert_eq!(merged.process.max_pids, Some(256)); // last wins
+        assert_eq!(merged.process.env_passthrough, vec!["PATH", "HOME", "LANG"]); // union
+        assert_eq!(
+            merged.process.allow_execve,
+            vec![PathBuf::from("/usr/bin/python3")]
+        ); // preserved
+    }
+
+    #[test]
+    fn merge_recipe_meta_overlay_wins() {
+        let a = parse_recipe(
+            r#"
+[recipe]
+name = "base"
+description = "base recipe"
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[recipe]
+name = "overlay"
+description = "overlay recipe"
+"#,
+        );
+        let merged = a.merge(b);
+        assert_eq!(merged.display_name("fallback"), "overlay");
+        assert_eq!(merged.description(), "overlay recipe");
+    }
+
+    #[test]
+    fn merge_three_recipes() {
+        let a = parse_recipe(
+            r#"
+[filesystem]
+allow = ["/usr/lib"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[filesystem]
+allow = ["/usr/bin"]
+
+[syscalls]
+allow_extra = ["ptrace"]
+"#,
+        );
+        let c = parse_recipe(
+            r#"
+strict = true
+
+[filesystem]
+allow = ["/tmp"]
+deny = ["/root"]
+"#,
+        );
+        let merged = a.merge(b).merge(c);
+        assert_eq!(
+            merged.filesystem.allow,
+            vec![
+                PathBuf::from("/usr/lib"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/tmp"),
+            ]
+        );
+        assert_eq!(merged.filesystem.deny, vec![PathBuf::from("/root")]);
+        assert_eq!(merged.syscalls.allow_extra, vec!["ptrace"]);
+        assert_eq!(merged.strict, Some(true));
+    }
+
+    #[test]
+    fn merge_match_prefix_preserved() {
+        let a = parse_recipe(
+            r#"
+[recipe]
+name = "nix"
+match_prefix = ["/nix/store"]
+"#,
+        );
+        // Overlay with different recipe replaces metadata.
+        let b = parse_recipe(
+            r#"
+[recipe]
+name = "elixir"
+"#,
+        );
+        let merged = a.merge(b);
+        // Overlay metadata wins (elixir has no match_prefix).
+        assert_eq!(merged.display_name("fallback"), "elixir");
+        assert!(merged.match_prefixes().is_empty());
     }
 }

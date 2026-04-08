@@ -402,7 +402,7 @@ fn child_entry(
     // to kernel audit but allowed to proceed. In strict mode, use
     // KILL_PROCESS so violations terminate immediately. In normal mode,
     // use Errno so the process can handle denials gracefully.
-    let seccomp_mode = config.syscalls.seccomp_mode;
+    let seccomp_mode = config.syscalls.seccomp_mode();
     let deny_action = if monitor {
         tracing::warn!(
             %seccomp_mode,

@@ -52,7 +52,7 @@ pub enum NetworkMode {
 impl NetworkMode {
     /// Determine the appropriate network mode from policy config.
     pub fn from_config(config: &NetworkConfig) -> Self {
-        if !config.deny_all {
+        if !config.deny_all() {
             return NetworkMode::Full;
         }
 
@@ -172,7 +172,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec!["example.com".to_string()],
             allow_ips: vec![],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
@@ -182,7 +182,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
-            deny_all: true,
+            deny_all: Some(true),
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
@@ -192,7 +192,7 @@ mod tests {
         let config = NetworkConfig {
             allow_domains: vec![],
             allow_ips: vec![],
-            deny_all: false,
+            deny_all: Some(false),
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Full);
     }

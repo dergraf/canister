@@ -326,7 +326,7 @@ pub fn load_and_apply(
         profile
     };
 
-    let mode = syscall_config.seccomp_mode;
+    let mode = syscall_config.seccomp_mode();
 
     let syscall_list = match mode {
         SeccompMode::AllowList => &profile.allow_syscalls,

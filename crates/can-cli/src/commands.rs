@@ -2,31 +2,93 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use can_policy::profile::baseline_search_dirs;
 use can_policy::{RecipeFile, SandboxConfig, SeccompProfile};
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
 use can_sandbox::setup::{self, ProfileStatus};
 
+/// Resolve a recipe argument to a filesystem path.
+///
+/// Rules:
+/// - If the argument contains `/` or ends with `.toml`, treat as a file path.
+/// - Otherwise, search for `{name}.toml` across `baseline_search_dirs()`.
+///
+/// Returns the resolved path, or an error if the name is not found.
+fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
+    // Treat as file path if it contains a separator or ends with .toml.
+    if arg.contains('/') || arg.ends_with(".toml") {
+        let path = PathBuf::from(arg);
+        anyhow::ensure!(path.exists(), "recipe file not found: {}", path.display());
+        return Ok(path);
+    }
+
+    // Name-based lookup: search for {name}.toml in search dirs.
+    let filename = format!("{arg}.toml");
+    for dir in baseline_search_dirs() {
+        let candidate = dir.join(&filename);
+        if candidate.is_file() {
+            tracing::debug!(name = arg, path = %candidate.display(), "resolved recipe by name");
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!(
+        "recipe '{arg}' not found. Searched for '{filename}' in:\n{}",
+        baseline_search_dirs()
+            .iter()
+            .map(|d| format!("  {}", d.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// Load and merge all recipe arguments into a single `SandboxConfig`.
+///
+/// Recipes are merged left-to-right using `RecipeFile::merge()`.
+fn load_recipes(recipe_args: &[String]) -> Result<SandboxConfig> {
+    if recipe_args.is_empty() {
+        tracing::info!("no recipe specified, using default deny-all policy");
+        return Ok(SandboxConfig::default_deny());
+    }
+
+    let mut merged: Option<RecipeFile> = None;
+
+    for arg in recipe_args {
+        let path = resolve_recipe_path(arg)?;
+        let recipe = RecipeFile::from_file(&path)
+            .with_context(|| format!("loading recipe: {}", path.display()))?;
+
+        tracing::info!(
+            recipe = recipe.display_name(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+            ),
+            path = %path.display(),
+            "loaded recipe"
+        );
+
+        merged = Some(match merged {
+            Some(base) => base.merge(recipe),
+            None => recipe,
+        });
+    }
+
+    merged
+        .expect("recipe_args was non-empty")
+        .into_sandbox_config()
+        .context("resolving merged recipe")
+}
+
 /// Execute the `can run` command.
 pub fn run(
-    recipe_path: Option<PathBuf>,
+    recipe_args: &[String],
     monitor: bool,
     strict: bool,
     command: Vec<String>,
 ) -> Result<i32> {
-    let config = match recipe_path {
-        Some(ref path) => {
-            let recipe = RecipeFile::from_file(path)
-                .with_context(|| format!("loading recipe: {}", path.display()))?;
-            recipe
-                .into_sandbox_config()
-                .with_context(|| format!("resolving recipe: {}", path.display()))?
-        }
-        None => {
-            tracing::info!("no recipe specified, using default deny-all policy");
-            SandboxConfig::default_deny()
-        }
-    };
+    let config = load_recipes(recipe_args)?;
 
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;
