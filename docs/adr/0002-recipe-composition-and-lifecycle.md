@@ -143,7 +143,7 @@ Six package manager recipes replace the hardcoded prefix detection:
 ### Recipe lifecycle: `can init` / `can update`
 
 Recipes are distributed from the main canister GitHub repository
-(`canister-sandbox/canister`), which already contains a `recipes/` directory.
+(`dergraf/canister`), which already contains a `recipes/` directory.
 
 - `can init` shallow-clones the repository via `git`, copies `.toml` files from
   `recipes/`, validates each as a `RecipeFile`, and writes to

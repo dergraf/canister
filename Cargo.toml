@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 authors = ["Canister Contributors"]
 description = "A lightweight, self-contained sandbox for running untrusted code safely"
-repository = "https://github.com/canister-sandbox/canister"
+repository = "https://github.com/dergraf/canister"
 
 [workspace.dependencies]
 # Error handling

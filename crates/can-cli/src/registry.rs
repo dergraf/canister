@@ -12,7 +12,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 /// Default GitHub repository for recipes (same repo as canister itself).
-const DEFAULT_REPO: &str = "canister-sandbox/canister";
+const DEFAULT_REPO: &str = "dergraf/canister";
 
 /// Default branch to fetch from.
 const DEFAULT_BRANCH: &str = "main";
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn repo_url_default() {
         let url = repo_url(DEFAULT_REPO);
-        assert_eq!(url, "https://github.com/canister-sandbox/canister.git");
+        assert_eq!(url, "https://github.com/dergraf/canister.git");
     }
 
     #[test]
