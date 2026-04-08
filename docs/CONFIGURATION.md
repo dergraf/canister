@@ -4,7 +4,7 @@ Canister uses TOML configuration files with strict schema validation. Unknown
 fields are rejected at parse time.
 
 When no config file is provided (`can run -- command`), a **default deny-all**
-policy is used: no filesystem access, no network, generic seccomp profile.
+policy is used: no filesystem access, no network, default seccomp baseline.
 
 ## Table of Contents
 
@@ -13,7 +13,7 @@ policy is used: no filesystem access, no network, generic seccomp profile.
 - [network](#network)
 - [process](#process)
 - [resources](#resources)
-- [profile](#profile)
+- [syscalls](#syscalls)
 - [Strict Mode](#strict-mode)
 - [Monitor Mode](#monitor-mode)
 - [Examples](#examples)
@@ -247,37 +247,69 @@ cpu_percent = 100
 
 ---
 
-## `[profile]`
+## `[syscalls]`
 
-Selects the seccomp BPF profile and enforcement mode.
+Customizes the seccomp BPF baseline and enforcement mode.
+
+Canister ships a single default seccomp baseline defined in
+`recipes/default.toml` (~130 allowed syscalls, ~16 always-denied). The
+baseline is embedded in the binary at compile time and can be overridden by
+placing a `default.toml` in the recipe search path (`./recipes/`,
+`$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
+
+Regular recipes customize the baseline by adding or removing syscalls with
+`allow_extra` / `deny_extra`. The baseline itself uses `allow` / `deny`
+(absolute lists). These two pairs are **mutually exclusive** — a recipe
+either IS the baseline (uses `allow`/`deny`) or EXTENDS it (uses
+`allow_extra`/`deny_extra`).
+
+### Override fields (for regular recipes)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | `string` | `"generic"` | Profile name: `"generic"`, `"python"`, `"node"`, or `"elixir"` |
 | `seccomp_mode` | `string` | `"allow-list"` | Seccomp mode: `"allow-list"` (default deny) or `"deny-list"` (default allow) |
+| `allow_extra` | `string[]` | `[]` | Syscalls to add to the baseline allow list |
+| `deny_extra` | `string[]` | `[]` | Syscalls to add to the deny list (also removed from allow list) |
+
+### Absolute fields (for `default.toml` only)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow` | `string[]` | `[]` | Complete allow list (replaces the baseline, not additive) |
+| `deny` | `string[]` | `[]` | Complete deny list (replaces the baseline, not additive) |
+
+**Mutual exclusion:** Using `allow` or `deny` together with `allow_extra`
+or `deny_extra` in the same `[syscalls]` section is a validation error.
 
 **Seccomp modes:**
 
 | Mode | Default action | Listed syscalls | Use case |
 |------|---------------|-----------------|----------|
-| `allow-list` | DENY all | Only listed syscalls permitted | Production, CI (recommended) |
-| `deny-list` | ALLOW all | Only listed syscalls blocked | Compatibility, unknown workloads |
+| `allow-list` | DENY all | Only baseline + `allow_extra` syscalls permitted | Production, CI (recommended) |
+| `deny-list` | ALLOW all | Only baseline deny + `deny_extra` syscalls blocked | Compatibility, unknown workloads |
 
-The profile can also be overridden from the command line:
-
-```bash
-can run --profile python -- python3 script.py
-```
-
-CLI `--profile` takes precedence over the config file.
-
-See [PROFILES.md](PROFILES.md) for details on what each profile allows/blocks.
+**Examples:**
 
 ```toml
-[profile]
-name = "python"
-seccomp_mode = "allow-list"   # default; or "deny-list" for compatibility
+# Elixir/BEAM: needs ptrace for observer/dbg/recon
+[syscalls]
+allow_extra = ["ptrace"]
+
+# Strict: also block personality for extra hardening
+[syscalls]
+deny_extra = ["personality"]
+
+# Full override: add io_uring support
+[syscalls]
+allow_extra = ["ptrace", "personality", "seccomp", "io_uring_setup", "io_uring_enter", "io_uring_register"]
+
+# Deny-list mode for maximum compatibility
+[syscalls]
+seccomp_mode = "deny-list"
 ```
+
+See [SECCOMP.md](SECCOMP.md) for details on the baseline syscall set and
+how the embed+override resolution works.
 
 ---
 
@@ -335,7 +367,7 @@ can run --monitor --recipe my_policy.toml -- python3 script.py
 | `[process].allow_execve` | Blocks unlisted commands | Logs warning, allows |
 | `[process].env_passthrough` | Strips unlisted vars | Logs stripped count, passes all |
 | `[process].max_pids` | Enforces RLIMIT_NPROC | Logs limit, skips enforcement |
-| `[profile]` seccomp | Returns EPERM on denied syscalls | Logs to kernel audit, allows |
+| `[syscalls]` seccomp | Returns EPERM on denied syscalls | Logs to kernel audit, allows |
 | `[filesystem]` | Overlay + pivot_root | Unchanged (isolation active) |
 | `[network]` | Namespace + slirp4netns | Unchanged (isolation active) |
 
@@ -366,8 +398,7 @@ Equivalent to:
 [filesystem]
 [network]
 deny_all = true
-[profile]
-name = "generic"
+[syscalls]
 ```
 
 ### Python data science
@@ -393,9 +424,6 @@ deny_all = true
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "VIRTUAL_ENV"]
-
-[profile]
-name = "python"
 ```
 
 ### Node.js build
@@ -420,9 +448,6 @@ deny_all = true
 
 [process]
 env_passthrough = ["PATH", "HOME", "NODE_ENV"]
-
-[profile]
-name = "node"
 ```
 
 ### Full network trust
@@ -436,9 +461,6 @@ allow = ["/tmp/workspace"]
 
 [network]
 deny_all = false
-
-[profile]
-name = "generic"
 ```
 
 ### Air-gapped
@@ -452,9 +474,6 @@ deny  = ["/etc", "/root", "/home"]
 
 [network]
 deny_all = true
-
-[profile]
-name = "python"
 ```
 
 ### Strict CI
@@ -479,8 +498,7 @@ allow_execve = ["/usr/bin/python3"]
 memory_mb = 512
 cpu_percent = 100
 
-[profile]
-name = "python"
+[syscalls]
 seccomp_mode = "allow-list"
 ```
 
@@ -513,8 +531,8 @@ env_passthrough = [
     "SECRET_KEY_BASE", "DATABASE_URL", "PORT",
 ]
 
-[profile]
-name = "elixir"
+[syscalls]
+allow_extra = ["ptrace"]   # BEAM tracing tools (:observer, :dbg, recon)
 ```
 
 Usage:

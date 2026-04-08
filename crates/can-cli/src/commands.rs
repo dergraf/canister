@@ -10,7 +10,6 @@ use can_sandbox::setup::{self, ProfileStatus};
 /// Execute the `can run` command.
 pub fn run(
     recipe_path: Option<PathBuf>,
-    profile: Option<String>,
     monitor: bool,
     strict: bool,
     command: Vec<String>,
@@ -28,12 +27,6 @@ pub fn run(
             SandboxConfig::default_deny()
         }
     };
-
-    // Override profile if specified on command line.
-    let mut config = config;
-    if let Some(profile_name) = profile {
-        config.profile.name = profile_name;
-    }
 
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;
@@ -236,37 +229,29 @@ fn setup_remove() -> Result<i32> {
     }
 }
 
-/// Execute the `can profiles` command.
-pub fn profiles() -> Result<i32> {
-    println!("Available seccomp profiles:\n");
-    for name in SeccompProfile::builtin_names() {
-        let profile = SeccompProfile::builtin(name).unwrap();
-        println!(
-            "  {:<12} {} ({} allowed, {} denied syscalls)",
-            profile.name,
-            profile.description,
-            profile.allow_syscalls.len(),
-            profile.deny_syscalls.len(),
-        );
-    }
-    Ok(0)
-}
-
 /// Print a preview of the active policy before running in monitor mode.
 ///
 /// Helps the user understand what enforcement points will be observed.
 fn print_monitor_policy_preview(config: &SandboxConfig) {
     eprintln!("\n--- Monitor Mode: Active Policy Preview ---");
 
-    // Seccomp profile.
-    if let Some(profile) = SeccompProfile::builtin(&config.profile.name) {
-        eprintln!(
-            "  seccomp profile: {} ({} denied syscalls)",
-            profile.name,
-            profile.deny_syscalls.len()
-        );
-    } else {
-        eprintln!("  seccomp profile: {} (unknown)", config.profile.name);
+    // Seccomp baseline + overrides.
+    match SeccompProfile::resolve_baseline() {
+        Ok(resolved) => {
+            let n_allow = resolved.profile.allow_syscalls.len() + config.syscalls.allow_extra.len();
+            let n_deny = resolved.profile.deny_syscalls.len() + config.syscalls.deny_extra.len();
+            eprintln!("  seccomp baseline: default ({n_allow} allowed, {n_deny} denied syscalls)");
+            eprintln!("  baseline source: {}", resolved.source);
+        }
+        Err(e) => {
+            eprintln!("  seccomp baseline: ERROR resolving — {e}");
+        }
+    }
+    if !config.syscalls.allow_extra.is_empty() {
+        eprintln!("  allow_extra:     {:?}", config.syscalls.allow_extra);
+    }
+    if !config.syscalls.deny_extra.is_empty() {
+        eprintln!("  deny_extra:      {:?}", config.syscalls.deny_extra);
     }
 
     // allow_execve.
@@ -324,7 +309,7 @@ fn print_monitor_exit_summary(exit_code: i32, config: &SandboxConfig) {
         eprintln!("  your current policy is likely compatible. Remove --monitor to enforce.");
     } else {
         eprintln!();
-        eprintln!("  Tip: Using default deny-all policy. Consider creating a config file");
+        eprintln!("  Tip: Using default deny-all policy. Consider creating a recipe file");
         eprintln!("  with appropriate allow lists based on the observations above.");
     }
 

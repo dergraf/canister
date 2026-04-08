@@ -1,0 +1,250 @@
+# Default baseline — the canonical syscall policy for Canister.
+#
+# This file defines the base set of allowed and denied syscalls used by
+# every sandbox invocation. It is embedded into the binary via
+# include_str!() as a fallback, but can be overridden by placing a
+# default.toml in the recipe search path:
+#
+#   1. ./recipes/default.toml              (project-local)
+#   2. $XDG_CONFIG_HOME/canister/recipes/  (per-user)
+#   3. /etc/canister/recipes/              (system-wide)
+#
+# Regular recipes extend this baseline with allow_extra / deny_extra.
+# Only the baseline itself uses the absolute allow / deny fields.
+
+[recipe]
+name = "default"
+description = "Default baseline — common syscalls for any Linux process. Blocks dangerous kernel operations and namespace escapes."
+version = "1"
+
+[syscalls]
+# Absolute allow list — syscalls needed by virtually any Linux process:
+# libc init, memory allocation, signal handling, file I/O, threading.
+#
+# Recipes MUST NOT use these fields — they use allow_extra / deny_extra
+# to layer on top of this baseline.
+allow = [
+    # Process lifecycle
+    "fork",
+    "vfork",
+    "clone",
+    "clone3",
+    "execve",
+    "execveat",
+    "kill",
+    "tkill",
+    "tgkill",
+    "exit",
+    "exit_group",
+    "wait4",
+    "waitid",
+
+    # Process control (prctl only — ptrace, personality, seccomp per-recipe)
+    "prctl",
+
+    # File I/O
+    "open",
+    "openat",
+    "openat2",
+    "creat",
+    "close",
+    "read",
+    "write",
+    "readv",
+    "writev",
+    "pread64",
+    "pwrite64",
+    "lseek",
+    "dup",
+    "dup2",
+    "dup3",
+    "fcntl",
+    "flock",
+    "fsync",
+    "fdatasync",
+    "truncate",
+    "ftruncate",
+
+    # File metadata
+    "stat",
+    "fstat",
+    "lstat",
+    "newfstatat",
+    "access",
+    "faccessat",
+    "faccessat2",
+    "chmod",
+    "fchmod",
+    "fchmodat",
+    "chown",
+    "fchown",
+    "lchown",
+    "fchownat",
+
+    # Directory operations
+    "mkdir",
+    "mkdirat",
+    "rmdir",
+    "rename",
+    "renameat",
+    "renameat2",
+    "link",
+    "linkat",
+    "unlink",
+    "unlinkat",
+    "symlink",
+    "symlinkat",
+    "readlink",
+    "readlinkat",
+    "getdents",
+    "getdents64",
+
+    # Memory
+    "mmap",
+    "mprotect",
+    "munmap",
+    "mremap",
+    "madvise",
+    "brk",
+    "mlock",
+    "mlock2",
+    "munlock",
+    "mlockall",
+    "munlockall",
+
+    # Network
+    "socket",
+    "connect",
+    "accept",
+    "accept4",
+    "bind",
+    "listen",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "shutdown",
+    "getsockopt",
+    "setsockopt",
+    "getsockname",
+    "getpeername",
+    "socketpair",
+
+    # Signals
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "rt_sigreturn",
+    "sigaltstack",
+
+    # Time
+    "nanosleep",
+    "clock_nanosleep",
+    "clock_gettime",
+    "clock_getres",
+    "gettimeofday",
+
+    # Polling / async I/O
+    "poll",
+    "ppoll",
+    "select",
+    "pselect6",
+    "epoll_create",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_wait",
+    "epoll_pwait",
+    "eventfd",
+    "eventfd2",
+    "timerfd_create",
+    "timerfd_settime",
+    "timerfd_gettime",
+
+    # IPC
+    "pipe",
+    "pipe2",
+    "shmget",
+    "shmat",
+    "shmctl",
+    "shmdt",
+    "semget",
+    "semop",
+    "semctl",
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+
+    # Process info
+    "getpid",
+    "getppid",
+    "getuid",
+    "getgid",
+    "geteuid",
+    "getegid",
+    "gettid",
+    "getpgid",
+    "setpgid",
+    "setsid",
+    "getgroups",
+    "setgroups",
+    "setuid",
+    "setgid",
+    "setreuid",
+    "setregid",
+    "setresuid",
+    "setresgid",
+
+    # I/O control + legacy AIO
+    "ioctl",
+    "io_setup",
+    "io_submit",
+    "io_getevents",
+    "io_destroy",
+
+    # Misc / threading
+    "futex",
+    "set_tid_address",
+    "set_robust_list",
+    "get_robust_list",
+    "sched_yield",
+    "sched_getaffinity",
+    "sched_setaffinity",
+    "getcwd",
+    "chdir",
+    "fchdir",
+    "umask",
+    "uname",
+    "sysinfo",
+    "getrandom",
+    "memfd_create",
+    "copy_file_range",
+    "sendfile",
+    "splice",
+    "tee",
+
+    # Arch-specific
+    "arch_prctl",
+]
+
+# Absolute deny list — dangerous kernel operations that a sandboxed
+# process should never need. Always denied regardless of mode.
+deny = [
+    "reboot",
+    "kexec_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "swapon",
+    "swapoff",
+    "acct",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "syslog",
+    "settimeofday",
+    # Namespace escapes — a sandboxed process must never create new
+    # namespaces or join existing ones.
+    "unshare",
+    "setns",
+]

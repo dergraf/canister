@@ -1,17 +1,31 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
-/// A seccomp profile defines which syscalls are allowed or denied for a given
-/// workload type.
+use crate::config::{ConfigError, RecipeFile, SyscallConfig};
+
+/// The default baseline TOML, embedded at compile time.
+///
+/// This is the fallback when no external `default.toml` is found in
+/// the recipe search path. The file lives at `recipes/default.toml`
+/// in the source tree.
+const EMBEDDED_DEFAULT: &str = include_str!("../../../recipes/default.toml");
+
+/// A seccomp profile defines which syscalls are allowed or denied.
+///
+/// There is one canonical baseline defined in `recipes/default.toml`.
+/// At runtime, the baseline is resolved from the recipe search path
+/// (project-local → per-user → system-wide) with the embedded copy
+/// as a fallback.
 ///
 /// Supports two enforcement modes:
 /// - **Allow-list** (default deny): only syscalls in `allow_syscalls` are
-///   permitted. Everything else is blocked. This is the recommended mode
-///   for production and CI.
+///   permitted. Everything else is blocked. Recommended for production/CI.
 /// - **Deny-list** (default allow): only syscalls in `deny_syscalls` are
 ///   blocked. Everything else is permitted. More permissive, useful for
 ///   compatibility when the workload's syscall set is unknown.
 ///
-/// The mode is selected via `[profile] seccomp_mode` in the config.
+/// The mode is selected via `[syscalls] seccomp_mode` in the recipe.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SeccompProfile {
     /// Human-readable name.
@@ -29,375 +43,242 @@ pub struct SeccompProfile {
     pub deny_syscalls: Vec<String>,
 }
 
-/// Syscalls that are dangerous in any context — kernel-level operations
-/// that a sandboxed process should never need. These are always denied
-/// regardless of mode and never appear in any allow list.
-const DENY_ALWAYS: &[&str] = &[
-    "reboot",
-    "kexec_load",
-    "init_module",
-    "finit_module",
-    "delete_module",
-    "swapon",
-    "swapoff",
-    "acct",
-    "mount",
-    "umount2",
-    "pivot_root",
-    "chroot",
-    "syslog",
-    "settimeofday",
-];
+/// Where the baseline was loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselineSource {
+    /// Loaded from an external file on the recipe search path.
+    External(PathBuf),
+    /// Using the copy embedded in the binary.
+    Embedded,
+}
 
-// ---------------------------------------------------------------------------
-// Allow-list base sets
-//
-// These are the syscalls needed by virtually every userspace workload.
-// Profile-specific syscalls are added on top of this base.
-// ---------------------------------------------------------------------------
+impl std::fmt::Display for BaselineSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::External(path) => write!(f, "{}", path.display()),
+            Self::Embedded => write!(f, "(embedded)"),
+        }
+    }
+}
 
-/// Syscalls needed by virtually any Linux process — libc init, memory
-/// allocation, signal handling, file I/O, and thread primitives.
-const ALLOW_BASE: &[&str] = &[
-    // Process lifecycle
-    "fork",
-    "vfork",
-    "clone",
-    "clone3",
-    "execve",
-    "execveat",
-    "kill",
-    "tkill",
-    "tgkill",
-    "exit",
-    "exit_group",
-    "wait4",
-    "waitid",
-    // Process control (prctl only — ptrace, personality, seccomp per-profile)
-    "prctl",
-    // File I/O
-    "open",
-    "openat",
-    "openat2",
-    "creat",
-    "close",
-    "read",
-    "write",
-    "readv",
-    "writev",
-    "pread64",
-    "pwrite64",
-    "lseek",
-    "dup",
-    "dup2",
-    "dup3",
-    "fcntl",
-    "flock",
-    "fsync",
-    "fdatasync",
-    "truncate",
-    "ftruncate",
-    // File metadata
-    "stat",
-    "fstat",
-    "lstat",
-    "newfstatat",
-    "access",
-    "faccessat",
-    "faccessat2",
-    "chmod",
-    "fchmod",
-    "fchmodat",
-    "chown",
-    "fchown",
-    "lchown",
-    "fchownat",
-    // Directory operations
-    "mkdir",
-    "mkdirat",
-    "rmdir",
-    "rename",
-    "renameat",
-    "renameat2",
-    "link",
-    "linkat",
-    "unlink",
-    "unlinkat",
-    "symlink",
-    "symlinkat",
-    "readlink",
-    "readlinkat",
-    "getdents",
-    "getdents64",
-    // Memory
-    "mmap",
-    "mprotect",
-    "munmap",
-    "mremap",
-    "madvise",
-    "brk",
-    "mlock",
-    "mlock2",
-    "munlock",
-    "mlockall",
-    "munlockall",
-    // Network
-    "socket",
-    "connect",
-    "accept",
-    "accept4",
-    "bind",
-    "listen",
-    "sendto",
-    "recvfrom",
-    "sendmsg",
-    "recvmsg",
-    "shutdown",
-    "getsockopt",
-    "setsockopt",
-    "getsockname",
-    "getpeername",
-    "socketpair",
-    // Signals
-    "rt_sigaction",
-    "rt_sigprocmask",
-    "rt_sigreturn",
-    "sigaltstack",
-    // Time
-    "nanosleep",
-    "clock_nanosleep",
-    "clock_gettime",
-    "clock_getres",
-    "gettimeofday",
-    // Polling / async I/O
-    "poll",
-    "ppoll",
-    "select",
-    "pselect6",
-    "epoll_create",
-    "epoll_create1",
-    "epoll_ctl",
-    "epoll_wait",
-    "epoll_pwait",
-    "eventfd",
-    "eventfd2",
-    "timerfd_create",
-    "timerfd_settime",
-    "timerfd_gettime",
-    // IPC
-    "pipe",
-    "pipe2",
-    "shmget",
-    "shmat",
-    "shmctl",
-    "shmdt",
-    "semget",
-    "semop",
-    "semctl",
-    "msgget",
-    "msgsnd",
-    "msgrcv",
-    "msgctl",
-    // Process info
-    "getpid",
-    "getppid",
-    "getuid",
-    "getgid",
-    "geteuid",
-    "getegid",
-    "gettid",
-    "getpgid",
-    "setpgid",
-    "setsid",
-    "getgroups",
-    "setgroups",
-    "setuid",
-    "setgid",
-    "setreuid",
-    "setregid",
-    "setresuid",
-    "setresgid",
-    // I/O control + legacy AIO
-    "ioctl",
-    "io_setup",
-    "io_submit",
-    "io_getevents",
-    "io_destroy",
-    // Misc / threading
-    "futex",
-    "set_tid_address",
-    "set_robust_list",
-    "get_robust_list",
-    "sched_yield",
-    "sched_getaffinity",
-    "sched_setaffinity",
-    "getcwd",
-    "chdir",
-    "fchdir",
-    "umask",
-    "uname",
-    "sysinfo",
-    "getrandom",
-    "memfd_create",
-    "copy_file_range",
-    "sendfile",
-    "splice",
-    "tee",
-    // Arch-specific
-    "arch_prctl",
-];
+/// Result of resolving the default baseline.
+#[derive(Debug, Clone)]
+pub struct ResolvedBaseline {
+    /// The seccomp profile built from the baseline.
+    pub profile: SeccompProfile,
+    /// Where the baseline was loaded from.
+    pub source: BaselineSource,
+}
 
 impl SeccompProfile {
-    /// Load a built-in profile by name.
+    /// Resolve and return the default baseline.
     ///
-    /// Returns `None` if the profile name is unknown.
-    pub fn builtin(name: &str) -> Option<Self> {
-        match name {
-            "generic" => Some(Self::generic()),
-            "python" => Some(Self::python()),
-            "node" => Some(Self::node()),
-            "elixir" => Some(Self::elixir()),
-            _ => None,
+    /// Search order:
+    /// 1. `./recipes/default.toml` (project-local)
+    /// 2. `$XDG_CONFIG_HOME/canister/recipes/default.toml` (per-user)
+    /// 3. `/etc/canister/recipes/default.toml` (system-wide)
+    /// 4. Embedded fallback (compiled into the binary)
+    ///
+    /// Returns the profile and its source for diagnostics.
+    pub fn resolve_baseline() -> Result<ResolvedBaseline, ConfigError> {
+        // Try external files first.
+        for dir in baseline_search_dirs() {
+            let path = dir.join("default.toml");
+            if path.is_file() {
+                let recipe = RecipeFile::from_file(&path)?;
+                let config = recipe.into_sandbox_config()?;
+                let profile = Self::from_baseline_config(&config.syscalls)?;
+                return Ok(ResolvedBaseline {
+                    profile,
+                    source: BaselineSource::External(path),
+                });
+            }
+        }
+
+        // Fall back to the embedded copy.
+        Self::from_embedded()
+    }
+
+    /// Build a baseline from the embedded default.toml.
+    fn from_embedded() -> Result<ResolvedBaseline, ConfigError> {
+        let recipe = RecipeFile::from_str(EMBEDDED_DEFAULT)?;
+        let config = recipe.into_sandbox_config()?;
+        let profile = Self::from_baseline_config(&config.syscalls)?;
+        Ok(ResolvedBaseline {
+            profile,
+            source: BaselineSource::Embedded,
+        })
+    }
+
+    /// Build a `SeccompProfile` from a baseline `SyscallConfig` (one that
+    /// uses absolute `allow`/`deny` fields).
+    fn from_baseline_config(syscalls: &SyscallConfig) -> Result<Self, ConfigError> {
+        if !syscalls.is_baseline() {
+            return Err(ConfigError::Validation(
+                "default.toml must use absolute [syscalls] allow/deny fields".to_string(),
+            ));
+        }
+        Ok(Self {
+            name: "default".to_string(),
+            description: "Default baseline — common syscalls for any Linux process. \
+                          Blocks dangerous kernel operations and namespace escapes."
+                .to_string(),
+            allow_syscalls: syscalls.allow.clone(),
+            deny_syscalls: syscalls.deny.clone(),
+        })
+    }
+
+    /// Build a profile directly from absolute `allow`/`deny` fields.
+    ///
+    /// Used when a `SyscallConfig` with `is_baseline() == true` is passed
+    /// directly (e.g., when `--recipe default.toml` is used explicitly).
+    pub fn from_absolute(syscalls: &SyscallConfig) -> Self {
+        Self {
+            name: "custom-baseline".to_string(),
+            description: "Baseline from absolute allow/deny fields".to_string(),
+            allow_syscalls: syscalls.allow.clone(),
+            deny_syscalls: syscalls.deny.clone(),
         }
     }
 
-    /// List all built-in profile names.
-    pub fn builtin_names() -> &'static [&'static str] {
-        &["generic", "python", "node", "elixir"]
+    /// Return the single built-in "default" baseline.
+    ///
+    /// Convenience wrapper that resolves from the embedded copy.
+    /// Panics if the embedded default.toml is malformed (compile-time
+    /// guarantee — this should never happen).
+    pub fn default_baseline() -> Self {
+        Self::from_embedded()
+            .expect("embedded default.toml is malformed")
+            .profile
     }
 
-    /// Generic profile — broadest built-in profile.
+    /// Apply recipe-level syscall overrides on top of the baseline.
     ///
-    /// Suitable for arbitrary compiled binaries (C, Rust, Go) where the
-    /// syscall set is unknown. Allows ptrace (debuggers), personality
-    /// (multilib), io_uring (modern async I/O), and seccomp (self-sandboxing).
-    /// Only denies DENY_ALWAYS + namespace escapes (unshare/setns).
-    fn generic() -> Self {
-        let mut allow = allow_base();
-        // Generic additionally allows these (other profiles restrict them).
-        allow.extend_from_slice(&[
-            "ptrace".to_string(),
-            "personality".to_string(),
-            "seccomp".to_string(),
-            "io_uring_setup".to_string(),
-            "io_uring_enter".to_string(),
-            "io_uring_register".to_string(),
-        ]);
-
-        let mut deny = deny_always();
-        deny.extend_from_slice(&["unshare".to_string(), "setns".to_string()]);
-
-        Self {
-            name: "generic".to_string(),
-            description: "Generic profile for arbitrary binaries. Blocks dangerous kernel \
-                          operations and namespace escapes. Allows ptrace, io_uring, \
-                          personality, and self-sandboxing."
-                .to_string(),
-            allow_syscalls: allow,
-            deny_syscalls: deny,
+    /// - `allow_extra`: syscalls added to the allow list
+    /// - `deny_extra`: syscalls added to the deny list and removed from allow list
+    pub fn apply_overrides(&mut self, allow_extra: &[String], deny_extra: &[String]) {
+        // Add extra allows (deduplicated).
+        for syscall in allow_extra {
+            if !self.allow_syscalls.contains(syscall) {
+                self.allow_syscalls.push(syscall.clone());
+            }
         }
-    }
 
-    /// Python profile — tighter than generic.
-    ///
-    /// Python scripts don't need ptrace, personality changes, io_uring, or
-    /// self-sandboxing via seccomp. multiprocessing (clone/clone3) and
-    /// subprocess (execve) are allowed via ALLOW_BASE.
-    fn python() -> Self {
-        let allow = allow_base();
-
-        let mut deny = deny_always();
-        deny.extend_from_slice(&[
-            "unshare".to_string(),
-            "setns".to_string(),
-            "ptrace".to_string(),
-            "personality".to_string(),
-            "io_uring_setup".to_string(),
-            "io_uring_enter".to_string(),
-            "io_uring_register".to_string(),
-            "seccomp".to_string(),
-        ]);
-
-        Self {
-            name: "python".to_string(),
-            description: "Profile for Python scripts. Blocks kernel ops, ptrace, io_uring, \
-                          and namespace manipulation."
-                .to_string(),
-            allow_syscalls: allow,
-            deny_syscalls: deny,
-        }
-    }
-
-    /// Node.js profile — similar restrictions to Python.
-    ///
-    /// Node uses worker_threads (clone/clone3) and libuv's epoll-based
-    /// event loop. Does not need ptrace, io_uring, personality, or seccomp.
-    fn node() -> Self {
-        let allow = allow_base();
-
-        let mut deny = deny_always();
-        deny.extend_from_slice(&[
-            "unshare".to_string(),
-            "setns".to_string(),
-            "ptrace".to_string(),
-            "personality".to_string(),
-            "io_uring_setup".to_string(),
-            "io_uring_enter".to_string(),
-            "io_uring_register".to_string(),
-            "seccomp".to_string(),
-        ]);
-
-        Self {
-            name: "node".to_string(),
-            description: "Profile for Node.js. Blocks kernel ops, ptrace, io_uring, \
-                          and namespace manipulation. Preserves clone for worker threads."
-                .to_string(),
-            allow_syscalls: allow,
-            deny_syscalls: deny,
-        }
-    }
-
-    /// Elixir/Erlang profile — tailored for the BEAM VM.
-    ///
-    /// The BEAM runtime requires ptrace for `:observer`, `:dbg`, and
-    /// `erlang:trace/3`. This profile allows ptrace but blocks personality,
-    /// io_uring (BEAM uses epoll), and seccomp self-modification.
-    ///
-    /// Suitable for: `mix` tasks, `iex`, Phoenix applications, OTP releases.
-    fn elixir() -> Self {
-        let mut allow = allow_base();
-        // BEAM needs ptrace for tracing/debugging tools.
-        allow.push("ptrace".to_string());
-
-        let mut deny = deny_always();
-        deny.extend_from_slice(&[
-            "unshare".to_string(),
-            "setns".to_string(),
-            "personality".to_string(),
-            "io_uring_setup".to_string(),
-            "io_uring_enter".to_string(),
-            "io_uring_register".to_string(),
-            "seccomp".to_string(),
-        ]);
-
-        Self {
-            name: "elixir".to_string(),
-            description: "Profile for Elixir/Erlang (BEAM VM). Blocks kernel ops, io_uring, \
-                          and namespace manipulation. Preserves clone, ptrace, and epoll for \
-                          BEAM schedulers and OTP tooling."
-                .to_string(),
-            allow_syscalls: allow,
-            deny_syscalls: deny,
+        // Add extra denies and remove them from allow list.
+        for syscall in deny_extra {
+            self.allow_syscalls.retain(|s| s != syscall);
+            if !self.deny_syscalls.contains(syscall) {
+                self.deny_syscalls.push(syscall.clone());
+            }
         }
     }
 }
 
-/// Build the base deny list from the always-denied set.
-fn deny_always() -> Vec<String> {
-    DENY_ALWAYS.iter().map(|s| (*s).to_string()).collect()
+/// Directories searched for the default baseline, in priority order.
+///
+/// This is also used by `can-cli` for recipe discovery.
+pub fn baseline_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("recipes")];
+
+    // XDG_CONFIG_HOME, defaulting to ~/.config
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(xdg).join("canister/recipes"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".config/canister/recipes"));
+    }
+
+    dirs.push(PathBuf::from("/etc/canister/recipes"));
+    dirs
 }
 
-/// Build the base allow list shared by all profiles.
-fn allow_base() -> Vec<String> {
-    ALLOW_BASE.iter().map(|s| (*s).to_string()).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_default_parses() {
+        let resolved = SeccompProfile::from_embedded().unwrap();
+        assert_eq!(resolved.source, BaselineSource::Embedded);
+        assert!(
+            resolved.profile.allow_syscalls.len() > 100,
+            "expected >100 allowed syscalls, got {}",
+            resolved.profile.allow_syscalls.len()
+        );
+        assert!(
+            resolved.profile.deny_syscalls.len() >= 14,
+            "expected >=14 denied syscalls, got {}",
+            resolved.profile.deny_syscalls.len()
+        );
+    }
+
+    #[test]
+    fn default_baseline_convenience() {
+        let profile = SeccompProfile::default_baseline();
+        assert_eq!(profile.name, "default");
+        assert!(profile.allow_syscalls.len() > 100);
+        assert!(profile.deny_syscalls.len() >= 14);
+    }
+
+    #[test]
+    fn apply_overrides_adds_allow() {
+        let mut profile = SeccompProfile::default_baseline();
+        let base_count = profile.allow_syscalls.len();
+        profile.apply_overrides(&["ptrace".to_string()], &[]);
+        assert_eq!(profile.allow_syscalls.len(), base_count + 1);
+        assert!(profile.allow_syscalls.contains(&"ptrace".to_string()));
+    }
+
+    #[test]
+    fn apply_overrides_adds_deny_and_removes_from_allow() {
+        let mut profile = SeccompProfile::default_baseline();
+        assert!(profile.allow_syscalls.contains(&"read".to_string()));
+        profile.apply_overrides(&[], &["read".to_string()]);
+        assert!(!profile.allow_syscalls.contains(&"read".to_string()));
+        assert!(profile.deny_syscalls.contains(&"read".to_string()));
+    }
+
+    #[test]
+    fn apply_overrides_deduplicates_allow() {
+        let mut profile = SeccompProfile::default_baseline();
+        let base_count = profile.allow_syscalls.len();
+        profile.apply_overrides(&["read".to_string()], &[]);
+        assert_eq!(profile.allow_syscalls.len(), base_count);
+    }
+
+    #[test]
+    fn apply_overrides_deduplicates_deny() {
+        let mut profile = SeccompProfile::default_baseline();
+        let base_deny_count = profile.deny_syscalls.len();
+        profile.apply_overrides(&[], &["reboot".to_string()]);
+        assert_eq!(profile.deny_syscalls.len(), base_deny_count);
+    }
+
+    #[test]
+    fn no_overlap_between_allow_and_deny() {
+        let profile = SeccompProfile::default_baseline();
+        for syscall in &profile.allow_syscalls {
+            assert!(
+                !profile.deny_syscalls.contains(syscall),
+                "syscall '{syscall}' appears in both allow and deny lists"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_source_display() {
+        assert_eq!(BaselineSource::Embedded.to_string(), "(embedded)");
+        assert_eq!(
+            BaselineSource::External(PathBuf::from("/etc/canister/recipes/default.toml"))
+                .to_string(),
+            "/etc/canister/recipes/default.toml"
+        );
+    }
+
+    #[test]
+    fn resolve_baseline_returns_embedded_when_no_external() {
+        // In test environment, there may or may not be a ./recipes/default.toml.
+        // We just verify it doesn't error.
+        let resolved = SeccompProfile::resolve_baseline().unwrap();
+        assert!(resolved.profile.allow_syscalls.len() > 100);
+    }
 }

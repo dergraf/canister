@@ -14,7 +14,18 @@ strict = true
 name = "generic-strict"
 description = "Strict deny-all policy for untrusted binaries (CI/production)"
 version = "1"
-baseline = "generic"
+
+[syscalls]
+# For compiled binaries that may use ptrace (debuggers), io_uring
+# (modern async I/O), personality (multilib), or seccomp (self-sandboxing).
+allow_extra = [
+    "ptrace",
+    "personality",
+    "seccomp",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+]
 
 [filesystem]
 allow = [

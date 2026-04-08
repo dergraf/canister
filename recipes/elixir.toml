@@ -1,7 +1,7 @@
 # Canister recipe for Elixir/Erlang workloads.
 #
-# Works with system-installed Elixir and with Nix/asdf/mise-installed
-# versions — the sandbox auto-detects and mounts the package prefix.
+# The BEAM VM needs ptrace for :observer, :dbg, and erlang:trace/3.
+# This recipe adds ptrace to the default baseline via [syscalls].
 #
 # Usage:
 #   can run --recipe recipes/elixir.toml -- mix test
@@ -12,11 +12,14 @@
 name = "elixir-dev"
 description = "Elixir/Erlang development: mix tasks, iex, Phoenix server"
 version = "1"
-baseline = "elixir"
 
 # Strict mode: abort if any isolation layer cannot be set up.
 # Recommended for CI. Uncomment to enable.
 # strict = true
+
+[syscalls]
+# BEAM needs ptrace for tracing/debugging tools (:observer, :dbg).
+allow_extra = ["ptrace"]
 
 [filesystem]
 # Paths the sandboxed BEAM process can access.
@@ -79,9 +82,3 @@ env_passthrough = [
 memory_mb = 1024
 # CPU limit as percentage of one core (enforced via cgroups v2).
 cpu_percent = 100
-
-# [profile] section is no longer needed when baseline is set in [recipe].
-# Kept here commented out for reference:
-# [profile]
-# name = "elixir"
-# seccomp_mode = "allow-list"

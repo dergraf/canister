@@ -12,5 +12,4 @@ deny_all = true
 max_pids = 32
 env_passthrough = ["PATH"]
 
-[profile]
-name = "python"
+[syscalls]

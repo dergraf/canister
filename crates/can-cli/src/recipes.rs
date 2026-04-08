@@ -2,35 +2,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use can_policy::profile::baseline_search_dirs;
 use can_policy::{RecipeFile, SeccompProfile};
-
-/// Directories searched for recipe files, in order of priority.
-///
-/// 1. `./recipes/` — project-local recipes
-/// 2. `$XDG_CONFIG_HOME/canister/recipes/` — per-user recipes
-/// 3. `/etc/canister/recipes/` — system-wide recipes
-fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("recipes")];
-
-    // XDG_CONFIG_HOME, defaulting to ~/.config
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        dirs.push(PathBuf::from(xdg).join("canister/recipes"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".config/canister/recipes"));
-    }
-
-    dirs.push(PathBuf::from("/etc/canister/recipes"));
-    dirs
-}
 
 /// Discover all `.toml` recipe files across search directories.
 ///
-/// Returns `(path, RecipeFile)` pairs. Files that fail to parse are
+/// Returns `(path, RecipeFile)` pairs. `default.toml` is excluded — it
+/// is the baseline, not a regular recipe. Files that fail to parse are
 /// skipped with a warning (tracing).
 fn discover() -> Vec<(PathBuf, RecipeFile)> {
     let mut recipes = Vec::new();
 
-    for dir in search_dirs() {
+    for dir in baseline_search_dirs() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(_) => continue, // directory doesn't exist or unreadable
@@ -39,7 +22,10 @@ fn discover() -> Vec<(PathBuf, RecipeFile)> {
         let mut paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "toml")
+                    && p.file_stem().is_some_and(|s| s != "default")
+            })
             .collect();
         paths.sort();
 
@@ -59,7 +45,7 @@ fn discover() -> Vec<(PathBuf, RecipeFile)> {
 /// Execute the `can recipes` command.
 ///
 /// Lists discovered recipes from the search path, followed by
-/// built-in baselines (the raw seccomp profiles).
+/// information about the default seccomp baseline and its source.
 pub fn list() -> Result<i32> {
     let recipes = discover();
 
@@ -76,13 +62,14 @@ pub fn list() -> Result<i32> {
                 .unwrap_or("unknown");
             let name = recipe.display_name(stem);
             let desc = recipe.description();
-            let baseline = recipe.baseline_name();
+
+            let extras = format_syscall_extras(&recipe.syscalls);
 
             if desc.is_empty() {
-                println!("  {name:<20} baseline={baseline:<10} {}", path.display());
+                println!("  {name:<20} {extras:<30} {}", path.display());
             } else {
                 println!(
-                    "  {name:<20} {desc}\n  {:<20} baseline={baseline:<10} {}",
+                    "  {name:<20} {desc}\n  {:<20} {extras:<30} {}",
                     "",
                     path.display()
                 );
@@ -91,24 +78,43 @@ pub fn list() -> Result<i32> {
     }
 
     println!("\nSearch path:");
-    for dir in search_dirs() {
+    for dir in baseline_search_dirs() {
         let exists = dir.is_dir();
-        let marker = if exists { "✓" } else { " " };
+        let marker = if exists { "+" } else { " " };
         println!("  {marker} {}", dir.display());
     }
 
-    // --- Built-in baselines ---
-    println!("\nBuilt-in baselines (seccomp profiles):\n");
-    for name in SeccompProfile::builtin_names() {
-        let profile = SeccompProfile::builtin(name).unwrap();
-        println!(
-            "  {:<12} {} ({} allowed, {} denied syscalls)",
-            profile.name,
-            profile.description,
-            profile.allow_syscalls.len(),
-            profile.deny_syscalls.len(),
-        );
+    // --- Default baseline ---
+    match SeccompProfile::resolve_baseline() {
+        Ok(resolved) => {
+            println!(
+                "\nDefault baseline: {} allowed, {} denied syscalls",
+                resolved.profile.allow_syscalls.len(),
+                resolved.profile.deny_syscalls.len(),
+            );
+            println!("  Source: {}", resolved.source);
+        }
+        Err(e) => {
+            println!("\nDefault baseline: ERROR resolving — {e}");
+        }
     }
+    println!("  Customize per-recipe with [syscalls] allow_extra / deny_extra");
 
     Ok(0)
+}
+
+/// Format the syscall extras for display in recipe listing.
+fn format_syscall_extras(syscalls: &can_policy::SyscallConfig) -> String {
+    let mut parts = Vec::new();
+    if !syscalls.allow_extra.is_empty() {
+        parts.push(format!("+{}", syscalls.allow_extra.join(",")));
+    }
+    if !syscalls.deny_extra.is_empty() {
+        parts.push(format!("-{}", syscalls.deny_extra.join(",")));
+    }
+    if parts.is_empty() {
+        "(default syscalls)".to_string()
+    } else {
+        parts.join(" ")
+    }
 }

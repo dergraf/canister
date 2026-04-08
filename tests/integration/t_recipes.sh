@@ -4,10 +4,10 @@
 #
 # Tests:
 #   1. can recipes lists discovered recipes
-#   2. can recipes lists built-in baselines
+#   2. can recipes shows default baseline info
 #   3. --recipe flag works (loads a recipe TOML)
-#   4. --recipe with --profile overrides baseline
-#   5. Recipe with unknown baseline is rejected
+#   4. Recipe with [syscalls] allow_extra works
+#   5. Recipe with unknown fields is rejected (deny_unknown_fields)
 #   6. Plain policy (no [recipe] section) works via --recipe
 # ============================================================================
 
@@ -22,13 +22,11 @@ assert_exit_code 0 "$RUN_EXIT"
 # Should find the example recipes in ./recipes/
 assert_contains "$RUN_STDOUT" "Discovered recipes"
 
-# ---- Test 2: can recipes lists baselines ----
-begin_test "can recipes lists built-in baselines"
-assert_contains "$RUN_STDOUT" "Built-in baselines"
-assert_contains "$RUN_STDOUT" "generic"
-assert_contains "$RUN_STDOUT" "python"
-assert_contains "$RUN_STDOUT" "node"
-assert_contains "$RUN_STDOUT" "elixir"
+# ---- Test 2: can recipes shows default baseline ----
+begin_test "can recipes shows default baseline info"
+assert_contains "$RUN_STDOUT" "Default baseline"
+assert_contains "$RUN_STDOUT" "allowed"
+assert_contains "$RUN_STDOUT" "denied"
 
 # ---- Test 3: --recipe flag works ----
 begin_test "--recipe loads a recipe TOML file"
@@ -36,7 +34,6 @@ TMPRECIPE=$(tmpconfig <<'EOF'
 [recipe]
 name = "test-recipe"
 description = "Integration test recipe"
-baseline = "generic"
 
 [network]
 deny_all = true
@@ -47,39 +44,46 @@ run_can run --recipe "$TMPRECIPE" -- echo "recipe works"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "recipe works" "$RUN_STDOUT"
 
-# ---- Test 4: --recipe with --profile overrides baseline ----
-begin_test "--profile overrides recipe baseline"
+# ---- Test 4: Recipe with [syscalls] allow_extra ----
+begin_test "recipe with [syscalls] allow_extra works"
 TMPRECIPE2=$(tmpconfig <<'EOF'
 [recipe]
-name = "override-test"
-baseline = "python"
+name = "syscall-test"
+description = "Tests allow_extra override"
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[syscalls]
+allow_extra = ["ptrace", "personality"]
 EOF
 )
 _TMPFILES+=("$TMPRECIPE2")
-# Recipe says "python" but --profile says "generic"
-run_can run --recipe "$TMPRECIPE2" --profile generic -- echo "override"
+run_can run --recipe "$TMPRECIPE2" -- echo "allow_extra works"
 assert_exit_code 0 "$RUN_EXIT"
-assert_eq "override" "$RUN_STDOUT"
+assert_eq "allow_extra works" "$RUN_STDOUT"
 
-# ---- Test 5: Unknown baseline is rejected ----
-begin_test "recipe with unknown baseline is rejected"
+# ---- Test 5: Unknown fields rejected (migration guard) ----
+begin_test "recipe with unknown fields is rejected"
 TMPBAD=$(tmpconfig <<'EOF'
 [recipe]
-baseline = "nonexistent"
+name = "bad-recipe"
+baseline = "python"
 EOF
 )
 _TMPFILES+=("$TMPBAD")
 run_can run --recipe "$TMPBAD" -- echo "should fail"
-assert_neq 0 "$RUN_EXIT" "unknown baseline should be rejected"
-assert_contains "$RUN_STDERR" "nonexistent"
+assert_neq 0 "$RUN_EXIT" "unknown field 'baseline' should be rejected"
 
 # ---- Test 6: Plain policy without [recipe] section works ----
 begin_test "plain policy (no [recipe] section) works via --recipe"
 TMPPLAIN=$(tmpconfig <<'EOF'
 [network]
 deny_all = true
-[profile]
-name = "generic"
+[syscalls]
 EOF
 )
 _TMPFILES+=("$TMPPLAIN")

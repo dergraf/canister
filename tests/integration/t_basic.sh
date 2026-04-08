@@ -8,7 +8,7 @@
 #   3. Python script runs inside the sandbox
 #   4. Nonexistent command fails with appropriate error
 #   5. can check runs successfully
-#   6. can profiles lists all built-in profiles
+#   6. can recipes shows default baseline info
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -56,13 +56,12 @@ run_can check
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "User namespaces"
 
-# ---- Test 8: can profiles ----
-begin_test "can profiles lists all profiles"
-run_can profiles
+# ---- Test 8: can recipes ----
+begin_test "can recipes shows default baseline"
+run_can recipes
 assert_exit_code 0 "$RUN_EXIT"
-assert_contains "$RUN_STDOUT" "generic"
-assert_contains "$RUN_STDOUT" "python"
-assert_contains "$RUN_STDOUT" "node"
-assert_contains "$RUN_STDOUT" "elixir"
+assert_contains "$RUN_STDOUT" "Discovered recipes"
+assert_contains "$RUN_STDOUT" "Default baseline"
+assert_contains "$RUN_STDOUT" "allowed"
 
 summary

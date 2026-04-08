@@ -349,7 +349,16 @@ is no network isolation.
 **Syscall:** `prctl(PR_SET_NO_NEW_PRIVS)` + `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`
 
 A classic BPF program is loaded right before `execve()`. The filter is
-generated at runtime from the selected profile's syscall list.
+generated at runtime from the default baseline defined in
+`recipes/default.toml` plus any `[syscalls]` overrides (`allow_extra` /
+`deny_extra`).
+
+The baseline is embedded in the binary via `include_str!()` so it works
+standalone. At runtime, Canister searches for an external `default.toml` in
+`./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
+`/etc/canister/recipes/`. If found, the external file takes precedence over
+the embedded copy. This lets users pin, audit, or version-control the
+baseline without recompiling.
 
 **Two modes — allow-list (default) and deny-list:**
 
@@ -397,7 +406,7 @@ Instruction  What it does
 [N+2]        Return ERRNO(EPERM) (match → denied)
 ```
 
-The mode is selected via `[profile] seccomp_mode` in the config file
+The mode is selected via `[syscalls] seccomp_mode` in the config file
 (default: `"allow-list"`).
 
 **Architecture validation:** The first check rejects any syscall from a
@@ -411,8 +420,8 @@ process is killed immediately on any denied syscall.
 
 **Security property:** Even if a process escapes all namespace isolation,
 it cannot invoke unlisted syscalls. The filter is enforced by the kernel and
-cannot be removed or modified by the filtered process (loading new filters
-is blocked in all profiles except `generic`).
+cannot be removed or modified by the filtered process (loading new seccomp
+filters is blocked by the default baseline's deny list).
 
 ### 5. Process Control
 

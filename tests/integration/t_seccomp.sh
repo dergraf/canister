@@ -6,8 +6,8 @@
 #   1. mount() is denied (all profiles block it)
 #   2. reboot() is denied (all profiles block it)
 #   3. unshare() is denied (namespace escape blocked)
-#   4. Allow-list mode works (python profile)
-#   5. Deny-list mode works (python profile, legacy)
+#   4. Allow-list mode works (default baseline)
+#   5. Deny-list mode works (default baseline)
 #   6. Strict mode kills process on denied syscall
 # ============================================================================
 

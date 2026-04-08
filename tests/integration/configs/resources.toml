@@ -14,5 +14,4 @@ env_passthrough = ["PATH", "HOME"]
 memory_mb = 64
 cpu_percent = 50
 
-[profile]
-name = "python"
+[syscalls]

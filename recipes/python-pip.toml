@@ -12,7 +12,6 @@
 name = "python-pip"
 description = "Install Python packages with pip (network access to PyPI)"
 version = "1"
-baseline = "python"
 
 [filesystem]
 allow = [

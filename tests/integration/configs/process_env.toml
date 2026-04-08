@@ -11,5 +11,4 @@ deny_all = true
 max_pids = 32
 env_passthrough = ["PATH", "HOME"]
 
-[profile]
-name = "generic"
+[syscalls]

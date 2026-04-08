@@ -10,6 +10,5 @@ deny_all = true
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
-[profile]
-name = "python"
+[syscalls]
 seccomp_mode = "allow-list"

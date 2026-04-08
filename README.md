@@ -10,7 +10,7 @@
   <a href="#configuration">Configuration</a> &middot;
   <a href="docs/ARCHITECTURE.md">Architecture</a> &middot;
   <a href="docs/CONFIGURATION.md">Config Reference</a> &middot;
-  <a href="docs/PROFILES.md">Seccomp Profiles</a>
+  <a href="docs/SECCOMP.md">Seccomp Filtering</a>
 </p>
 
 ---
@@ -34,7 +34,7 @@ discarded.
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via slirp4netns), or full
-- **Seccomp BPF** -- default-deny allow-list syscall filtering with built-in profiles for generic, Python, Node.js, and Elixir/Erlang workloads
+- **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~130 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
 - **Process isolation** -- PID namespace, environment filtering, RLIMIT_NPROC, execve whitelisting
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
 - **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS, all degradation is fatal
@@ -42,7 +42,7 @@ discarded.
 - **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
 - **Graceful degradation** -- detects AppArmor restrictions and falls back to reduced isolation with clear warnings
-- **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata for naming and baseline selection
+- **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata, `[syscalls]` section for per-recipe baseline customization
 - **TTY-aware logging** -- colored human output on terminals, JSON lines when piped
 
 ## Requirements
@@ -86,7 +86,7 @@ The binary is at `target/release/can`.
 ### Run a command in the sandbox
 
 ```bash
-# Minimal -- default deny-all policy, generic seccomp profile
+# Minimal -- default deny-all policy, default seccomp baseline
 can run -- echo "hello from the sandbox"
 
 # With a recipe file
@@ -95,7 +95,7 @@ can run --recipe recipes/example.toml -- python3 script.py
 # Strict mode for CI -- all degradation is fatal, seccomp kills on violation
 can run --strict --recipe recipes/example.toml -- python3 script.py
 
-# Elixir/Erlang -- run mix tasks or iex
+# Elixir/Erlang -- run mix tasks or iex (recipe adds ptrace to baseline)
 can run --recipe recipes/elixir.toml -- mix test
 can run --recipe recipes/elixir.toml -- iex -S mix
 
@@ -104,9 +104,6 @@ can run --recipe recipes/elixir.toml -- iex -S mix
 can run -- iex -e 'IO.puts("hello")'        # Nix-installed Elixir
 can run -- rg --help                         # Cargo-installed ripgrep
 
-# Override the seccomp profile
-can run --profile python -- python3 -c "print('safe')"
-
 # Monitor mode -- observe what would be blocked without enforcing
 can run --monitor --recipe my_policy.toml -- ./my_program
 
@@ -114,16 +111,18 @@ can run --monitor --recipe my_policy.toml -- ./my_program
 can -v run -- ls /
 ```
 
-### Inspect seccomp profiles
+### Inspect seccomp baseline
 
 ```
-$ can profiles
-Available seccomp profiles:
+$ can recipes
+Discovered recipes:
 
-  generic      Generic profile for arbitrary binaries. (177 allowed, 16 denied)
-  python       Profile for Python scripts. (171 allowed, 22 denied)
-  node         Profile for Node.js scripts. (171 allowed, 22 denied)
-  elixir       Profile for Elixir/Erlang (BEAM VM). (172 allowed, 21 denied)
+  elixir               Elixir/Erlang (BEAM VM) — mix, iex, Phoenix
+                       +ptrace                        recipes/elixir.toml
+  ...
+
+Default baseline: ~130 allowed, ~16 denied syscalls
+  Customize per-recipe with [syscalls] allow_extra / deny_extra
 ```
 
 ## How It Works
@@ -188,13 +187,12 @@ For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Canister uses TOML recipe files. All fields have sensible defaults.
 Unknown fields are rejected. Recipes can include a `[recipe]` metadata
-section to declare a name, description, and baseline (syscall profile).
+section and a `[syscalls]` section to customize the seccomp baseline.
 
 ```toml
 [recipe]
 name = "my-policy"
 description = "Policy for my project"
-baseline = "python"  # selects the seccomp syscall set
 
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/tmp/workspace"]
@@ -214,8 +212,10 @@ env_passthrough = ["PATH", "HOME", "LANG"]
 memory_mb   = 512
 cpu_percent = 50
 
-[profile]
-name = "python"   # or "generic", "node", "elixir"
+[syscalls]
+seccomp_mode = "allow-list"  # default; or "deny-list"
+allow_extra  = ["ptrace"]    # add to the default baseline
+deny_extra   = ["personality"] # remove from the baseline and explicitly deny
 ```
 
 For complete reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
@@ -319,6 +319,7 @@ canister/
 │   ├── can-net/        # Network isolation: netns, slirp4netns, DNS proxy
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
+│   ├── default.toml    # Default seccomp baseline (embedded + overridable)
 │   ├── example.toml    # Example recipe (all options documented)
 │   ├── elixir.toml     # Elixir/Erlang development recipe
 │   ├── python-pip.toml # Python pip install recipe
@@ -327,7 +328,7 @@ canister/
 ├── docs/
 │   ├── ARCHITECTURE.md # Design and execution flow
 │   ├── CONFIGURATION.md# Complete config reference
-│   └── PROFILES.md     # Seccomp profile documentation
+│   └── SECCOMP.md      # Seccomp baseline and filtering docs
 └── canister.apparmor   # AppArmor override for Ubuntu 24.04+
 ```
 

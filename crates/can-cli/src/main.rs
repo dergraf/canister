@@ -30,11 +30,6 @@ enum Commands {
         #[arg(short, long)]
         recipe: Option<PathBuf>,
 
-        /// Seccomp baseline name (overrides recipe baseline).
-        /// Built-in baselines: generic, python, node, elixir.
-        #[arg(short, long)]
-        profile: Option<String>,
-
         /// Run in monitor mode: log access attempts without enforcing.
         #[arg(short, long)]
         monitor: bool,
@@ -60,11 +55,8 @@ enum Commands {
         remove: bool,
     },
 
-    /// List available recipes and built-in baselines.
+    /// List available recipes and the default baseline syscall counts.
     Recipes,
-
-    /// List available seccomp profiles (baselines).
-    Profiles,
 }
 
 fn main() -> ExitCode {
@@ -84,15 +76,13 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Run {
             recipe,
-            profile,
             monitor,
             strict,
             command,
-        } => commands::run(recipe, profile, monitor, strict, command),
+        } => commands::run(recipe, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipes => recipes::list(),
-        Commands::Profiles => commands::profiles(),
     };
 
     match result {

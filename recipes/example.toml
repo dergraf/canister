@@ -1,12 +1,11 @@
 # Example Canister recipe — a complete sandbox policy for Python scripts.
 #
-# Usage: can run --recipe recipes/example.toml python3 script.py
+# Usage: can run --recipe recipes/example.toml -- python3 script.py
 
 [recipe]
 name = "example"
 description = "Example recipe showing all available options"
 version = "1"
-baseline = "python"
 
 # Strict mode: abort if any isolation layer cannot be set up.
 # Recommended for CI. Uncomment to enable.
@@ -40,8 +39,9 @@ memory_mb = 512
 # CPU limit as percentage of one core (enforced via cgroups v2).
 cpu_percent = 50
 
-# [profile] section is no longer needed when baseline is set in [recipe].
-# Kept here commented out for reference:
-# [profile]
-# name = "python"
+# [syscalls] section — customize the default seccomp baseline.
+# Uncomment to add or remove specific syscalls:
+# [syscalls]
 # seccomp_mode = "allow-list"
+# allow_extra = ["ptrace"]        # add ptrace to the allow list
+# deny_extra = ["personality"]    # remove personality from allow, add to deny

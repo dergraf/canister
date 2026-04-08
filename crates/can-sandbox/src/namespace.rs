@@ -402,18 +402,15 @@ fn child_entry(
     // to kernel audit but allowed to proceed. In strict mode, use
     // KILL_PROCESS so violations terminate immediately. In normal mode,
     // use Errno so the process can handle denials gracefully.
-    let profile_name = &config.profile.name;
-    let seccomp_mode = config.profile.seccomp_mode;
+    let seccomp_mode = config.syscalls.seccomp_mode;
     let deny_action = if monitor {
         tracing::warn!(
-            profile = profile_name,
             %seccomp_mode,
             "MONITOR: seccomp using LOG action (denied syscalls will be allowed but logged)"
         );
         seccomp::DenyAction::Log
     } else if strict {
         tracing::info!(
-            profile = profile_name,
             %seccomp_mode,
             "STRICT: seccomp using KILL_PROCESS action"
         );
@@ -421,20 +418,17 @@ fn child_entry(
     } else {
         seccomp::DenyAction::Errno
     };
-    match seccomp::load_and_apply(profile_name, deny_action, seccomp_mode) {
-        Ok(()) => tracing::debug!(profile = profile_name, "seccomp filter applied"),
+    match seccomp::load_and_apply(&config.syscalls, deny_action) {
+        Ok(()) => tracing::debug!("seccomp filter applied"),
         Err(seccomp::SeccompError::EmptyFilter) => {
-            tracing::debug!(
-                profile = profile_name,
-                "no denied syscalls, seccomp skipped"
-            );
+            tracing::debug!("no denied syscalls, seccomp skipped");
         }
         Err(e) if strict => {
-            tracing::error!(profile = profile_name, error = %e, "STRICT: seccomp filter failed");
+            tracing::error!(error = %e, "STRICT: seccomp filter failed");
             return Err(NamespaceError::Seccomp(e));
         }
         Err(e) => {
-            tracing::warn!(profile = profile_name, error = %e, "seccomp filter failed");
+            tracing::warn!(error = %e, "seccomp filter failed");
             return Err(NamespaceError::Seccomp(e));
         }
     }

@@ -64,8 +64,7 @@ allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 deny_all = true
 [process]
 env_passthrough = ["HOME"]
-[profile]
-name = "generic"
+[syscalls]
 EOF
 )
 _TMPFILES+=("$TMPCONF")

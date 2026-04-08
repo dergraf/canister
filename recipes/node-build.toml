@@ -12,7 +12,6 @@
 name = "node-build"
 description = "Node.js build tasks: npm install, build, test"
 version = "1"
-baseline = "node"
 
 [filesystem]
 allow = [

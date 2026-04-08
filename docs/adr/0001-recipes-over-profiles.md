@@ -119,8 +119,8 @@ lookup is deferred to Phase 2.
 - [x] Ship example recipes in `recipes/` directory
 - [x] Update `docs/CONFIGURATION.md` and `docs/PROFILES.md`
 - [x] Remove `--config` backward compatibility — `--recipe` is the only way
-- [ ] Phase 2 ADR: recipe composition, name-based lookup, `[syscalls]` section
-- [ ] Phase 3 ADR: remote registries, versioning, signing
+- [ ] Phase 2 ADR: recipe composition, name-based lookup, remote registries
+- [ ] Phase 3 ADR: versioning, signing
 
 ## Amendments
 
@@ -134,3 +134,50 @@ immediately. Rationale:
 - Two flags doing the same thing creates confusion, not compatibility
 - Cleaner codebase: no mutual-exclusion logic, no deprecation warnings, no dead code paths
 - `--recipe` is strictly better (same format, plus optional `[recipe]` metadata)
+
+### 2026-04-08: Collapse 4 profiles into single default baseline
+
+The original design kept 4 built-in profiles (`generic`, `python`, `node`, `elixir`) as
+"baselines" that recipes could reference. After implementation and analysis, we collapsed them
+into a single default baseline with per-recipe `[syscalls]` overrides. Rationale:
+
+- **Python and Node profiles were literally identical** — same allow list, same deny list
+- The total delta across all 4 profiles was only **6 syscalls**: `ptrace`, `personality`,
+  `seccomp`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`
+- The 4-profile taxonomy gave a false sense of specificity — "I'm using the Python profile"
+  told you almost nothing about what was actually allowed
+
+**What changed:**
+- `--profile` CLI flag removed entirely
+- `can profiles` command removed
+- `[profile]` section in TOML rejected by `deny_unknown_fields` (migration guard)
+- `baseline = "..."` in `[recipe]` rejected by `deny_unknown_fields`
+- New `[syscalls]` section: `allow_extra`, `deny_extra`, `seccomp_mode`
+- Single `SeccompProfile::default_baseline()` replaces 4 profile constructors
+- `SeccompProfile::apply_overrides()` merges recipe overrides onto the baseline
+- `can recipes` shows `+syscall` / `-syscall` annotations per recipe
+
+### 2026-04-08: External default.toml baseline (Phase 2)
+
+The single default baseline was originally defined as Rust constants (`ALLOW_BASE` and
+`DENY_ALWAYS` arrays in `profile.rs`). Phase 2 moved the baseline to an external
+`recipes/default.toml` TOML file, removing all hardcoded syscall lists from Rust code.
+
+**What changed:**
+- `recipes/default.toml` is the single source of truth for the baseline (~130 allow, 16 deny)
+- The file is embedded in the binary via `include_str!()` as a compile-time fallback
+- At runtime, Canister searches `./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
+  `/etc/canister/recipes/` for an external `default.toml`. External file takes precedence.
+- `SyscallConfig` now has absolute `allow`/`deny` fields (used only by `default.toml`) in
+  addition to the relative `allow_extra`/`deny_extra` (used by regular recipes). The two
+  pairs are mutually exclusive — enforced by `validate()`.
+- `ALLOW_BASE` and `DENY_ALWAYS` Rust constants removed from `profile.rs`
+- `SeccompProfile::resolve_baseline()` implements the embed+override search
+- `can recipes` shows the baseline source (embedded vs external path)
+
+**Rationale:**
+- Users can pin/audit/version-control the exact baseline without recompiling
+- The baseline is human-readable TOML, not buried in Rust arrays
+- The embed+override pattern ensures the binary always works standalone
+- Organizations can deploy a custom `default.toml` to `/etc/canister/recipes/`
+  for fleet-wide baseline policy

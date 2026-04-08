@@ -1,7 +1,8 @@
 //! Seccomp BPF filter generation and application.
 //!
-//! Generates classic BPF programs from [`SeccompProfile`] definitions and
-//! applies them via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
+//! Generates classic BPF programs from the default [`SeccompProfile`] baseline
+//! with recipe-level syscall overrides, and applies them via
+//! `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
 //!
 //! Supports two enforcement modes:
 //!
@@ -30,7 +31,7 @@
 //! Architecture validation always uses KILL_PROCESS regardless of mode,
 //! preventing bypasses via x32 ABI on x86_64 or similar cross-arch attacks.
 
-use can_policy::{SeccompMode, SeccompProfile};
+use can_policy::{SeccompMode, SeccompProfile, SyscallConfig};
 
 /// Errors from seccomp filter operations.
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +50,9 @@ pub enum SeccompError {
 
     #[error("seccomp not supported on this architecture")]
     UnsupportedArch,
+
+    #[error("failed to resolve seccomp baseline: {0}")]
+    BaselineResolution(String),
 }
 
 /// What action to take when a denied syscall is invoked.
@@ -185,7 +189,7 @@ fn build_allow_filter(
 
 /// Build a deny-list filter (default ALLOW, explicit denies).
 ///
-/// This is the legacy model. Layout:
+/// Layout:
 /// ```text
 /// [0]  load arch → if mismatch → KILL_PROCESS
 /// [3]  load nr
@@ -288,17 +292,41 @@ pub fn apply_filter(filter: &[libc::sock_filter]) -> Result<(), SeccompError> {
     Ok(())
 }
 
-/// Load a profile by name and apply its seccomp filter.
+/// Resolve the seccomp profile from the syscall config, apply overrides,
+/// and install the BPF filter.
 ///
-/// Convenience function that combines profile lookup, filter generation,
-/// and application.
+/// If the config uses absolute `allow`/`deny` fields (baseline mode),
+/// those define the entire policy. If it uses `allow_extra`/`deny_extra`
+/// (override mode), the default baseline is resolved from the recipe
+/// search path (external file → embedded fallback) and overrides are
+/// applied on top.
+///
+/// This is the main entry point for the sandbox setup path.
 pub fn load_and_apply(
-    profile_name: &str,
+    syscall_config: &SyscallConfig,
     action: DenyAction,
-    mode: SeccompMode,
 ) -> Result<(), SeccompError> {
-    let profile = SeccompProfile::builtin(profile_name)
-        .ok_or_else(|| SeccompError::UnknownSyscall(format!("unknown profile: {profile_name}")))?;
+    let profile = if syscall_config.is_baseline() {
+        // Absolute mode: the config IS the baseline (e.g., default.toml loaded
+        // directly as `--recipe default.toml`). Use its allow/deny as-is.
+        SeccompProfile::from_absolute(syscall_config)
+    } else {
+        // Override mode (or empty): resolve the default baseline, then apply
+        // allow_extra / deny_extra on top.
+        let resolved = SeccompProfile::resolve_baseline()
+            .map_err(|e| SeccompError::BaselineResolution(format!("{e}")))?;
+
+        tracing::debug!(
+            source = %resolved.source,
+            "resolved seccomp baseline"
+        );
+
+        let mut profile = resolved.profile;
+        profile.apply_overrides(&syscall_config.allow_extra, &syscall_config.deny_extra);
+        profile
+    };
+
+    let mode = syscall_config.seccomp_mode;
 
     let syscall_list = match mode {
         SeccompMode::AllowList => &profile.allow_syscalls,
@@ -307,18 +335,18 @@ pub fn load_and_apply(
 
     if syscall_list.is_empty() {
         tracing::debug!(
-            profile = profile_name,
             %mode,
-            "profile has no syscalls for this mode, skipping seccomp"
+            "no syscalls for this mode, skipping seccomp"
         );
         return Ok(());
     }
 
     let filter = build_filter(&profile, action, mode)?;
     tracing::info!(
-        profile = profile_name,
         instructions = filter.len(),
         syscall_count = syscall_list.len(),
+        allow_extra = ?syscall_config.allow_extra,
+        deny_extra = ?syscall_config.deny_extra,
         %mode,
         "applying seccomp filter"
     );
@@ -608,11 +636,25 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
 mod tests {
     use super::*;
 
-    // --- Deny-list mode tests (legacy) ---
+    /// Helper: build default baseline profile (no overrides).
+    fn default_profile() -> SeccompProfile {
+        SeccompProfile::default_baseline()
+    }
+
+    /// Helper: build default profile with overrides applied.
+    fn profile_with_overrides(allow_extra: &[&str], deny_extra: &[&str]) -> SeccompProfile {
+        let mut profile = SeccompProfile::default_baseline();
+        let allow: Vec<String> = allow_extra.iter().map(|s| s.to_string()).collect();
+        let deny: Vec<String> = deny_extra.iter().map(|s| s.to_string()).collect();
+        profile.apply_overrides(&allow, &deny);
+        profile
+    }
+
+    // --- Deny-list mode tests ---
 
     #[test]
-    fn deny_list_filter_for_generic_profile() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+    fn deny_list_filter_for_default_baseline() {
+        let profile = default_profile();
         let n_denied = profile.deny_syscalls.len();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
@@ -622,22 +664,20 @@ mod tests {
         assert_eq!(filter.len(), expected_len, "unexpected filter length");
         assert!(
             n_denied >= 14,
-            "generic profile should deny at least the always-deny set"
+            "default baseline should deny at least the always-deny set"
         );
     }
 
     #[test]
-    fn deny_list_filter_for_python_profile() {
-        let profile = SeccompProfile::builtin("python").unwrap();
-        let n_denied = profile.deny_syscalls.len();
-        let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::DenyList).unwrap();
+    fn deny_list_with_extra_denies() {
+        let base = default_profile();
+        let base_denied = base.deny_syscalls.len();
 
-        let expected_len = 3 + 1 + n_denied + 1 + 1;
-        assert_eq!(filter.len(), expected_len);
-        let generic = SeccompProfile::builtin("generic").unwrap();
-        assert!(
-            n_denied > generic.deny_syscalls.len(),
-            "python should be stricter than generic"
+        let profile = profile_with_overrides(&[], &["ptrace", "personality"]);
+        assert_eq!(
+            profile.deny_syscalls.len(),
+            base_denied + 2,
+            "deny_extra should add to deny list"
         );
     }
 
@@ -667,7 +707,7 @@ mod tests {
 
     #[test]
     fn deny_list_filter_starts_with_arch_check() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
@@ -685,7 +725,7 @@ mod tests {
 
     #[test]
     fn deny_list_ends_with_deny_action() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
@@ -701,7 +741,7 @@ mod tests {
 
     #[test]
     fn deny_list_kill_uses_correct_return() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
@@ -711,7 +751,7 @@ mod tests {
 
     #[test]
     fn deny_list_errno_uses_eperm() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::DenyList).unwrap();
 
         let deny = filter.last().unwrap();
@@ -720,7 +760,7 @@ mod tests {
 
     #[test]
     fn deny_list_log_uses_ret_log() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter = build_filter(&profile, DenyAction::Log, SeccompMode::DenyList).unwrap();
 
         let deny = filter.last().unwrap();
@@ -754,8 +794,8 @@ mod tests {
     // --- Allow-list mode tests ---
 
     #[test]
-    fn allow_list_filter_for_generic_profile() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+    fn allow_list_filter_for_default_baseline() {
+        let profile = default_profile();
         let n_allowed = profile.allow_syscalls.len();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
@@ -765,13 +805,13 @@ mod tests {
         assert_eq!(filter.len(), expected_len, "unexpected filter length");
         assert!(
             n_allowed > 100,
-            "generic allow-list should have >100 syscalls, got {n_allowed}"
+            "default allow-list should have >100 syscalls, got {n_allowed}"
         );
     }
 
     #[test]
     fn allow_list_default_action_is_deny() {
-        let profile = SeccompProfile::builtin("generic").unwrap();
+        let profile = default_profile();
         let filter =
             build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
 
@@ -788,7 +828,7 @@ mod tests {
 
     #[test]
     fn allow_list_errno_as_default_deny() {
-        let profile = SeccompProfile::builtin("python").unwrap();
+        let profile = default_profile();
         let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::AllowList).unwrap();
 
         let deny = &filter[filter.len() - 2];
@@ -835,8 +875,8 @@ mod tests {
     }
 
     #[test]
-    fn allow_list_profiles_have_no_overlap_with_deny_always() {
-        // Verify that no profile's allow list contains any DENY_ALWAYS syscall.
+    fn allow_list_no_overlap_with_deny_always() {
+        // Verify that the default baseline's allow list contains no always-denied syscalls.
         let deny_always: Vec<&str> = vec![
             "reboot",
             "kexec_load",
@@ -852,72 +892,112 @@ mod tests {
             "chroot",
             "syslog",
             "settimeofday",
+            "unshare",
+            "setns",
         ];
-        for name in SeccompProfile::builtin_names() {
-            let profile = SeccompProfile::builtin(name).unwrap();
-            for syscall in &profile.allow_syscalls {
-                assert!(
-                    !deny_always.contains(&syscall.as_str()),
-                    "profile {name} allow-list contains DENY_ALWAYS syscall: {syscall}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn allow_list_all_profiles_compile() {
-        for name in SeccompProfile::builtin_names() {
-            let profile = SeccompProfile::builtin(name).unwrap();
-            let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
+        let profile = default_profile();
+        for syscall in &profile.allow_syscalls {
             assert!(
-                filter.is_ok(),
-                "profile {name} failed to compile in allow-list mode: {:?}",
-                filter.err()
+                !deny_always.contains(&syscall.as_str()),
+                "default allow-list contains DENY_ALWAYS syscall: {syscall}"
             );
         }
     }
 
     #[test]
-    fn deny_list_all_profiles_compile() {
-        for name in SeccompProfile::builtin_names() {
-            let profile = SeccompProfile::builtin(name).unwrap();
-            let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList);
-            assert!(
-                filter.is_ok(),
-                "profile {name} failed to compile in deny-list mode: {:?}",
-                filter.err()
-            );
-        }
-    }
-
-    #[test]
-    fn allow_list_python_is_tighter_than_generic() {
-        let generic = SeccompProfile::builtin("generic").unwrap();
-        let python = SeccompProfile::builtin("python").unwrap();
+    fn allow_list_default_baseline_compiles() {
+        let profile = default_profile();
+        let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
         assert!(
-            python.allow_syscalls.len() < generic.allow_syscalls.len(),
-            "python allow-list ({}) should be smaller than generic ({})",
-            python.allow_syscalls.len(),
-            generic.allow_syscalls.len()
+            filter.is_ok(),
+            "default baseline failed to compile in allow-list mode: {:?}",
+            filter.err()
         );
     }
 
     #[test]
-    fn allow_list_elixir_allows_ptrace() {
-        let elixir = SeccompProfile::builtin("elixir").unwrap();
+    fn deny_list_default_baseline_compiles() {
+        let profile = default_profile();
+        let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList);
         assert!(
-            elixir.allow_syscalls.contains(&"ptrace".to_string()),
-            "elixir profile should allow ptrace for BEAM tracing"
+            filter.is_ok(),
+            "default baseline failed to compile in deny-list mode: {:?}",
+            filter.err()
+        );
+    }
+
+    // --- Override tests ---
+
+    #[test]
+    fn allow_extra_adds_to_allow_list() {
+        let base = default_profile();
+        let base_count = base.allow_syscalls.len();
+
+        let profile = profile_with_overrides(&["ptrace", "io_uring_setup"], &[]);
+        assert_eq!(profile.allow_syscalls.len(), base_count + 2);
+        assert!(profile.allow_syscalls.contains(&"ptrace".to_string()));
+        assert!(
+            profile
+                .allow_syscalls
+                .contains(&"io_uring_setup".to_string())
         );
     }
 
     #[test]
-    fn allow_list_python_denies_ptrace() {
-        let python = SeccompProfile::builtin("python").unwrap();
+    fn deny_extra_removes_from_allow_and_adds_to_deny() {
+        // "read" is in the default allow list
+        let profile = profile_with_overrides(&[], &["read"]);
         assert!(
-            !python.allow_syscalls.contains(&"ptrace".to_string()),
-            "python profile should not allow ptrace"
+            !profile.allow_syscalls.contains(&"read".to_string()),
+            "deny_extra should remove from allow list"
         );
+        assert!(
+            profile.deny_syscalls.contains(&"read".to_string()),
+            "deny_extra should add to deny list"
+        );
+    }
+
+    #[test]
+    fn allow_extra_deduplicates() {
+        // "read" is already in the default allow list
+        let base = default_profile();
+        let base_count = base.allow_syscalls.len();
+
+        let profile = profile_with_overrides(&["read"], &[]);
+        assert_eq!(
+            profile.allow_syscalls.len(),
+            base_count,
+            "duplicate should not increase count"
+        );
+    }
+
+    #[test]
+    fn deny_extra_already_denied_deduplicates() {
+        // "reboot" is already in DENY_ALWAYS
+        let base = default_profile();
+        let base_deny_count = base.deny_syscalls.len();
+
+        let profile = profile_with_overrides(&[], &["reboot"]);
+        assert_eq!(
+            profile.deny_syscalls.len(),
+            base_deny_count,
+            "duplicate deny should not increase count"
+        );
+    }
+
+    #[test]
+    fn allow_extra_with_overrides_compiles() {
+        let profile = profile_with_overrides(
+            &[
+                "ptrace",
+                "io_uring_setup",
+                "io_uring_enter",
+                "io_uring_register",
+            ],
+            &[],
+        );
+        let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
+        assert!(filter.is_ok());
     }
 
     // --- Common tests ---

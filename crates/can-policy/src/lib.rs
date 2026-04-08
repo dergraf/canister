@@ -2,5 +2,5 @@ pub mod config;
 pub mod profile;
 pub mod whitelist;
 
-pub use config::{RecipeFile, RecipeMeta, SandboxConfig, SeccompMode};
-pub use profile::SeccompProfile;
+pub use config::{ConfigError, RecipeFile, RecipeMeta, SandboxConfig, SeccompMode, SyscallConfig};
+pub use profile::{BaselineSource, ResolvedBaseline, SeccompProfile};
