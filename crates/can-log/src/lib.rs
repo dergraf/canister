@@ -4,23 +4,36 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 /// Initialize the logging subsystem.
 ///
-/// Detects whether stdout is a TTY:
+/// Detects whether stderr is a TTY:
 /// - TTY: human-readable, colored output
-/// - Pipe: JSON lines
+/// - Pipe/redirect: JSON lines
+///
+/// All log output goes to stderr so it never contaminates the sandboxed
+/// command's stdout.
 pub fn init() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = std::io::stderr().is_terminal();
 
     if is_tty {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().with_target(false).with_level(true))
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_target(false)
+                    .with_level(true),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().json().with_target(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_writer(std::io::stderr)
+                    .with_target(true),
+            )
             .init();
     }
 }
@@ -28,17 +41,27 @@ pub fn init() {
 /// Initialize logging in verbose mode (debug level).
 pub fn init_verbose() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = std::io::stderr().is_terminal();
 
     if is_tty {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().with_target(true).with_level(true))
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_target(true)
+                    .with_level(true),
+            )
             .init();
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().json().with_target(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_writer(std::io::stderr)
+                    .with_target(true),
+            )
             .init();
     }
 }
@@ -51,13 +74,14 @@ pub fn init_verbose() {
 pub fn init_monitor() {
     // Allow RUST_LOG override, but default to debug for full visibility.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = std::io::stderr().is_terminal();
 
     if is_tty {
         tracing_subscriber::registry()
             .with(filter)
             .with(
                 fmt::layer()
+                    .with_writer(std::io::stderr)
                     .with_target(true)
                     .with_level(true)
                     .with_thread_ids(false),
@@ -66,7 +90,12 @@ pub fn init_monitor() {
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer().json().with_target(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_writer(std::io::stderr)
+                    .with_target(true),
+            )
             .init();
     }
 }
