@@ -89,6 +89,7 @@ dependencies = [
  "can-policy",
  "can-sandbox",
  "clap",
+ "toml",
  "tracing",
 ]
 

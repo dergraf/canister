@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod recipes;
+mod registry;
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +63,34 @@ enum Commands {
 
     /// List available recipes and the default baseline syscall counts.
     Recipes,
+
+    /// Download community recipes to the local config directory.
+    ///
+    /// Clones the canister GitHub repository (shallow) and copies recipe
+    /// .toml files into $XDG_CONFIG_HOME/canister/recipes/.
+    /// Requires git. Prints manual instructions if git is unavailable.
+    Init {
+        /// GitHub repository (owner/repo) to fetch from.
+        #[arg(long, default_value = None)]
+        repo: Option<String>,
+
+        /// Branch to fetch.
+        #[arg(long, default_value = None)]
+        branch: Option<String>,
+    },
+
+    /// Update community recipes from the remote repository.
+    ///
+    /// Re-downloads and overwrites all recipes. Equivalent to `can init`.
+    Update {
+        /// GitHub repository (owner/repo) to fetch from.
+        #[arg(long, default_value = None)]
+        repo: Option<String>,
+
+        /// Branch to fetch.
+        #[arg(long, default_value = None)]
+        branch: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -88,6 +117,8 @@ fn main() -> ExitCode {
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipes => recipes::list(),
+        Commands::Init { repo, branch } => registry::init(repo.as_deref(), branch.as_deref()),
+        Commands::Update { repo, branch } => registry::update(repo.as_deref(), branch.as_deref()),
     };
 
     match result {
