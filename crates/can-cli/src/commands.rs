@@ -12,6 +12,7 @@ pub fn run(
     config_path: Option<PathBuf>,
     profile: Option<String>,
     monitor: bool,
+    strict: bool,
     command: Vec<String>,
 ) -> Result<i32> {
     let config = match config_path {
@@ -27,6 +28,17 @@ pub fn run(
     let mut config = config;
     if let Some(profile_name) = profile {
         config.profile.name = profile_name;
+    }
+
+    // CLI --strict flag overrides config (can only tighten, never loosen).
+    let effective_strict = strict || config.strict;
+
+    if monitor && effective_strict {
+        anyhow::bail!("--monitor and --strict are mutually exclusive");
+    }
+
+    if effective_strict {
+        tracing::warn!("STRICT MODE: all setup failures are fatal, seccomp uses KILL_PROCESS");
     }
 
     if monitor {
@@ -45,6 +57,7 @@ pub fn run(
         args: args.to_vec(),
         config,
         monitor,
+        strict: effective_strict,
     };
 
     let exit_code = can_sandbox::run(&opts)?;
@@ -212,10 +225,11 @@ pub fn profiles() -> Result<i32> {
     for name in SeccompProfile::builtin_names() {
         let profile = SeccompProfile::builtin(name).unwrap();
         println!(
-            "  {:<12} {} ({} denied syscalls)",
+            "  {:<12} {} ({} allowed, {} denied syscalls)",
             profile.name,
             profile.description,
-            profile.deny_syscalls.len()
+            profile.allow_syscalls.len(),
+            profile.deny_syscalls.len(),
         );
     }
     Ok(0)

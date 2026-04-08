@@ -49,6 +49,14 @@ pub struct SandboxOpts {
 
     /// Run in monitor mode (log but don't enforce).
     pub monitor: bool,
+
+    /// Strict mode: fail hard instead of degrading.
+    ///
+    /// When true:
+    /// - Seccomp uses KILL_PROCESS instead of ERRNO
+    /// - Filesystem isolation failures are fatal (no degraded mode)
+    /// - All setup failures abort instead of warning
+    pub strict: bool,
 }
 
 /// Run a command inside the sandbox.
@@ -64,6 +72,7 @@ pub fn run(opts: &SandboxOpts) -> Result<i32, SandboxError> {
         command = %opts.command,
         args = ?opts.args,
         monitor = opts.monitor,
+        strict = opts.strict,
         "starting sandbox"
     );
 

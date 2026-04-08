@@ -7,6 +7,14 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
+    /// Strict mode: fail hard instead of degrading gracefully.
+    ///
+    /// When true, any setup failure (filesystem isolation, seccomp, cgroups)
+    /// is a fatal error instead of a warning. Seccomp uses KILL_PROCESS
+    /// instead of ERRNO. Intended for CI / production use.
+    #[serde(default)]
+    pub strict: bool,
+
     /// Filesystem access policy.
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -172,6 +180,7 @@ impl SandboxConfig {
     /// Return a default config with sensible defaults (deny-all).
     pub fn default_deny() -> Self {
         Self {
+            strict: false,
             filesystem: FilesystemConfig::default(),
             network: NetworkConfig::default(),
             process: ProcessConfig::default(),

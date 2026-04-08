@@ -126,6 +126,10 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             if net_mode == NetworkMode::Filtered {
                 match setup_parent_network(child, &opts.config, &mut net_state) {
                     Ok(()) => tracing::debug!("parent network setup complete"),
+                    Err(e) if opts.strict => {
+                        tracing::error!(error = %e, "STRICT: parent network setup failed");
+                        return Err(NamespaceError::Network(e));
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "parent network setup failed, child will run without filtered network");
                         // Don't fail hard — child will detect missing network
@@ -158,6 +162,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 &opts.config,
                 net_mode,
                 opts.monitor,
+                opts.strict,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -229,6 +234,10 @@ fn setup_parent_network(
 /// Phase 6 additions:
 /// - `monitor` flag: when true, enforcement points log violations but don't block.
 ///   Namespace isolation is still active for accurate observation.
+///
+/// Security hardening:
+/// - `strict` flag: when true, any setup failure is fatal and seccomp uses
+///   KILL_PROCESS instead of ERRNO. Intended for CI / production.
 #[allow(clippy::too_many_arguments)]
 fn child_entry(
     cmd: &CString,
@@ -239,6 +248,7 @@ fn child_entry(
     config: &SandboxConfig,
     net_mode: NetworkMode,
     monitor: bool,
+    strict: bool,
 ) -> Result<(), NamespaceError> {
     // Build clone flags: always user + mount + PID namespaces.
     let mut clone_flags =
@@ -298,11 +308,18 @@ fn child_entry(
     }
 
     // Set up isolated filesystem with bind mounts and pivot_root.
-    // Falls back to degraded mode if AppArmor blocks mount operations.
+    // In strict mode, failures are fatal. Otherwise falls back to degraded mode
+    // if AppArmor blocks mount operations.
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
     let fs_isolated = overlay::try_setup_filesystem(&config.filesystem, command_prefix.as_deref())?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
+    } else if strict {
+        tracing::error!("STRICT: filesystem isolation failed — aborting");
+        return Err(NamespaceError::Overlay(overlay::OverlayError::Mount {
+            path: "/ (strict mode requires full isolation)".to_string(),
+            source: nix::Error::EPERM,
+        }));
     } else {
         tracing::warn!("filesystem isolation DISABLED — running with host filesystem");
     }
@@ -313,6 +330,10 @@ fn child_entry(
             // Bring up loopback so localhost works (e.g., for inter-process comms).
             match can_net::netns::bring_up_loopback() {
                 Ok(()) => tracing::debug!("loopback up (network fully isolated)"),
+                Err(e) if strict => {
+                    tracing::error!(error = %e, "STRICT: failed to bring up loopback");
+                    return Err(NamespaceError::Network(e));
+                }
                 Err(e) => tracing::warn!(error = %e, "failed to bring up loopback"),
             }
         }
@@ -345,8 +366,9 @@ fn child_entry(
 
     // Apply seccomp filter — must be last setup step before exec.
     // In monitor mode, use SECCOMP_RET_LOG so denied syscalls are logged
-    // to kernel audit but allowed to proceed. In normal mode, use Errno
-    // so the process can handle denials gracefully.
+    // to kernel audit but allowed to proceed. In strict mode, use
+    // KILL_PROCESS so violations terminate immediately. In normal mode,
+    // use Errno so the process can handle denials gracefully.
     let profile_name = &config.profile.name;
     let seccomp_mode = config.profile.seccomp_mode;
     let deny_action = if monitor {
@@ -356,6 +378,13 @@ fn child_entry(
             "MONITOR: seccomp using LOG action (denied syscalls will be allowed but logged)"
         );
         seccomp::DenyAction::Log
+    } else if strict {
+        tracing::info!(
+            profile = profile_name,
+            %seccomp_mode,
+            "STRICT: seccomp using KILL_PROCESS action"
+        );
+        seccomp::DenyAction::KillProcess
     } else {
         seccomp::DenyAction::Errno
     };
@@ -366,6 +395,10 @@ fn child_entry(
                 profile = profile_name,
                 "no denied syscalls, seccomp skipped"
             );
+        }
+        Err(e) if strict => {
+            tracing::error!(profile = profile_name, error = %e, "STRICT: seccomp filter failed");
+            return Err(NamespaceError::Seccomp(e));
         }
         Err(e) => {
             tracing::warn!(profile = profile_name, error = %e, "seccomp filter failed");

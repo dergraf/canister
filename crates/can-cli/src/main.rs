@@ -37,6 +37,12 @@ enum Commands {
         #[arg(short, long)]
         monitor: bool,
 
+        /// Strict mode: fail hard instead of degrading gracefully.
+        /// Seccomp uses KILL_PROCESS, filesystem isolation failures are fatal.
+        /// Intended for CI / production use.
+        #[arg(short, long)]
+        strict: bool,
+
         /// The command to execute.
         #[arg(required = true)]
         command: Vec<String>,
@@ -75,8 +81,9 @@ fn main() -> ExitCode {
             config,
             profile,
             monitor,
+            strict,
             command,
-        } => commands::run(config, profile, monitor, command),
+        } => commands::run(config, profile, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Profiles => commands::profiles(),
