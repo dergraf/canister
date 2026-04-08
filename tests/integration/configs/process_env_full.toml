@@ -1,0 +1,14 @@
+# Full passthrough env — passes all common variables.
+# Used by: t_process.sh to test env filtering.
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME", "LANG", "TERM", "USER", "SHELL", "EDITOR"]
+
+[profile]
+name = "generic"

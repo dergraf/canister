@@ -1,0 +1,15 @@
+# Seccomp in allow-list mode (default deny, explicit allow).
+# Used by: t_seccomp.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME", "LANG"]
+
+[profile]
+name = "python"
+seccomp_mode = "allow-list"

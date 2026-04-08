@@ -1,0 +1,15 @@
+# Process control — env filtering and max_pids.
+# Used by: t_process.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+max_pids = 32
+env_passthrough = ["PATH", "HOME"]
+
+[profile]
+name = "generic"

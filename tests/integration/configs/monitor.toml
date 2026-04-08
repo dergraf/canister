@@ -1,0 +1,16 @@
+# Monitor mode config — used with --monitor flag.
+# Used by: t_monitor.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+deny  = ["/etc/shadow"]
+
+[network]
+deny_all = true
+
+[process]
+max_pids = 32
+env_passthrough = ["PATH"]
+
+[profile]
+name = "python"

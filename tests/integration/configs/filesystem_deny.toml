@@ -1,0 +1,15 @@
+# Filesystem with deny rules — blocks /etc/shadow and /root.
+# Used by: t_filesystem.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+deny  = ["/etc/shadow", "/root"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME", "LANG"]
+
+[profile]
+name = "python"

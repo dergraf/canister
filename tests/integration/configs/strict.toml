@@ -1,0 +1,17 @@
+# Strict mode — all degradation is fatal, seccomp kills on violation.
+# Used by: t_strict.sh
+
+strict = true
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME", "LANG"]
+
+[profile]
+name = "python"
+seccomp_mode = "allow-list"

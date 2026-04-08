@@ -1,0 +1,11 @@
+# Minimal config — default deny-all, generic seccomp profile.
+# Used by: t_basic.sh
+
+[filesystem]
+allow = []
+
+[network]
+deny_all = true
+
+[profile]
+name = "generic"

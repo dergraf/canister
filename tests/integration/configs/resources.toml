@@ -1,0 +1,18 @@
+# Resource limits — memory and CPU via cgroups v2.
+# Used by: t_resources.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[resources]
+memory_mb = 64
+cpu_percent = 50
+
+[profile]
+name = "python"

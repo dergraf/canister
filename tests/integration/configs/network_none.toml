@@ -1,0 +1,14 @@
+# Network none mode — no network, loopback only.
+# Used by: t_network.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[profile]
+name = "generic"
