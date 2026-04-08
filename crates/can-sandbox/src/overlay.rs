@@ -347,6 +347,12 @@ fn bind_mount_command_prefix(
 }
 
 /// Mount /proc inside the sandbox for the new PID namespace.
+///
+/// After mounting, masks sensitive /proc paths following the Docker
+/// approach to prevent information leaks:
+/// - Bind-mount /dev/null over files like /proc/kcore, /proc/keys
+/// - Mount tmpfs over directories like /proc/acpi, /proc/scsi
+/// - Remount /proc/sys read-only
 fn mount_proc(root: &Path) -> Result<(), OverlayError> {
     let proc_path = root.join("proc");
     mkdir_p(&proc_path)?;
@@ -362,7 +368,86 @@ fn mount_proc(root: &Path) -> Result<(), OverlayError> {
     .map_err(|source| OverlayError::Mount {
         path: proc_path.display().to_string(),
         source,
-    })
+    })?;
+
+    // Mask sensitive /proc files by bind-mounting /dev/null over them.
+    // These paths can leak host kernel state even from inside a PID namespace.
+    let masked_files = &[
+        "kcore",         // physical memory — trivially exploitable
+        "keys",          // kernel keyring (encryption keys)
+        "sysrq-trigger", // can force kernel crash, reboot, etc.
+        "timer_list",    // high-res timer info, side-channel risk
+        "latency_stats", // scheduler internals
+    ];
+    let dev_null = root.join("dev/null");
+    for entry in masked_files {
+        let target = proc_path.join(entry);
+        if target.exists() {
+            match mount(
+                Some(&dev_null),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                Ok(()) => tracing::debug!(path = %target.display(), "masked /proc entry"),
+                Err(e) => {
+                    tracing::debug!(path = %target.display(), error = %e, "could not mask /proc entry (non-fatal)");
+                }
+            }
+        }
+    }
+
+    // Mask sensitive /proc directories by mounting empty tmpfs over them.
+    let masked_dirs = &[
+        "acpi", // ACPI tables — host hardware info
+        "scsi", // SCSI device info — host hardware
+    ];
+    for entry in masked_dirs {
+        let target = proc_path.join(entry);
+        if target.is_dir() {
+            match mount(
+                Some("tmpfs"),
+                &target,
+                Some("tmpfs"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_RDONLY,
+                Some("size=0"),
+            ) {
+                Ok(()) => tracing::debug!(path = %target.display(), "masked /proc directory"),
+                Err(e) => {
+                    tracing::debug!(path = %target.display(), error = %e, "could not mask /proc dir (non-fatal)");
+                }
+            }
+        }
+    }
+
+    // Remount /proc/sys as read-only to prevent sysctl writes.
+    let proc_sys = proc_path.join("sys");
+    if proc_sys.is_dir() {
+        // First bind-mount onto itself, then remount read-only.
+        let _ = mount(
+            Some(&proc_sys),
+            &proc_sys,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        );
+        let _ = mount(
+            None::<&str>,
+            &proc_sys,
+            None::<&str>,
+            MsFlags::MS_BIND
+                | MsFlags::MS_REMOUNT
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV
+                | MsFlags::MS_NOEXEC,
+            None::<&str>,
+        );
+        tracing::debug!("/proc/sys remounted read-only");
+    }
+
+    Ok(())
 }
 
 /// Create minimal /dev with null, zero, urandom, etc.
