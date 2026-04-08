@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod cgroups;
 pub mod namespace;
 pub mod overlay;
 pub mod process;

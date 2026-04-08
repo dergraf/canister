@@ -9,7 +9,7 @@ use nix::unistd::{ForkResult, Pid, fork, pipe};
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
 
-use crate::{SandboxOpts, overlay, process, resolve_command, seccomp, to_cstring};
+use crate::{SandboxOpts, cgroups, overlay, process, resolve_command, seccomp, to_cstring};
 
 /// Errors specific to namespace operations.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +40,9 @@ pub enum NamespaceError {
 
     #[error("process control failed: {0}")]
     Process(#[from] crate::process::ProcessError),
+
+    #[error("cgroup resource limit failed: {0}")]
+    Cgroup(#[from] crate::cgroups::CgroupError),
 }
 
 /// Spawn a process inside new namespaces.
@@ -361,6 +364,36 @@ fn child_entry(
             );
         } else {
             process::set_max_pids(max_pids)?;
+        }
+    }
+
+    // Apply cgroup v2 resource limits (memory, CPU).
+    let has_cgroup_limits =
+        config.resources.memory_mb.is_some() || config.resources.cpu_percent.is_some();
+    if has_cgroup_limits {
+        if monitor {
+            tracing::warn!(
+                memory_mb = ?config.resources.memory_mb,
+                cpu_percent = ?config.resources.cpu_percent,
+                "MONITOR: would enforce cgroup resource limits, skipping"
+            );
+        } else {
+            match cgroups::apply_limits(config.resources.memory_mb, config.resources.cpu_percent) {
+                Ok(Some(path)) => {
+                    tracing::info!(path = %path.display(), "cgroup resource limits applied");
+                }
+                Ok(None) => {} // no limits configured
+                Err(e) if strict => {
+                    tracing::error!(error = %e, "STRICT: cgroup resource limits failed");
+                    return Err(NamespaceError::Cgroup(e));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "cgroup resource limits unavailable — running without memory/CPU limits"
+                    );
+                }
+            }
         }
     }
 

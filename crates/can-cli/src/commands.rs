@@ -106,6 +106,18 @@ pub fn check() -> Result<i32> {
         println!("                   Install with: sudo apt install slirp4netns");
     }
 
+    // Check cgroup v2 delegation.
+    if caps.cgroups_v2 {
+        if can_sandbox::cgroups::is_available() {
+            println!("  cgroups v2:      available and delegated (memory/CPU limits work)");
+        } else {
+            println!("  cgroups v2:      available but NOT delegated to current user");
+            println!("                   memory_mb and cpu_percent limits will be unavailable");
+        }
+    } else {
+        println!("  cgroups v2:      NOT available (no resource limits)");
+    }
+
     // Check seccomp support.
     if can_sandbox::seccomp::is_supported() {
         println!("  seccomp:         supported");
