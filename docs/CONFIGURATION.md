@@ -296,7 +296,7 @@ strict = true
 **CLI:**
 
 ```bash
-can run --strict --config policy.toml -- python3 script.py
+can run --strict --recipe policy.toml -- python3 script.py
 ```
 
 The CLI `--strict` flag can only tighten — if the config sets `strict = true`,
@@ -325,7 +325,7 @@ enforcement across all policy sections so you can observe what would be
 blocked without actually blocking it.
 
 ```bash
-can run --monitor --config my_policy.toml -- python3 script.py
+can run --monitor --recipe my_policy.toml -- python3 script.py
 ```
 
 **What changes in monitor mode:**
@@ -520,7 +520,7 @@ name = "elixir"
 Usage:
 
 ```bash
-can run --config elixir.toml -- mix test
-can run --config elixir.toml -- iex -S mix
-can run --config elixir.toml -- mix phx.server
+can run --recipe elixir.toml -- mix test
+can run --recipe elixir.toml -- iex -S mix
+can run --recipe elixir.toml -- mix phx.server
 ```

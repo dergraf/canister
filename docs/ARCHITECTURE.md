@@ -78,7 +78,7 @@ Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 
 ## Execution Flow
 
-The complete lifecycle of `can run --config example.toml -- python3 script.py`:
+The complete lifecycle of `can run --recipe example.toml -- python3 script.py`:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -584,7 +584,7 @@ observation) but relaxes policy enforcement. Each enforcement point logs what
 
 ```bash
 # 1. Run with monitor to see what the policy would block
-can run --monitor --config my_policy.toml -- ./my_program
+can run --monitor --recipe my_policy.toml -- ./my_program
 
 # 2. Review MONITOR: lines in output and seccomp audit logs
 journalctl -k | grep seccomp
@@ -592,7 +592,7 @@ journalctl -k | grep seccomp
 # 3. Adjust policy based on observations
 
 # 4. Run with enforcement
-can run --config my_policy.toml -- ./my_program
+can run --recipe my_policy.toml -- ./my_program
 ```
 
 **Security property:** Monitor mode provides NO security guarantees. It is

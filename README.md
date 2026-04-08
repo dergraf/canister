@@ -20,7 +20,7 @@ filesystem, network, and syscall access. No root required. Single binary, zero
 runtime dependencies.
 
 ```
-$ can run --config profiles/example.toml -- python3 untrusted_script.py
+$ can run --recipe recipes/example.toml -- python3 untrusted_script.py
 ```
 
 The script sees an empty filesystem (except explicitly whitelisted paths), can
@@ -42,7 +42,7 @@ discarded.
 - **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
 - **Graceful degradation** -- detects AppArmor restrictions and falls back to reduced isolation with clear warnings
-- **TOML config** -- strict schema with `deny_unknown_fields`, sensible defaults
+- **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata for naming and baseline selection
 - **TTY-aware logging** -- colored human output on terminals, JSON lines when piped
 
 ## Requirements
@@ -89,15 +89,15 @@ The binary is at `target/release/can`.
 # Minimal -- default deny-all policy, generic seccomp profile
 can run -- echo "hello from the sandbox"
 
-# With a config file
-can run --config profiles/example.toml -- python3 script.py
+# With a recipe file
+can run --recipe recipes/example.toml -- python3 script.py
 
 # Strict mode for CI -- all degradation is fatal, seccomp kills on violation
-can run --strict --config profiles/example.toml -- python3 script.py
+can run --strict --recipe recipes/example.toml -- python3 script.py
 
 # Elixir/Erlang -- run mix tasks or iex
-can run --config profiles/elixir.toml -- mix test
-can run --config profiles/elixir.toml -- iex -S mix
+can run --recipe recipes/elixir.toml -- mix test
+can run --recipe recipes/elixir.toml -- iex -S mix
 
 # Commands from any package manager work automatically:
 # Nix, Homebrew, Cargo, pipx, etc. -- prefix is auto-detected and mounted
@@ -108,7 +108,7 @@ can run -- rg --help                         # Cargo-installed ripgrep
 can run --profile python -- python3 -c "print('safe')"
 
 # Monitor mode -- observe what would be blocked without enforcing
-can run --monitor --config my_policy.toml -- ./my_program
+can run --monitor --recipe my_policy.toml -- ./my_program
 
 # Verbose logging (debug level)
 can -v run -- ls /
@@ -186,10 +186,16 @@ For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
-Canister uses TOML configuration files. All fields have sensible defaults.
-Unknown fields are rejected.
+Canister uses TOML recipe files. All fields have sensible defaults.
+Unknown fields are rejected. Recipes can include a `[recipe]` metadata
+section to declare a name, description, and baseline (syscall profile).
 
 ```toml
+[recipe]
+name = "my-policy"
+description = "Policy for my project"
+baseline = "python"  # selects the seccomp syscall set
+
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/tmp/workspace"]
 deny  = ["/etc/shadow"]
@@ -312,9 +318,12 @@ canister/
 │   ├── can-policy/     # Config parsing, whitelist logic, profile definitions
 │   ├── can-net/        # Network isolation: netns, slirp4netns, DNS proxy
 │   └── can-log/        # TTY-aware structured logging
-├── profiles/
-│   ├── example.toml    # Example sandbox configuration
-│   └── elixir.toml     # Elixir/Erlang sandbox configuration
+├── recipes/
+│   ├── example.toml    # Example recipe (all options documented)
+│   ├── elixir.toml     # Elixir/Erlang development recipe
+│   ├── python-pip.toml # Python pip install recipe
+│   ├── node-build.toml # Node.js build recipe
+│   └── generic-strict.toml # Strict deny-all recipe for CI
 ├── docs/
 │   ├── ARCHITECTURE.md # Design and execution flow
 │   ├── CONFIGURATION.md# Complete config reference

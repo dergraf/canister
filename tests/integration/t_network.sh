@@ -20,7 +20,7 @@ CONFIG="${CONFIGS_DIR}/network_none.toml"
 begin_test "no external network access (none mode)"
 # Use sh -c with /dev/tcp is bash-specific, so try a connect via python or
 # just attempt a simple connection failure test.
-run_can run --config "$CONFIG" -- sh -c '
+run_can run --recipe "$CONFIG" -- sh -c '
     # Try a raw TCP connection — this should fail in network-none mode
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "
@@ -48,7 +48,7 @@ assert_contains "$RUN_STDOUT" "NETWORK=unreachable"
 
 # ---- Test 2: Loopback exists ----
 begin_test "loopback interface exists"
-run_can run --config "$CONFIG" -- sh -c 'cat /proc/net/if_inet6 2>/dev/null || echo "LOOPBACK_CHECK=done"'
+run_can run --recipe "$CONFIG" -- sh -c 'cat /proc/net/if_inet6 2>/dev/null || echo "LOOPBACK_CHECK=done"'
 assert_exit_code 0 "$RUN_EXIT"
 
 summary

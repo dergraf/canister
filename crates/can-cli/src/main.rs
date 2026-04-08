@@ -26,15 +26,11 @@ struct Cli {
 enum Commands {
     /// Run a command inside the sandbox.
     Run {
-        /// Path to a recipe TOML file (preferred way to configure the sandbox).
+        /// Path to a recipe TOML file.
         #[arg(short, long)]
         recipe: Option<PathBuf>,
 
-        /// Path to TOML config file (use --recipe instead for new projects).
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-
-        /// Seccomp baseline name (overrides recipe/config).
+        /// Seccomp baseline name (overrides recipe baseline).
         /// Built-in baselines: generic, python, node, elixir.
         #[arg(short, long)]
         profile: Option<String>,
@@ -88,12 +84,11 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Run {
             recipe,
-            config,
             profile,
             monitor,
             strict,
             command,
-        } => commands::run(recipe, config, profile, monitor, strict, command),
+        } => commands::run(recipe, profile, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipes => recipes::list(),

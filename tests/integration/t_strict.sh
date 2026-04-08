@@ -17,7 +17,7 @@ CONFIG="${CONFIGS_DIR}/strict.toml"
 
 # ---- Test 1: Strict mode runs successfully ----
 begin_test "strict mode runs with all features available"
-run_can run --config "$CONFIG" -- echo "strict works"
+run_can run --recipe "$CONFIG" -- echo "strict works"
 # If this system supports all features, it should work.
 # If it doesn't (e.g., AppArmor blocks mounts), strict mode will abort —
 # that's the correct behavior.
@@ -43,7 +43,7 @@ name = "generic"
 EOF
 )
 _TMPFILES+=("$TMPCONF")
-run_can run --strict --config "$TMPCONF" -- echo "strict flag"
+run_can run --strict --recipe "$TMPCONF" -- echo "strict flag"
 if [[ "$RUN_EXIT" -eq 0 ]]; then
     assert_eq "strict flag" "$RUN_STDOUT"
 else
@@ -52,7 +52,7 @@ fi
 
 # ---- Test 3: Exit code in strict mode ----
 begin_test "exit code propagated in strict mode"
-run_can run --config "$CONFIG" -- sh -c "exit 7"
+run_can run --recipe "$CONFIG" -- sh -c "exit 7"
 if [[ "$RUN_EXIT" -eq 7 ]]; then
     pass
 elif [[ "$RUN_EXIT" -ne 0 ]]; then

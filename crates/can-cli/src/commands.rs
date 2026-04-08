@@ -10,23 +10,12 @@ use can_sandbox::setup::{self, ProfileStatus};
 /// Execute the `can run` command.
 pub fn run(
     recipe_path: Option<PathBuf>,
-    config_path: Option<PathBuf>,
     profile: Option<String>,
     monitor: bool,
     strict: bool,
     command: Vec<String>,
 ) -> Result<i32> {
-    // --recipe and --config are mutually exclusive (they do the same thing).
-    if recipe_path.is_some() && config_path.is_some() {
-        anyhow::bail!(
-            "--recipe and --config are mutually exclusive. \
-             Use --recipe (--config is kept for backward compatibility)."
-        );
-    }
-
-    let policy_path = recipe_path.or(config_path);
-
-    let config = match policy_path {
+    let config = match recipe_path {
         Some(ref path) => {
             let recipe = RecipeFile::from_file(path)
                 .with_context(|| format!("loading recipe: {}", path.display()))?;

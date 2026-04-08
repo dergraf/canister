@@ -37,7 +37,7 @@ except MemoryError:
 
 # ---- Test 1: Process within limit succeeds ----
 begin_test "process within memory limit succeeds"
-run_can run --config "$CONFIG" -- python3 -c "$ALLOC_MEMORY" 10
+run_can run --recipe "$CONFIG" -- python3 -c "$ALLOC_MEMORY" 10
 if [[ "$RUN_EXIT" -eq 0 ]]; then
     assert_contains "$RUN_STDOUT" "OK: allocated 10MB"
 else
@@ -51,7 +51,7 @@ fi
 
 # ---- Test 2: Process exceeding limit is killed ----
 begin_test "process exceeding memory limit is killed"
-run_can run --config "$CONFIG" -- python3 -c "$ALLOC_MEMORY" 256
+run_can run --recipe "$CONFIG" -- python3 -c "$ALLOC_MEMORY" 256
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     pass
 else

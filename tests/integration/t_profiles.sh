@@ -5,7 +5,7 @@
 # Tests:
 #   1. can profiles shows all built-in profiles with counts
 #   2. --profile flag selects the right profile
-#   3. Profile override via CLI takes precedence over config
+#   3. Profile override via CLI takes precedence over recipe
 #   4. Invalid profile name is rejected
 # ============================================================================
 
@@ -32,8 +32,8 @@ run_can run --profile python -- echo "profile test"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "profile test" "$RUN_STDOUT"
 
-# ---- Test 3: --profile overrides config ----
-begin_test "--profile overrides config file profile"
+# ---- Test 3: --profile overrides recipe ----
+begin_test "--profile overrides recipe file profile"
 TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
@@ -44,8 +44,8 @@ name = "node"
 EOF
 )
 _TMPFILES+=("$TMPCONF")
-# Config says "node" but CLI says "generic"
-run_can run --profile generic --config "$TMPCONF" -- echo "override"
+# Recipe says "node" but CLI says "generic"
+run_can run --profile generic --recipe "$TMPCONF" -- echo "override"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "override" "$RUN_STDOUT"
 

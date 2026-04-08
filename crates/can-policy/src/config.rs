@@ -157,21 +157,7 @@ fn default_profile() -> String {
     "generic".to_string()
 }
 
-impl std::str::FromStr for SandboxConfig {
-    type Err = ConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        toml::from_str(s).map_err(ConfigError::Parse)
-    }
-}
-
 impl SandboxConfig {
-    /// Load configuration from a TOML file.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path).map_err(ConfigError::ReadFile)?;
-        content.parse()
-    }
-
     /// Return a default config with sensible defaults (deny-all).
     pub fn default_deny() -> Self {
         Self {
@@ -230,9 +216,9 @@ pub struct RecipeMeta {
 
 /// A recipe file — superset of `SandboxConfig` with optional metadata.
 ///
-/// Both `--recipe` and `--config` parse through this struct. Files without
-/// a `[recipe]` section are valid (the field defaults to `None`), which
-/// preserves full backward compatibility with existing config files.
+/// This is the only entry point for parsing policy TOML files.
+/// Files without a `[recipe]` section are valid — the field defaults
+/// to `None` and the file is treated as a plain policy.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeFile {
@@ -340,7 +326,8 @@ allow = ["/usr/lib", "/tmp/workspace"]
 [network]
 allow_domains = ["pypi.org"]
 "#;
-        let config: SandboxConfig = toml.parse().unwrap();
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.filesystem.allow.len(), 2);
         assert_eq!(config.network.allow_domains, vec!["pypi.org"]);
         assert!(config.network.deny_all); // default
@@ -371,7 +358,8 @@ cpu_percent = 50
 [profile]
 name = "python"
 "#;
-        let config: SandboxConfig = toml.parse().unwrap();
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.resources.memory_mb, Some(512));
         assert_eq!(config.process.max_pids, Some(64));
         assert_eq!(config.profile.name, "python");
@@ -392,7 +380,7 @@ name = "python"
 allow = ["/tmp"]
 bogus_field = true
 "#;
-        let result: Result<SandboxConfig, _> = toml.parse();
+        let result: Result<RecipeFile, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
 
@@ -429,7 +417,7 @@ env_passthrough = ["PATH", "HOME"]
 
     #[test]
     fn parse_recipe_without_metadata() {
-        // A recipe file without [recipe] is a valid legacy config.
+        // A recipe file without [recipe] is a valid plain policy.
         let toml = r#"
 [filesystem]
 allow = ["/usr/lib"]

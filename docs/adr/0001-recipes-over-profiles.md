@@ -35,7 +35,7 @@ Users select a profile via `--profile NAME` or `[profile] name = "..."` in TOML 
 
 ### Option 1: Expand built-in profiles
 **Description**: Add more profiles (python-pip, python-script, node-build, node-runtime, etc.)
-**Pros**: No new concepts; backward compatible
+**Pros**: No new concepts; no migration
 **Cons**: Combinatorial explosion; still ages; still our maintenance burden; still hardcoded
 **Estimated effort**: Low
 
@@ -61,9 +61,10 @@ in a week, abstract enough to become an ecosystem primitive later.
 
 ### Key design decisions:
 
-**Recipe format:** A recipe TOML file is a strict superset of the current config format. The only
-addition is an optional `[recipe]` metadata section with `name`, `description`, `version`, and
-`baseline` fields. Every existing config file is a valid recipe (backward compatible).
+**Recipe format:** A recipe TOML file defines a complete sandbox policy. It contains an optional
+`[recipe]` metadata section with `name`, `description`, `version`, and `baseline` fields, plus
+the standard sandbox policy sections (`[profile]`, `[filesystem]`, `[network]`, `[process]`,
+`[resources]`).
 
 **Baselines vs recipes:** Baselines (the 4 existing profiles) become low-level syscall sets — internal
 building blocks, not user-facing. Recipes are the user-facing concept. A recipe references a baseline
@@ -71,10 +72,9 @@ via `recipe.baseline = "python"` to get its syscall set, then layers filesystem/
 policies on top.
 
 **Resolution order:**
-1. `--recipe PATH` loads a recipe TOML file (preferred)
-2. `--config PATH` loads any TOML file (backward compat, treated identically to `--recipe`)
-3. `--profile NAME` overrides the baseline from the file
-4. `--recipe` + `--config` together is an error (they're the same concept)
+1. `--recipe PATH` loads a recipe TOML file
+2. `--profile NAME` overrides the baseline from the file
+3. No `--recipe` flag: default deny-all policy with generic baseline
 
 **Recipe discovery:** `can recipes` searches `./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`,
 and `/etc/canister/recipes/`. The `--recipe` flag takes a file path (not a name). Name-based
@@ -85,7 +85,7 @@ lookup is deferred to Phase 2.
 - `--recipe` CLI flag on `can run`
 - `can recipes` list command
 - Example recipes shipped in `recipes/` directory
-- `--config` and `--profile` continue working unchanged
+- `--profile` continues working as a baseline override
 
 **Explicitly NOT in Phase 1:**
 - Recipe composition (`include` / layering between recipes)
@@ -100,12 +100,11 @@ lookup is deferred to Phase 2.
 ### Positive
 - Users get context-specific, auditable policies instead of vague profile names
 - The recipe format is simple TOML — no new DSL to learn
-- Full backward compatibility: `--config` and `--profile` work unchanged
+- `--recipe` is the single, clear entry point for loading sandbox policies
 - Recipes are portable files — easy to version control, share, review
 - Foundation for an ecosystem: community recipes, org registries, CI templates
 
 ### Negative
-- Two ways to do the same thing (`--recipe` vs `--config`) during migration period
 - Users must learn the distinction between baselines and recipes (mitigated by docs)
 - `can profiles` command becomes less prominent (kept as alias for baseline listing)
 
@@ -115,9 +114,23 @@ lookup is deferred to Phase 2.
 - Existing test configs continue to work
 
 ## Follow-up Actions
-- [ ] Implement `RecipeFile` / `RecipeMeta` in `can-policy/src/config.rs`
-- [ ] Add `--recipe` flag and `can recipes` command to CLI
-- [ ] Ship example recipes in `recipes/` directory
-- [ ] Update `docs/CONFIGURATION.md` and `docs/PROFILES.md`
+- [x] Implement `RecipeFile` / `RecipeMeta` in `can-policy/src/config.rs`
+- [x] Add `--recipe` flag and `can recipes` command to CLI
+- [x] Ship example recipes in `recipes/` directory
+- [x] Update `docs/CONFIGURATION.md` and `docs/PROFILES.md`
+- [x] Remove `--config` backward compatibility — `--recipe` is the only way
 - [ ] Phase 2 ADR: recipe composition, name-based lookup, `[syscalls]` section
 - [ ] Phase 3 ADR: remote registries, versioning, signing
+
+## Amendments
+
+### 2026-04-08: Remove backward compatibility
+
+The original decision planned for a migration period where `--config` and `--recipe` coexisted.
+After implementation, we decided to skip the migration period entirely and remove `--config`
+immediately. Rationale:
+
+- Canister is pre-1.0 with no external users relying on `--config`
+- Two flags doing the same thing creates confusion, not compatibility
+- Cleaner codebase: no mutual-exclusion logic, no deprecation warnings, no dead code paths
+- `--recipe` is strictly better (same format, plus optional `[recipe]` metadata)

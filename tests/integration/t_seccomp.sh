@@ -66,37 +66,37 @@ else:
 
 # ---- Test 1: mount() denied in allow-list mode ----
 begin_test "mount() denied (allow-list mode)"
-run_can run --config "$AL_CONFIG" -- python3 -c "$TRY_MOUNT"
+run_can run --recipe "$AL_CONFIG" -- python3 -c "$TRY_MOUNT"
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "OK: mount()"
 
 # ---- Test 2: reboot() denied in allow-list mode ----
 begin_test "reboot() denied (allow-list mode)"
-run_can run --config "$AL_CONFIG" -- python3 -c "$TRY_REBOOT"
+run_can run --recipe "$AL_CONFIG" -- python3 -c "$TRY_REBOOT"
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "OK: reboot() denied"
 
 # ---- Test 3: unshare() denied ----
 begin_test "unshare() denied (namespace escape blocked)"
-run_can run --config "$AL_CONFIG" -- python3 -c "$TRY_UNSHARE"
+run_can run --recipe "$AL_CONFIG" -- python3 -c "$TRY_UNSHARE"
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "OK: unshare() denied"
 
 # ---- Test 4: mount() denied in deny-list mode ----
 begin_test "mount() denied (deny-list mode)"
-run_can run --config "$DL_CONFIG" -- python3 -c "$TRY_MOUNT"
+run_can run --recipe "$DL_CONFIG" -- python3 -c "$TRY_MOUNT"
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "OK: mount()"
 
 # ---- Test 5: reboot() denied in deny-list mode ----
 begin_test "reboot() denied (deny-list mode)"
-run_can run --config "$DL_CONFIG" -- python3 -c "$TRY_REBOOT"
+run_can run --recipe "$DL_CONFIG" -- python3 -c "$TRY_REBOOT"
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "OK: reboot() denied"
 
 # ---- Test 6: Strict mode kills on denied syscall ----
 begin_test "strict mode kills process on denied syscall"
-run_can run --config "$STRICT_CONFIG" -- python3 -c "$TRY_MOUNT"
+run_can run --recipe "$STRICT_CONFIG" -- python3 -c "$TRY_MOUNT"
 # In strict mode, the process should be killed (SIGSYS = signal 31, exit 159)
 # rather than getting EPERM. The process won't print "OK" because it's dead.
 assert_neq 0 "$RUN_EXIT" "process should be killed"

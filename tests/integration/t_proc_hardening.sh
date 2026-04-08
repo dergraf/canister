@@ -59,7 +59,7 @@ for r in results:
 '
 
 # ---- Run the proc check ----
-run_can run --config "$CONFIG" -- python3 -c "$CHECK_PROC"
+run_can run --recipe "$CONFIG" -- python3 -c "$CHECK_PROC"
 
 OUTPUT="$RUN_STDOUT"
 

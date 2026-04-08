@@ -6,10 +6,9 @@
 #   1. can recipes lists discovered recipes
 #   2. can recipes lists built-in baselines
 #   3. --recipe flag works (loads a recipe TOML)
-#   4. --recipe and --config are mutually exclusive
-#   5. --recipe with --profile overrides baseline
-#   6. Recipe with unknown baseline is rejected
-#   7. Legacy config (no [recipe] section) works via --recipe
+#   4. --recipe with --profile overrides baseline
+#   5. Recipe with unknown baseline is rejected
+#   6. Plain policy (no [recipe] section) works via --recipe
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -48,19 +47,7 @@ run_can run --recipe "$TMPRECIPE" -- echo "recipe works"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "recipe works" "$RUN_STDOUT"
 
-# ---- Test 4: --recipe and --config are mutually exclusive ----
-begin_test "--recipe and --config are mutually exclusive"
-TMPCONF=$(tmpconfig <<'EOF'
-[network]
-deny_all = true
-EOF
-)
-_TMPFILES+=("$TMPCONF")
-run_can run --recipe "$TMPRECIPE" --config "$TMPCONF" -- echo "should fail"
-assert_neq 0 "$RUN_EXIT" "should reject both --recipe and --config"
-assert_contains "$RUN_STDERR" "mutually exclusive"
-
-# ---- Test 5: --recipe with --profile overrides baseline ----
+# ---- Test 4: --recipe with --profile overrides baseline ----
 begin_test "--profile overrides recipe baseline"
 TMPRECIPE2=$(tmpconfig <<'EOF'
 [recipe]
@@ -74,7 +61,7 @@ run_can run --recipe "$TMPRECIPE2" --profile generic -- echo "override"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "override" "$RUN_STDOUT"
 
-# ---- Test 6: Unknown baseline is rejected ----
+# ---- Test 5: Unknown baseline is rejected ----
 begin_test "recipe with unknown baseline is rejected"
 TMPBAD=$(tmpconfig <<'EOF'
 [recipe]
@@ -86,18 +73,18 @@ run_can run --recipe "$TMPBAD" -- echo "should fail"
 assert_neq 0 "$RUN_EXIT" "unknown baseline should be rejected"
 assert_contains "$RUN_STDERR" "nonexistent"
 
-# ---- Test 7: Legacy config works via --recipe ----
-begin_test "legacy config (no [recipe] section) works via --recipe"
-TMPLEGACY=$(tmpconfig <<'EOF'
+# ---- Test 6: Plain policy without [recipe] section works ----
+begin_test "plain policy (no [recipe] section) works via --recipe"
+TMPPLAIN=$(tmpconfig <<'EOF'
 [network]
 deny_all = true
 [profile]
 name = "generic"
 EOF
 )
-_TMPFILES+=("$TMPLEGACY")
-run_can run --recipe "$TMPLEGACY" -- echo "legacy works"
+_TMPFILES+=("$TMPPLAIN")
+run_can run --recipe "$TMPPLAIN" -- echo "plain works"
 assert_exit_code 0 "$RUN_EXIT"
-assert_eq "legacy works" "$RUN_STDOUT"
+assert_eq "plain works" "$RUN_STDOUT"
 
 summary

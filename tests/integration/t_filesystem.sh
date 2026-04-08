@@ -19,7 +19,7 @@ CONFIG="${CONFIGS_DIR}/filesystem_deny.toml"
 
 # ---- Test 1: Essential paths exist ----
 begin_test "essential paths exist (/bin, /usr, /proc, /dev)"
-run_can run --config "$CONFIG" -- sh -c '
+run_can run --recipe "$CONFIG" -- sh -c '
     for path in /bin /usr /proc /dev /tmp /etc/shadow /root /home; do
         if [ -e "$path" ]; then
             echo "EXISTS:$path"
@@ -54,7 +54,7 @@ assert_contains "$RUN_STDOUT" "MISSING:/root"
 # ---- Test 5: Writes are ephemeral ----
 begin_test "writes to /tmp are ephemeral"
 MARKER="/tmp/.canister_ephemeral_test_$$"
-run_can run --config "$CONFIG" -- sh -c "echo test > ${MARKER}"
+run_can run --recipe "$CONFIG" -- sh -c "echo test > ${MARKER}"
 if [[ -e "$MARKER" ]]; then
     fail "marker file leaked to host filesystem"
 else
@@ -64,7 +64,7 @@ fi
 # ---- Test 6: Python script can't read /etc/shadow ----
 if has_python3; then
     begin_test "python3 cannot read /etc/shadow"
-    run_can run --config "$CONFIG" -- python3 -c '
+    run_can run --recipe "$CONFIG" -- python3 -c '
 import sys
 try:
     with open("/etc/shadow") as f:
