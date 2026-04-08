@@ -1,0 +1,56 @@
+# Canister recipe for Node.js build tasks (npm/yarn/pnpm).
+#
+# Allows network access to the npm registry and common CDNs.
+# Suitable for `npm install`, `npm run build`, and similar tasks.
+#
+# Usage:
+#   can run --recipe recipes/node-build.toml -- npm install
+#   can run --recipe recipes/node-build.toml -- npm run build
+#   can run --recipe recipes/node-build.toml -- npx tsc
+
+[recipe]
+name = "node-build"
+description = "Node.js build tasks: npm install, build, test"
+version = "1"
+baseline = "node"
+
+[filesystem]
+allow = [
+    "/usr/lib",
+    "/usr/bin",
+    "/usr/local/lib",
+    "/usr/local/bin",
+    "/lib",
+    "/tmp",
+]
+deny = ["/etc/shadow", "/root"]
+
+[network]
+allow_domains = [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "registry.npmmirror.com",
+]
+deny_all = true
+
+[process]
+max_pids = 128
+allow_execve = [
+    "/usr/bin/node",
+    "/usr/local/bin/node",
+    "/usr/local/bin/npm",
+    "/usr/local/bin/npx",
+]
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "NODE_ENV",
+    "NPM_CONFIG_REGISTRY",
+    "NPM_TOKEN",
+]
+
+[resources]
+memory_mb = 1024
+cpu_percent = 100

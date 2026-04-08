@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod recipes;
 
 #[derive(Parser)]
 #[command(
@@ -25,11 +26,16 @@ struct Cli {
 enum Commands {
     /// Run a command inside the sandbox.
     Run {
-        /// Path to TOML config file.
+        /// Path to a recipe TOML file (preferred way to configure the sandbox).
+        #[arg(short, long)]
+        recipe: Option<PathBuf>,
+
+        /// Path to TOML config file (use --recipe instead for new projects).
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// Seccomp profile name (overrides config).
+        /// Seccomp baseline name (overrides recipe/config).
+        /// Built-in baselines: generic, python, node, elixir.
         #[arg(short, long)]
         profile: Option<String>,
 
@@ -58,7 +64,10 @@ enum Commands {
         remove: bool,
     },
 
-    /// List available seccomp profiles.
+    /// List available recipes and built-in baselines.
+    Recipes,
+
+    /// List available seccomp profiles (baselines).
     Profiles,
 }
 
@@ -78,14 +87,16 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Commands::Run {
+            recipe,
             config,
             profile,
             monitor,
             strict,
             command,
-        } => commands::run(config, profile, monitor, strict, command),
+        } => commands::run(recipe, config, profile, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
+        Commands::Recipes => recipes::list(),
         Commands::Profiles => commands::profiles(),
     };
 

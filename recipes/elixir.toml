@@ -1,12 +1,18 @@
-# Canister sandbox configuration for Elixir/Erlang workloads.
+# Canister recipe for Elixir/Erlang workloads.
 #
 # Works with system-installed Elixir and with Nix/asdf/mise-installed
-# versions -- the sandbox auto-detects and mounts the package prefix.
+# versions — the sandbox auto-detects and mounts the package prefix.
 #
 # Usage:
-#   can run --config profiles/elixir.toml -- mix test
-#   can run --config profiles/elixir.toml -- iex -S mix
-#   can run --config profiles/elixir.toml -- mix phx.server
+#   can run --recipe recipes/elixir.toml -- mix test
+#   can run --recipe recipes/elixir.toml -- iex -S mix
+#   can run --recipe recipes/elixir.toml -- mix phx.server
+
+[recipe]
+name = "elixir-dev"
+description = "Elixir/Erlang development: mix tasks, iex, Phoenix server"
+version = "1"
+baseline = "elixir"
 
 # Strict mode: abort if any isolation layer cannot be set up.
 # Recommended for CI. Uncomment to enable.
@@ -74,7 +80,8 @@ memory_mb = 1024
 # CPU limit as percentage of one core (enforced via cgroups v2).
 cpu_percent = 100
 
-[profile]
-name = "elixir"
-# Seccomp mode: "allow-list" (default deny, recommended) or "deny-list" (default allow).
+# [profile] section is no longer needed when baseline is set in [recipe].
+# Kept here commented out for reference:
+# [profile]
+# name = "elixir"
 # seccomp_mode = "allow-list"

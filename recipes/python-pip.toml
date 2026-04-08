@@ -1,0 +1,54 @@
+# Canister recipe for installing Python packages with pip.
+#
+# Allows network access to PyPI and filesystem writes to the
+# standard pip target directories. Suitable for `pip install`
+# inside a sandboxed environment.
+#
+# Usage:
+#   can run --recipe recipes/python-pip.toml -- pip install requests
+#   can run --recipe recipes/python-pip.toml -- python3 -m pip install -r requirements.txt
+
+[recipe]
+name = "python-pip"
+description = "Install Python packages with pip (network access to PyPI)"
+version = "1"
+baseline = "python"
+
+[filesystem]
+allow = [
+    "/usr/lib",
+    "/usr/bin",
+    "/usr/local/lib",
+    "/usr/local/bin",
+    "/lib",
+    "/tmp",
+]
+deny = ["/etc/shadow", "/root"]
+
+[network]
+allow_domains = [
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+deny_all = true
+
+[process]
+max_pids = 32
+allow_execve = [
+    "/usr/bin/python3",
+    "/usr/local/bin/pip",
+    "/usr/local/bin/pip3",
+]
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "PIP_INDEX_URL",
+    "PIP_TRUSTED_HOST",
+    "VIRTUAL_ENV",
+]
+
+[resources]
+memory_mb = 512
+cpu_percent = 50

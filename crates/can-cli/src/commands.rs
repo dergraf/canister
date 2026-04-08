@@ -2,24 +2,40 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use can_policy::{SandboxConfig, SeccompProfile};
+use can_policy::{RecipeFile, SandboxConfig, SeccompProfile};
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
 use can_sandbox::setup::{self, ProfileStatus};
 
 /// Execute the `can run` command.
 pub fn run(
+    recipe_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
     profile: Option<String>,
     monitor: bool,
     strict: bool,
     command: Vec<String>,
 ) -> Result<i32> {
-    let config = match config_path {
-        Some(ref path) => SandboxConfig::from_file(path)
-            .with_context(|| format!("loading config: {}", path.display()))?,
+    // --recipe and --config are mutually exclusive (they do the same thing).
+    if recipe_path.is_some() && config_path.is_some() {
+        anyhow::bail!(
+            "--recipe and --config are mutually exclusive. \
+             Use --recipe (--config is kept for backward compatibility)."
+        );
+    }
+
+    let policy_path = recipe_path.or(config_path);
+
+    let config = match policy_path {
+        Some(ref path) => {
+            let recipe = RecipeFile::from_file(path)
+                .with_context(|| format!("loading recipe: {}", path.display()))?;
+            recipe
+                .into_sandbox_config()
+                .with_context(|| format!("resolving recipe: {}", path.display()))?
+        }
         None => {
-            tracing::info!("no config file specified, using default deny-all policy");
+            tracing::info!("no recipe specified, using default deny-all policy");
             SandboxConfig::default_deny()
         }
     };

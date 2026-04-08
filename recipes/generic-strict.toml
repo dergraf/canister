@@ -1,0 +1,36 @@
+# Canister recipe for strict-mode execution of arbitrary binaries.
+#
+# Enables strict mode: any setup failure is fatal, seccomp uses
+# KILL_PROCESS. No network access. Minimal filesystem. Intended
+# for CI pipelines and production jobs where security is paramount.
+#
+# Usage:
+#   can run --recipe recipes/generic-strict.toml -- ./my-binary --flag
+#   can run --recipe recipes/generic-strict.toml -- cargo test
+
+strict = true
+
+[recipe]
+name = "generic-strict"
+description = "Strict deny-all policy for untrusted binaries (CI/production)"
+version = "1"
+baseline = "generic"
+
+[filesystem]
+allow = [
+    "/usr/lib",
+    "/usr/bin",
+    "/lib",
+]
+deny = ["/etc/shadow", "/root", "/home"]
+
+[network]
+deny_all = true
+
+[process]
+max_pids = 64
+env_passthrough = ["PATH", "LANG", "TERM"]
+
+[resources]
+memory_mb = 512
+cpu_percent = 50
