@@ -348,16 +348,18 @@ fn child_entry(
     // to kernel audit but allowed to proceed. In normal mode, use Errno
     // so the process can handle denials gracefully.
     let profile_name = &config.profile.name;
+    let seccomp_mode = config.profile.seccomp_mode;
     let deny_action = if monitor {
         tracing::warn!(
             profile = profile_name,
+            %seccomp_mode,
             "MONITOR: seccomp using LOG action (denied syscalls will be allowed but logged)"
         );
         seccomp::DenyAction::Log
     } else {
         seccomp::DenyAction::Errno
     };
-    match seccomp::load_and_apply(profile_name, deny_action) {
+    match seccomp::load_and_apply(profile_name, deny_action, seccomp_mode) {
         Ok(()) => tracing::debug!(profile = profile_name, "seccomp filter applied"),
         Err(seccomp::SeccompError::EmptyFilter) => {
             tracing::debug!(

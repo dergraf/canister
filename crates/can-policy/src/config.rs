@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -92,19 +93,55 @@ pub struct ResourceConfig {
     pub cpu_percent: Option<u32>,
 }
 
+/// Seccomp enforcement mode.
+///
+/// Controls how the seccomp BPF filter is constructed:
+/// - **AllowList** (default): default action is DENY. Only explicitly listed
+///   syscalls are allowed. This is the secure choice for production/CI.
+/// - **DenyList**: default action is ALLOW. Only explicitly listed syscalls
+///   are blocked. More permissive, useful when compatibility is paramount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeccompMode {
+    /// Default deny — only allow-listed syscalls are permitted.
+    AllowList,
+    /// Default allow — only deny-listed syscalls are blocked.
+    DenyList,
+}
+
+impl Default for SeccompMode {
+    fn default() -> Self {
+        Self::AllowList
+    }
+}
+
+impl fmt::Display for SeccompMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllowList => write!(f, "allow-list"),
+            Self::DenyList => write!(f, "deny-list"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     /// Name of the seccomp profile to use.
-    /// Built-in profiles: "python", "node", "generic".
+    /// Built-in profiles: "generic", "python", "node", "elixir".
     #[serde(default = "default_profile")]
     pub name: String,
+
+    /// Seccomp enforcement mode: "allow-list" (default) or "deny-list".
+    #[serde(default)]
+    pub seccomp_mode: SeccompMode,
 }
 
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
             name: default_profile(),
+            seccomp_mode: SeccompMode::default(),
         }
     }
 }

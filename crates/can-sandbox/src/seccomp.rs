@@ -3,25 +3,34 @@
 //! Generates classic BPF programs from [`SeccompProfile`] definitions and
 //! applies them via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`.
 //!
-//! Design:
-//! - **Deny-list model**: default action is ALLOW; listed syscalls are blocked.
-//! - **Architecture validation**: the filter rejects syscalls from unexpected
-//!   architectures (prevents bypasses via x32 ABI on x86_64).
-//! - **No external dependencies**: raw BPF bytecode assembled from `libc`
-//!   primitives only.
+//! Supports two enforcement modes:
 //!
-//! The filter structure (in BPF execution order):
+//! **Allow-list** (default deny):
 //! ```text
 //! [0]  load seccomp_data.arch
-//! [1]  if arch != AUDIT_ARCH_X86_64 → KILL_PROCESS
-//! [2]  load seccomp_data.nr (syscall number)
-//! [3]  if nr == denied_syscall_0 → action (KILL_PROCESS or ERRNO)
-//! [4]  if nr == denied_syscall_1 → action
+//! [1]  if arch != NATIVE → KILL_PROCESS
+//! [2]  load seccomp_data.nr
+//! [3]  if nr == allowed_0 → ALLOW
+//! [4]  if nr == allowed_1 → ALLOW
+//! ...
+//! [N]  return DENY (ERRNO/KILL_PROCESS)
+//! ```
+//!
+//! **Deny-list** (default allow):
+//! ```text
+//! [0]  load seccomp_data.arch
+//! [1]  if arch != NATIVE → KILL_PROCESS
+//! [2]  load seccomp_data.nr
+//! [3]  if nr == denied_0 → DENY
+//! [4]  if nr == denied_1 → DENY
 //! ...
 //! [N]  return ALLOW
 //! ```
+//!
+//! Architecture validation always uses KILL_PROCESS regardless of mode,
+//! preventing bypasses via x32 ABI on x86_64 or similar cross-arch attacks.
 
-use can_policy::SeccompProfile;
+use can_policy::{SeccompMode, SeccompProfile};
 
 /// Errors from seccomp filter operations.
 #[derive(Debug, thiserror::Error)]
@@ -79,10 +88,113 @@ const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
 
 /// Build a BPF filter program from a seccomp profile.
 ///
-/// Returns the raw `sock_filter` instructions. The filter uses a deny-list
-/// approach: syscalls in `deny_syscalls` trigger `action`, everything else
-/// is allowed.
+/// The `mode` parameter selects the enforcement model:
+/// - **AllowList**: default action is `action` (deny). Syscalls in
+///   `allow_syscalls` jump to ALLOW. Unknown syscalls are blocked.
+/// - **DenyList**: default action is ALLOW. Syscalls in `deny_syscalls`
+///   jump to `action` (deny). Unknown syscalls are allowed.
 pub fn build_filter(
+    profile: &SeccompProfile,
+    action: DenyAction,
+    mode: SeccompMode,
+) -> Result<Vec<libc::sock_filter>, SeccompError> {
+    match mode {
+        SeccompMode::AllowList => build_allow_filter(profile, action),
+        SeccompMode::DenyList => build_deny_filter(profile, action),
+    }
+}
+
+/// Build an allow-list filter (default DENY, explicit allows).
+///
+/// Layout:
+/// ```text
+/// [0]  load arch → if mismatch → KILL_PROCESS
+/// [3]  load nr
+/// [4]  if nr == allowed_0 → jump to ALLOW
+/// ...
+/// [N]  return DENY (default action for unrecognized syscalls)
+/// [N+1] return ALLOW (target of matched jumps)
+/// ```
+fn build_allow_filter(
+    profile: &SeccompProfile,
+    action: DenyAction,
+) -> Result<Vec<libc::sock_filter>, SeccompError> {
+    let allowed_nrs = resolve_syscall_numbers(&profile.allow_syscalls)?;
+
+    if allowed_nrs.is_empty() {
+        return Err(SeccompError::EmptyFilter);
+    }
+
+    let deny_ret = match action {
+        DenyAction::KillProcess => libc::SECCOMP_RET_KILL_PROCESS,
+        DenyAction::Errno => libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32),
+        DenyAction::Log => SECCOMP_RET_LOG,
+    };
+
+    let mut filter: Vec<libc::sock_filter> = vec![
+        // [0] Load architecture
+        bpf_stmt(
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            OFFSET_ARCH,
+        ),
+        // [1] Validate architecture: if native → skip kill
+        bpf_jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            AUDIT_ARCH_NATIVE,
+            1,
+            0,
+        ),
+        // [2] Architecture mismatch → always kill
+        bpf_stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_KILL_PROCESS,
+        ),
+        // [3] Load syscall number
+        bpf_stmt(
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            OFFSET_NR,
+        ),
+    ];
+
+    // For each allowed syscall: if nr matches → jump to ALLOW (at the end).
+    // Layout after checks: [DENY] [ALLOW]
+    // For check at index i with `remaining = n-1-i` checks after it:
+    //   jt = remaining + 1 (skip remaining checks + DENY → land on ALLOW)
+    //   jf = 0 (fall through to next check, or to DENY if last)
+    for (i, &nr) in allowed_nrs.iter().enumerate() {
+        let remaining = (allowed_nrs.len() - 1 - i) as u8;
+        filter.push(bpf_jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            nr as u32,
+            remaining + 1, // jt: skip remaining checks + DENY → ALLOW
+            0,             // jf: fall through
+        ));
+    }
+
+    // Default: deny (no check matched → syscall not in allow list).
+    filter.push(bpf_stmt((libc::BPF_RET | libc::BPF_K) as u16, deny_ret));
+
+    // Allow (reached when a check matched and jumped here).
+    filter.push(bpf_stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        libc::SECCOMP_RET_ALLOW,
+    ));
+
+    Ok(filter)
+}
+
+/// Build a deny-list filter (default ALLOW, explicit denies).
+///
+/// This is the legacy model. Layout:
+/// ```text
+/// [0]  load arch → if mismatch → KILL_PROCESS
+/// [3]  load nr
+/// [4]  if nr == denied_0 → jump to DENY
+/// ...
+/// [N]  return ALLOW (default action for unrecognized syscalls)
+/// [N+1] return DENY
+/// ```
+fn build_deny_filter(
     profile: &SeccompProfile,
     action: DenyAction,
 ) -> Result<Vec<libc::sock_filter>, SeccompError> {
@@ -99,55 +211,43 @@ pub fn build_filter(
     };
 
     let mut filter: Vec<libc::sock_filter> = vec![
-        // [0] Load architecture: BPF_LD | BPF_W | BPF_ABS, offset = arch
         bpf_stmt(
             (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
             OFFSET_ARCH,
         ),
-        // [1] Validate architecture: if arch == native → skip kill, else fall through.
         bpf_jump(
             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
             AUDIT_ARCH_NATIVE,
-            1, // jt: skip over the next kill instruction
-            0, // jf: fall through to kill
+            1,
+            0,
         ),
-        // [2] Architecture mismatch → kill
         bpf_stmt(
             (libc::BPF_RET | libc::BPF_K) as u16,
             libc::SECCOMP_RET_KILL_PROCESS,
         ),
-        // [3] Load syscall number: BPF_LD | BPF_W | BPF_ABS, offset = nr
         bpf_stmt(
             (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
             OFFSET_NR,
         ),
     ];
 
-    // [4..N-1] For each denied syscall, emit a conditional jump.
-    // If nr == denied → jump to deny return.
-    // If no match → fall through to next check, or to ALLOW at the end.
-    //
-    // Layout after checks: [ALLOW] [DENY]
-    // So for check at index i with `remaining = n-1-i` checks after it:
-    //   jt = remaining + 1 (skip remaining checks + ALLOW → land on DENY)
-    //   jf = 0 (fall through to next check, or to ALLOW if last)
     for (i, &nr) in denied_nrs.iter().enumerate() {
         let remaining = (denied_nrs.len() - 1 - i) as u8;
         filter.push(bpf_jump(
             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
             nr as u32,
             remaining + 1, // jt: skip remaining checks + ALLOW → DENY
-            0,             // jf: fall through to next check or ALLOW
+            0,             // jf: fall through
         ));
     }
 
-    // [N] Default: allow (reached when no check matched).
+    // Default: allow
     filter.push(bpf_stmt(
         (libc::BPF_RET | libc::BPF_K) as u16,
         libc::SECCOMP_RET_ALLOW,
     ));
 
-    // [N+1] Deny action (reached when a check matched and jumped here).
+    // Deny action
     filter.push(bpf_stmt((libc::BPF_RET | libc::BPF_K) as u16, deny_ret));
 
     Ok(filter)
@@ -192,23 +292,34 @@ pub fn apply_filter(filter: &[libc::sock_filter]) -> Result<(), SeccompError> {
 ///
 /// Convenience function that combines profile lookup, filter generation,
 /// and application.
-pub fn load_and_apply(profile_name: &str, action: DenyAction) -> Result<(), SeccompError> {
+pub fn load_and_apply(
+    profile_name: &str,
+    action: DenyAction,
+    mode: SeccompMode,
+) -> Result<(), SeccompError> {
     let profile = SeccompProfile::builtin(profile_name)
         .ok_or_else(|| SeccompError::UnknownSyscall(format!("unknown profile: {profile_name}")))?;
 
-    if profile.deny_syscalls.is_empty() {
+    let syscall_list = match mode {
+        SeccompMode::AllowList => &profile.allow_syscalls,
+        SeccompMode::DenyList => &profile.deny_syscalls,
+    };
+
+    if syscall_list.is_empty() {
         tracing::debug!(
             profile = profile_name,
-            "profile has no denied syscalls, skipping seccomp"
+            %mode,
+            "profile has no syscalls for this mode, skipping seccomp"
         );
         return Ok(());
     }
 
-    let filter = build_filter(&profile, action)?;
+    let filter = build_filter(&profile, action, mode)?;
     tracing::info!(
         profile = profile_name,
         instructions = filter.len(),
-        denied_syscalls = profile.deny_syscalls.len(),
+        syscall_count = syscall_list.len(),
+        %mode,
         "applying seccomp filter"
     );
 
@@ -497,13 +608,16 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
 mod tests {
     use super::*;
 
+    // --- Deny-list mode tests (legacy) ---
+
     #[test]
-    fn build_filter_for_generic_profile() {
+    fn deny_list_filter_for_generic_profile() {
         let profile = SeccompProfile::builtin("generic").unwrap();
         let n_denied = profile.deny_syscalls.len();
-        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
-        // Structure: 3 (arch load+check+kill) + 1 (load nr) + N (deny checks) + 1 (deny ret) + 1 (allow ret)
+        // Structure: 3 (arch) + 1 (load nr) + N (checks) + 1 (allow) + 1 (deny)
         let expected_len = 3 + 1 + n_denied + 1 + 1;
         assert_eq!(filter.len(), expected_len, "unexpected filter length");
         assert!(
@@ -513,14 +627,13 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_for_python_profile() {
+    fn deny_list_filter_for_python_profile() {
         let profile = SeccompProfile::builtin("python").unwrap();
         let n_denied = profile.deny_syscalls.len();
-        let filter = build_filter(&profile, DenyAction::Errno).unwrap();
+        let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::DenyList).unwrap();
 
         let expected_len = 3 + 1 + n_denied + 1 + 1;
         assert_eq!(filter.len(), expected_len);
-        // Python should deny more than generic (adds ptrace, io_uring, etc.)
         let generic = SeccompProfile::builtin("generic").unwrap();
         assert!(
             n_denied > generic.deny_syscalls.len(),
@@ -529,42 +642,40 @@ mod tests {
     }
 
     #[test]
-    fn empty_deny_list_returns_error() {
+    fn deny_list_empty_returns_error() {
         let profile = SeccompProfile {
             name: "empty".to_string(),
             description: "no denies".to_string(),
             allow_syscalls: vec![],
             deny_syscalls: vec![],
         };
-        let result = build_filter(&profile, DenyAction::KillProcess);
+        let result = build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList);
         assert!(matches!(result, Err(SeccompError::EmptyFilter)));
     }
 
     #[test]
-    fn unknown_syscall_returns_error() {
+    fn deny_list_unknown_syscall_returns_error() {
         let profile = SeccompProfile {
             name: "bad".to_string(),
             description: "has unknown".to_string(),
             allow_syscalls: vec![],
             deny_syscalls: vec!["totally_fake_syscall".to_string()],
         };
-        let result = build_filter(&profile, DenyAction::KillProcess);
+        let result = build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList);
         assert!(matches!(result, Err(SeccompError::UnknownSyscall(_))));
     }
 
     #[test]
-    fn filter_starts_with_arch_check() {
+    fn deny_list_filter_starts_with_arch_check() {
         let profile = SeccompProfile::builtin("generic").unwrap();
-        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
-        // First instruction: load arch
         assert_eq!(
             filter[0].code,
             (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16
         );
         assert_eq!(filter[0].k, OFFSET_ARCH);
-
-        // Second: compare arch
         assert_eq!(
             filter[1].code,
             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
@@ -573,12 +684,12 @@ mod tests {
     }
 
     #[test]
-    fn filter_ends_with_deny_action() {
+    fn deny_list_ends_with_deny_action() {
         let profile = SeccompProfile::builtin("generic").unwrap();
-        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
-        // Layout: [...checks...] [ALLOW] [DENY]
-        // Last instruction is DENY, second-to-last is ALLOW.
+        // Deny-list layout: [...checks...] [ALLOW] [DENY]
         let last = filter.last().unwrap();
         assert_eq!(last.code, (libc::BPF_RET | libc::BPF_K) as u16);
         assert_eq!(last.k, libc::SECCOMP_RET_KILL_PROCESS);
@@ -589,39 +700,230 @@ mod tests {
     }
 
     #[test]
-    fn deny_action_kill_uses_correct_return() {
+    fn deny_list_kill_uses_correct_return() {
         let profile = SeccompProfile::builtin("generic").unwrap();
-        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
 
-        // Last instruction is the deny action.
         let deny = filter.last().unwrap();
-        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
         assert_eq!(deny.k, libc::SECCOMP_RET_KILL_PROCESS);
     }
 
     #[test]
-    fn deny_action_errno_uses_eperm() {
+    fn deny_list_errno_uses_eperm() {
         let profile = SeccompProfile::builtin("generic").unwrap();
-        let filter = build_filter(&profile, DenyAction::Errno).unwrap();
+        let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::DenyList).unwrap();
 
         let deny = filter.last().unwrap();
-        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
         assert_eq!(deny.k, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
     }
 
     #[test]
-    fn deny_action_log_uses_ret_log() {
+    fn deny_list_log_uses_ret_log() {
         let profile = SeccompProfile::builtin("generic").unwrap();
-        let filter = build_filter(&profile, DenyAction::Log).unwrap();
+        let filter = build_filter(&profile, DenyAction::Log, SeccompMode::DenyList).unwrap();
 
         let deny = filter.last().unwrap();
-        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
-        assert_eq!(deny.k, super::SECCOMP_RET_LOG);
+        assert_eq!(deny.k, SECCOMP_RET_LOG);
     }
 
     #[test]
+    fn deny_list_jump_offsets_are_correct() {
+        let profile = SeccompProfile {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            allow_syscalls: vec![],
+            deny_syscalls: vec![
+                "reboot".to_string(),
+                "mount".to_string(),
+                "ptrace".to_string(),
+            ],
+        };
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
+
+        // [load_arch, cmp_arch, kill_arch, load_nr, cmp0, cmp1, cmp2, allow_ret, deny_ret]
+        assert_eq!(filter[4].jt, 3); // skip cmp1, cmp2, allow → deny_ret
+        assert_eq!(filter[4].jf, 0);
+        assert_eq!(filter[5].jt, 2);
+        assert_eq!(filter[5].jf, 0);
+        assert_eq!(filter[6].jt, 1);
+        assert_eq!(filter[6].jf, 0);
+    }
+
+    // --- Allow-list mode tests ---
+
+    #[test]
+    fn allow_list_filter_for_generic_profile() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let n_allowed = profile.allow_syscalls.len();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
+
+        // Structure: 3 (arch) + 1 (load nr) + N (checks) + 1 (deny) + 1 (allow)
+        let expected_len = 3 + 1 + n_allowed + 1 + 1;
+        assert_eq!(filter.len(), expected_len, "unexpected filter length");
+        assert!(
+            n_allowed > 100,
+            "generic allow-list should have >100 syscalls, got {n_allowed}"
+        );
+    }
+
+    #[test]
+    fn allow_list_default_action_is_deny() {
+        let profile = SeccompProfile::builtin("generic").unwrap();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
+
+        // Allow-list layout: [...checks...] [DENY] [ALLOW]
+        // Second-to-last is deny (default), last is allow (matched).
+        let deny = &filter[filter.len() - 2];
+        assert_eq!(deny.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(deny.k, libc::SECCOMP_RET_KILL_PROCESS);
+
+        let allow = filter.last().unwrap();
+        assert_eq!(allow.code, (libc::BPF_RET | libc::BPF_K) as u16);
+        assert_eq!(allow.k, libc::SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn allow_list_errno_as_default_deny() {
+        let profile = SeccompProfile::builtin("python").unwrap();
+        let filter = build_filter(&profile, DenyAction::Errno, SeccompMode::AllowList).unwrap();
+
+        let deny = &filter[filter.len() - 2];
+        assert_eq!(deny.k, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
+    }
+
+    #[test]
+    fn allow_list_empty_returns_error() {
+        let profile = SeccompProfile {
+            name: "empty".to_string(),
+            description: "no allows".to_string(),
+            allow_syscalls: vec![],
+            deny_syscalls: vec!["reboot".to_string()],
+        };
+        let result = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
+        assert!(matches!(result, Err(SeccompError::EmptyFilter)));
+    }
+
+    #[test]
+    fn allow_list_jump_offsets_are_correct() {
+        let profile = SeccompProfile {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            allow_syscalls: vec![
+                "read".to_string(),
+                "write".to_string(),
+                "exit_group".to_string(),
+            ],
+            deny_syscalls: vec![],
+        };
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
+
+        // [load_arch, cmp_arch, kill_arch, load_nr, cmp0, cmp1, cmp2, deny_ret, allow_ret]
+        // cmp0 (index 4): if read matches → skip cmp1, cmp2, deny → allow_ret
+        assert_eq!(filter[4].jt, 3);
+        assert_eq!(filter[4].jf, 0);
+        // cmp1 (index 5): if write matches → skip cmp2, deny → allow_ret
+        assert_eq!(filter[5].jt, 2);
+        assert_eq!(filter[5].jf, 0);
+        // cmp2 (index 6): if exit_group matches → skip deny → allow_ret
+        assert_eq!(filter[6].jt, 1);
+        assert_eq!(filter[6].jf, 0);
+    }
+
+    #[test]
+    fn allow_list_profiles_have_no_overlap_with_deny_always() {
+        // Verify that no profile's allow list contains any DENY_ALWAYS syscall.
+        let deny_always: Vec<&str> = vec![
+            "reboot",
+            "kexec_load",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "swapon",
+            "swapoff",
+            "acct",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "chroot",
+            "syslog",
+            "settimeofday",
+        ];
+        for name in SeccompProfile::builtin_names() {
+            let profile = SeccompProfile::builtin(name).unwrap();
+            for syscall in &profile.allow_syscalls {
+                assert!(
+                    !deny_always.contains(&syscall.as_str()),
+                    "profile {name} allow-list contains DENY_ALWAYS syscall: {syscall}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allow_list_all_profiles_compile() {
+        for name in SeccompProfile::builtin_names() {
+            let profile = SeccompProfile::builtin(name).unwrap();
+            let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
+            assert!(
+                filter.is_ok(),
+                "profile {name} failed to compile in allow-list mode: {:?}",
+                filter.err()
+            );
+        }
+    }
+
+    #[test]
+    fn deny_list_all_profiles_compile() {
+        for name in SeccompProfile::builtin_names() {
+            let profile = SeccompProfile::builtin(name).unwrap();
+            let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList);
+            assert!(
+                filter.is_ok(),
+                "profile {name} failed to compile in deny-list mode: {:?}",
+                filter.err()
+            );
+        }
+    }
+
+    #[test]
+    fn allow_list_python_is_tighter_than_generic() {
+        let generic = SeccompProfile::builtin("generic").unwrap();
+        let python = SeccompProfile::builtin("python").unwrap();
+        assert!(
+            python.allow_syscalls.len() < generic.allow_syscalls.len(),
+            "python allow-list ({}) should be smaller than generic ({})",
+            python.allow_syscalls.len(),
+            generic.allow_syscalls.len()
+        );
+    }
+
+    #[test]
+    fn allow_list_elixir_allows_ptrace() {
+        let elixir = SeccompProfile::builtin("elixir").unwrap();
+        assert!(
+            elixir.allow_syscalls.contains(&"ptrace".to_string()),
+            "elixir profile should allow ptrace for BEAM tracing"
+        );
+    }
+
+    #[test]
+    fn allow_list_python_denies_ptrace() {
+        let python = SeccompProfile::builtin("python").unwrap();
+        assert!(
+            !python.allow_syscalls.contains(&"ptrace".to_string()),
+            "python profile should not allow ptrace"
+        );
+    }
+
+    // --- Common tests ---
+
+    #[test]
     fn syscall_number_known_syscalls() {
-        // Spot-check a few well-known syscall numbers on x86_64.
         assert_eq!(syscall_number("read").unwrap(), 0);
         assert_eq!(syscall_number("write").unwrap(), 1);
         assert_eq!(syscall_number("execve").unwrap(), 59);
@@ -634,56 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn all_builtin_profiles_compile() {
-        for name in SeccompProfile::builtin_names() {
-            let profile = SeccompProfile::builtin(name).unwrap();
-            if !profile.deny_syscalls.is_empty() {
-                let filter = build_filter(&profile, DenyAction::KillProcess);
-                assert!(
-                    filter.is_ok(),
-                    "profile {name} failed to compile: {:?}",
-                    filter.err()
-                );
-            }
-        }
-    }
-
-    #[test]
     fn is_supported_returns_bool() {
-        // On any Linux system this should return true.
-        // We just verify it doesn't panic.
         let _ = is_supported();
-    }
-
-    #[test]
-    fn jump_offsets_are_correct() {
-        // Build a minimal filter with 3 denied syscalls and verify
-        // the jump target offsets.
-        let profile = SeccompProfile {
-            name: "test".to_string(),
-            description: "test".to_string(),
-            allow_syscalls: vec![],
-            deny_syscalls: vec![
-                "reboot".to_string(),
-                "mount".to_string(),
-                "ptrace".to_string(),
-            ],
-        };
-        let filter = build_filter(&profile, DenyAction::KillProcess).unwrap();
-
-        // Instructions: [load_arch, cmp_arch, kill_arch, load_nr, cmp0, cmp1, cmp2, allow_ret, deny_ret]
-        // Indices:       0          1         2          3        4     5     6     7          8
-
-        // cmp0 (index 4): if match, skip 2 remaining + 1 (allow) → land on deny_ret (index 8)
-        assert_eq!(filter[4].jt, 3); // skip cmp1, cmp2, allow → deny_ret
-        assert_eq!(filter[4].jf, 0);
-
-        // cmp1 (index 5): if match, skip 1 remaining + 1 (allow) → land on deny_ret
-        assert_eq!(filter[5].jt, 2);
-        assert_eq!(filter[5].jf, 0);
-
-        // cmp2 (index 6): if match, skip 0 remaining + 1 (allow) → deny_ret
-        assert_eq!(filter[6].jt, 1);
-        assert_eq!(filter[6].jf, 0); // fall through to allow_ret
     }
 }
