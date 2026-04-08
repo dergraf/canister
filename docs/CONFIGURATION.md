@@ -14,6 +14,7 @@ policy is used: no filesystem access, no network, generic seccomp profile.
 - [process](#process)
 - [resources](#resources)
 - [profile](#profile)
+- [Strict Mode](#strict-mode)
 - [Monitor Mode](#monitor-mode)
 - [Examples](#examples)
 
@@ -215,13 +216,28 @@ env_passthrough = ["PATH", "HOME", "LANG", "TERM", "VIRTUAL_ENV"]
 
 ## `[resources]`
 
-Resource limits via cgroups v2. **Currently parsed but not yet enforced at
-runtime** (planned for Phase 7).
+Resource limits enforced via cgroups v2. Requires systemd with per-user
+cgroup delegation (default on most modern distributions).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `memory_mb` | `int` (optional) | none | Memory limit in megabytes |
 | `cpu_percent` | `int` (optional) | none | CPU limit as percentage of one core (e.g., 50 = 50%) |
+
+**How it works:**
+
+Canister detects the current cgroup from `/proc/self/cgroup`, creates a
+child cgroup (`canister-<pid>`), writes `memory.max` and `cpu.max`, and
+moves the sandboxed process into it. No root required.
+
+- `memory_mb = 512` → `memory.max = 536870912` (512 MiB). Exceeding the
+  limit triggers the kernel OOM killer.
+- `cpu_percent = 50` → `cpu.max = "50000 100000"` (50ms quota per 100ms
+  period), capping the process to 50% of one CPU core.
+
+**Failure behavior:** If cgroup setup fails (e.g., no cgroup v2, no
+delegation), the limits are skipped with a warning. In strict mode
+(`--strict`), cgroup failure aborts the sandbox.
 
 ```toml
 [resources]
@@ -233,11 +249,19 @@ cpu_percent = 100
 
 ## `[profile]`
 
-Selects the seccomp BPF profile applied to the sandboxed process.
+Selects the seccomp BPF profile and enforcement mode.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | `string` | `"generic"` | Profile name: `"generic"`, `"python"`, `"node"`, or `"elixir"` |
+| `seccomp_mode` | `string` | `"allow-list"` | Seccomp mode: `"allow-list"` (default deny) or `"deny-list"` (default allow) |
+
+**Seccomp modes:**
+
+| Mode | Default action | Listed syscalls | Use case |
+|------|---------------|-----------------|----------|
+| `allow-list` | DENY all | Only listed syscalls permitted | Production, CI (recommended) |
+| `deny-list` | ALLOW all | Only listed syscalls blocked | Compatibility, unknown workloads |
 
 The profile can also be overridden from the command line:
 
@@ -247,12 +271,50 @@ can run --profile python -- python3 script.py
 
 CLI `--profile` takes precedence over the config file.
 
-See [PROFILES.md](PROFILES.md) for details on what each profile blocks.
+See [PROFILES.md](PROFILES.md) for details on what each profile allows/blocks.
 
 ```toml
 [profile]
 name = "python"
+seccomp_mode = "allow-list"   # default; or "deny-list" for compatibility
 ```
+
+---
+
+## Strict Mode
+
+Strict mode (`--strict` or `strict = true` in config) tightens all enforcement
+for CI and production use. Every point where normal mode gracefully degrades
+becomes a hard failure.
+
+**Config:**
+
+```toml
+strict = true
+```
+
+**CLI:**
+
+```bash
+can run --strict --config policy.toml -- python3 script.py
+```
+
+The CLI `--strict` flag can only tighten — if the config sets `strict = true`,
+the CLI cannot override it to false.
+
+**Changes in strict mode:**
+
+| Enforcement point | Normal mode | Strict mode |
+|-------------------|-------------|-------------|
+| Filesystem isolation | Falls back with warning | **Aborts** |
+| Network setup | Logs warning | **Aborts** |
+| Loopback bring-up | Skips with warning | **Aborts** |
+| Seccomp deny action | `EPERM` (process survives) | `KILL_PROCESS` (immediate termination) |
+| Cgroup setup | Logs warning | **Aborts** |
+
+**Mutual exclusion:** `--strict` and `--monitor` cannot be used together.
+Strict mode ensures full enforcement; monitor mode relaxes it. These are
+contradictory intents.
 
 ---
 
@@ -284,6 +346,7 @@ can run --monitor --config my_policy.toml -- python3 script.py
 - A pre-run policy preview and post-run summary are printed automatically.
 
 Monitor mode is a development tool. It provides **no security guarantees**.
+Cannot be combined with `--strict`.
 
 ---
 
@@ -392,6 +455,33 @@ deny_all = true
 
 [profile]
 name = "python"
+```
+
+### Strict CI
+
+All-or-nothing enforcement. If any isolation layer can't be set up, the
+sandbox refuses to start. Denied syscalls kill the process immediately.
+
+```toml
+strict = true
+
+[filesystem]
+allow = ["/tmp/workspace"]
+
+[network]
+deny_all = true
+
+[process]
+max_pids = 64
+allow_execve = ["/usr/bin/python3"]
+
+[resources]
+memory_mb = 512
+cpu_percent = 100
+
+[profile]
+name = "python"
+seccomp_mode = "allow-list"
 ```
 
 ### Elixir/Erlang (mix tasks, iex, Phoenix)

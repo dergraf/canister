@@ -2,6 +2,10 @@
 #
 # Usage: can run --config example.toml python3 script.py
 
+# Strict mode: abort if any isolation layer cannot be set up.
+# Recommended for CI. Uncomment to enable.
+# strict = true
+
 [filesystem]
 # Paths the sandboxed process can access.
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp/workspace"]
@@ -25,11 +29,13 @@ allow_execve = ["/usr/bin/python3"]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
 [resources]
-# Memory limit in MB.
+# Memory limit in MB (enforced via cgroups v2).
 memory_mb = 512
-# CPU limit as percentage of one core.
+# CPU limit as percentage of one core (enforced via cgroups v2).
 cpu_percent = 50
 
 [profile]
 # Seccomp profile: "generic", "python", "node", or "elixir".
 name = "python"
+# Seccomp mode: "allow-list" (default deny, recommended) or "deny-list" (default allow).
+# seccomp_mode = "allow-list"

@@ -1,6 +1,6 @@
 <p align="center">
   <img width="300" alt="canister" src="https://github.com/user-attachments/assets/476d2ac9-d390-4798-b329-dd371162cd99" /><br>
-<strong>canister</strong><br>
+  <strong>canister</strong><br>
   <em>A lightweight sandbox for running untrusted code safely on Linux.</em>
 </p>
 
@@ -34,9 +34,12 @@ discarded.
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via slirp4netns), or full
-- **Seccomp BPF** -- deny-list syscall filtering with built-in profiles for generic, Python, Node.js, and Elixir/Erlang workloads
+- **Seccomp BPF** -- default-deny allow-list syscall filtering with built-in profiles for generic, Python, Node.js, and Elixir/Erlang workloads
 - **Process isolation** -- PID namespace, environment filtering, RLIMIT_NPROC, execve whitelisting
+- **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
+- **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS, all degradation is fatal
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
+- **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
 - **Graceful degradation** -- detects AppArmor restrictions and falls back to reduced isolation with clear warnings
 - **TOML config** -- strict schema with `deny_unknown_fields`, sensible defaults
@@ -89,6 +92,9 @@ can run -- echo "hello from the sandbox"
 # With a config file
 can run --config profiles/example.toml -- python3 script.py
 
+# Strict mode for CI -- all degradation is fatal, seccomp kills on violation
+can run --strict --config profiles/example.toml -- python3 script.py
+
 # Elixir/Erlang -- run mix tasks or iex
 can run --config profiles/elixir.toml -- mix test
 can run --config profiles/elixir.toml -- iex -S mix
@@ -114,15 +120,15 @@ can -v run -- ls /
 $ can profiles
 Available seccomp profiles:
 
-  generic      Generic profile for arbitrary binaries. (16 denied syscalls)
-  python       Profile for Python scripts. (22 denied syscalls)
-  node         Profile for Node.js scripts. (22 denied syscalls)
-  elixir       Profile for Elixir/Erlang (BEAM VM). (21 denied syscalls)
+  generic      Generic profile for arbitrary binaries. (177 allowed, 16 denied)
+  python       Profile for Python scripts. (171 allowed, 22 denied)
+  node         Profile for Node.js scripts. (171 allowed, 22 denied)
+  elixir       Profile for Elixir/Erlang (BEAM VM). (172 allowed, 21 denied)
 ```
 
 ## How It Works
 
-Canister combines five Linux isolation mechanisms:
+Canister combines seven Linux isolation mechanisms:
 
 ```
                           can run -- python3 script.py
@@ -163,9 +169,18 @@ Canister combines five Linux isolation mechanisms:
    parent side. Whitelisted domains are pre-resolved to IPs at startup.
 
 5. **Seccomp BPF** -- a Berkeley Packet Filter program is loaded right before
-   `exec`. It validates the CPU architecture (prevents x32 ABI bypass) and
-   returns `EPERM` for denied syscalls. The process survives and can handle
-   the error gracefully.
+   `exec`. It operates in **default-deny (allow-list) mode**: only syscalls
+   explicitly listed in the profile are permitted; everything else is blocked.
+   The filter validates the CPU architecture (prevents x32 ABI bypass) and
+   returns `EPERM` for unlisted syscalls (or `KILL_PROCESS` in strict mode).
+
+6. **Cgroups v2** -- memory and CPU limits are enforced via the cgroup
+   filesystem. Canister creates a child cgroup under the user's systemd
+   delegation and writes `memory.max` and `cpu.max`. No root required.
+
+7. **/proc hardening** -- sensitive paths under `/proc` are masked (bind-mount
+   `/dev/null` over files, empty tmpfs over directories) and `/proc/sys` is
+   remounted read-only, matching Docker's default behavior.
 
 For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -220,8 +235,10 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 | User namespace | No real root privileges | Kernel exploit |
 | Mount namespace | Filesystem view | Mount escape (blocked by seccomp) |
 | Network namespace | Network access | Namespace escape (blocked by seccomp) |
-| Seccomp BPF | Syscall access | Filter bypass (architecture-validated) |
+| Seccomp BPF (allow-list) | Syscall access (default deny) | Filter bypass (architecture-validated) |
 | PID namespace | Process visibility | Namespace escape (blocked by seccomp) |
+| Cgroups v2 | Memory and CPU usage | Cgroup escape (requires root) |
+| /proc hardening | Sensitive kernel info | Remount (blocked by seccomp) |
 | Environment filtering | Host env leakage | N/A (applied at exec) |
 | RLIMIT_NPROC | Fork bombs | Kernel exploit |
 | Read-only bind mounts | Write access | Remount (blocked by seccomp) |
@@ -230,8 +247,47 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 
 - Kernel exploits (no sandbox can)
 - Side-channel attacks (timing, cache)
-- Resource exhaustion (cgroups limits are planned but not yet enforced)
 - Attacks within the allowed surface (if you whitelist `/`, there's no filesystem isolation)
+
+## Threat Model
+
+Canister is designed to sandbox **untrusted but non-malicious-kernel-level
+code** — scripts, build tools, and applications that may misbehave but are
+not expected to carry kernel exploits.
+
+**In scope (Canister defends against):**
+
+- Untrusted code reading/writing files outside the sandbox
+- Untrusted code accessing the network without authorization
+- Untrusted code calling dangerous syscalls (module loading, rebooting, etc.)
+- Untrusted code seeing or signaling host processes
+- Untrusted code consuming unbounded memory or CPU
+- Untrusted code leaking host environment variables (API keys, tokens)
+- Fork bombs and resource exhaustion within the sandbox
+- x32 ABI syscall bypass attempts
+
+**Out of scope (Canister does NOT defend against):**
+
+- **Kernel exploits.** If the attacker has a kernel 0-day, no userspace
+  sandbox helps. Seccomp reduces attack surface but cannot eliminate it.
+- **Side-channel attacks.** Timing, cache, and speculative execution attacks
+  are fundamentally out of scope for process-level sandboxing.
+- **IP-level network filtering.** Whitelisted domains are DNS-resolved at
+  startup, but connect() calls are not yet filtered by IP. A sandboxed
+  process in "filtered" network mode can connect to any IP reachable via
+  slirp4netns. IP-level enforcement requires `SECCOMP_RET_USER_NOTIF`
+  (planned).
+- **Ongoing execve enforcement.** `allow_execve` validates the initial
+  command, but child processes inside the sandbox can exec arbitrary visible
+  binaries. Full enforcement requires `SECCOMP_RET_USER_NOTIF` (planned).
+- **Monitor mode poisoning.** Monitor mode (`--monitor`) provides no security.
+  A malicious process aware it's being monitored can behave differently.
+  Always validate policies with enforcement enabled before trusting them.
+
+**Strict mode** (`--strict`) is recommended for CI and production. It
+converts all graceful degradation into hard failures and uses
+`SECCOMP_RET_KILL_PROCESS` instead of `SECCOMP_RET_ERRNO`, ensuring the
+sandbox either runs at full strength or doesn't run at all.
 
 ## AppArmor (Ubuntu 24.04+)
 

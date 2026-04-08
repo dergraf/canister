@@ -14,7 +14,10 @@ of a sandboxed process, and the security properties of each isolation layer.
   - [Network Namespace](#3-network-namespace)
   - [Seccomp BPF](#4-seccomp-bpf)
   - [Process Control](#5-process-control)
-  - [Monitor Mode](#6-monitor-mode)
+  - [Cgroups v2](#6-cgroups-v2)
+  - [/proc Hardening](#7-proc-hardening)
+  - [Monitor Mode](#8-monitor-mode)
+  - [Strict Mode](#9-strict-mode)
 - [Parent-Child Protocol](#parent-child-protocol)
 - [AppArmor Interaction](#apparmor-interaction)
 - [Known Limitations](#known-limitations)
@@ -26,12 +29,13 @@ of a sandboxed process, and the security properties of each isolation layer.
 1. **Unprivileged by default.** No root, no suid, no capabilities. Everything
    runs as the calling user using unprivileged user namespaces.
 
-2. **Defense in depth.** Five independent isolation mechanisms. Bypassing one
+2. **Defense in depth.** Seven independent isolation mechanisms. Bypassing one
    layer does not compromise the others.
 
 3. **Fail closed.** When a feature cannot be set up (e.g., AppArmor blocks
    mounts), Canister either falls back to reduced isolation with clear
-   warnings or fails entirely. It never silently runs without protection.
+   warnings or fails entirely. In strict mode (`--strict`), all degradation
+   is fatal — the sandbox runs at full strength or not at all.
 
 4. **Single binary.** No runtime dependencies beyond the Linux kernel (and
    optionally slirp4netns for filtered networking). No dynamic linking to
@@ -136,6 +140,11 @@ The complete lifecycle of `can run --config example.toml -- python3 script.py`:
     │             │                        │    pivot_   │
     │             │                        │    root     │
     │             │                        │             │
+    │             │                        │ 7b. PROC    │
+    │             │                        │    HARDEN   │
+    │             │                        │    Mask     │
+    │             │                        │    /proc/*  │
+    │             │                        │             │
     │             │                        │ 8. NET      │
     │             │                        │    SETUP    │
     │             │                        │    loopback │
@@ -144,6 +153,11 @@ The complete lifecycle of `can run --config example.toml -- python3 script.py`:
     │             │                        │ 9. PROCESS  │
     │             │                        │    RLIMIT   │
     │             │                        │    NPROC    │
+    │             │                        │             │
+    │             │                        │ 9b. CGROUP  │
+    │             │                        │    memory   │
+    │             │                        │    .max +   │
+    │             │                        │    cpu.max  │
     │             │                        │             │
     │             │                        │ 10. SECCOMP │
     │             │                        │    Load BPF │
@@ -180,7 +194,10 @@ The complete lifecycle of `can run --config example.toml -- python3 script.py`:
   `/proc` mount reflects the new PID namespace.
 - Command prefix detection must happen after PID namespace entry but before
   overlay setup, so the prefix can be bind-mounted into the new root.
+- /proc hardening must happen after overlay + /proc mount but before seccomp.
 - `RLIMIT_NPROC` must be set before seccomp (which blocks `prctl`).
+- Cgroups v2 setup must happen after RLIMIT but before seccomp, because
+  creating cgroups requires write access to the cgroup filesystem.
 - Seccomp must be loaded **after** all setup is complete, right before exec.
 - Environment filtering happens at exec time — `execve()` receives the
   filtered environment directly.
@@ -332,9 +349,38 @@ is no network isolation.
 **Syscall:** `prctl(PR_SET_NO_NEW_PRIVS)` + `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`
 
 A classic BPF program is loaded right before `execve()`. The filter is
-generated at runtime from the selected profile's deny-list.
+generated at runtime from the selected profile's syscall list.
 
-**BPF program structure:**
+**Two modes — allow-list (default) and deny-list:**
+
+| Mode | Default action | Listed syscalls | Recommended for |
+|------|---------------|-----------------|-----------------|
+| **Allow-list** (default) | DENY | Permitted | Production, CI |
+| **Deny-list** | ALLOW | Blocked | Compatibility, unknown workloads |
+
+Allow-list mode is the default and recommended mode. It inverts the
+security model: only syscalls explicitly listed in the profile are
+permitted; everything else is denied. This provides a much smaller attack
+surface than a deny-list.
+
+**BPF program structure (allow-list mode):**
+
+```
+Instruction  What it does
+─────────────────────────────────────────────────
+[0]          Load seccomp_data.arch
+[1]          If arch == x86_64: skip to [3]
+[2]          Return KILL_PROCESS (wrong architecture)
+[3]          Load seccomp_data.nr (syscall number)
+[4]          If nr == allowed_0: jump to [ALLOW]
+[5]          If nr == allowed_1: jump to [ALLOW]
+...
+[N]          If nr == allowed_K: jump to [ALLOW]
+[N+1]        Return ERRNO(EPERM) (no match → denied)
+[N+2]        Return ALLOW (match → permitted)
+```
+
+**BPF program structure (deny-list mode):**
 
 ```
 Instruction  What it does
@@ -351,19 +397,22 @@ Instruction  What it does
 [N+2]        Return ERRNO(EPERM) (match → denied)
 ```
 
+The mode is selected via `[profile] seccomp_mode` in the config file
+(default: `"allow-list"`).
+
 **Architecture validation:** The first check rejects any syscall from a
 non-native architecture. On x86_64, this prevents bypass via the x32 ABI
 (which shares the kernel but uses different syscall numbers).
 
-**Deny action:** Canister uses `SECCOMP_RET_ERRNO | EPERM` rather than
-`SECCOMP_RET_KILL_PROCESS`. This allows the sandboxed process to handle
-denied syscalls gracefully (e.g., catch the error and continue) rather than
-being killed immediately.
+**Deny action:** In normal mode, Canister uses `SECCOMP_RET_ERRNO | EPERM`
+which allows the sandboxed process to handle denied syscalls gracefully. In
+**strict mode** (`--strict`), it uses `SECCOMP_RET_KILL_PROCESS` — the
+process is killed immediately on any denied syscall.
 
 **Security property:** Even if a process escapes all namespace isolation,
-it cannot invoke denied syscalls. The filter is enforced by the kernel and
+it cannot invoke unlisted syscalls. The filter is enforced by the kernel and
 cannot be removed or modified by the filtered process (loading new filters
-is blocked since `seccomp` is in the deny list for python/node profiles).
+is blocked in all profiles except `generic`).
 
 ### 5. Process Control
 
@@ -431,7 +480,69 @@ spawned inside the sandbox can exec arbitrary binaries. Full ongoing execve
 enforcement requires `SECCOMP_RET_USER_NOTIF` with a supervisor thread
 (planned for a future phase).
 
-### 6. Monitor Mode
+### 6. Cgroups v2
+
+**Files:** `cgroups.rs`
+
+Cgroups v2 enforces resource limits (memory and CPU) without requiring root.
+It leverages systemd's per-user cgroup delegation, which is available on any
+modern system running systemd (Ubuntu 22.04+, Fedora 36+, etc.).
+
+**Setup sequence:**
+
+1. **Detect** the current cgroup by reading `/proc/self/cgroup`.
+2. **Create** a child cgroup at `<parent>/canister-<pid>`.
+3. **Write** `memory.max` (bytes) and `cpu.max` (quota/period) to the child
+   cgroup's control files.
+4. **Move** the sandboxed process into the child cgroup by writing its PID
+   to `cgroup.procs`.
+
+**CPU limiting:** `cpu_percent = 50` translates to `cpu.max = "50000 100000"`
+(50ms quota per 100ms period), effectively capping the process to 50% of
+one CPU core.
+
+**Memory limiting:** `memory_mb = 512` translates to `memory.max = 536870912`
+(512 * 1024 * 1024 bytes). When exceeded, the kernel OOM-kills the process.
+
+**Cleanup:** Child cgroups are removed when the sandboxed process exits (the
+kernel removes empty cgroups automatically).
+
+**Failure handling:** In normal mode, cgroup setup failure is non-fatal (a
+warning is logged). In strict mode, cgroup failure aborts the sandbox.
+
+**Security property:** The sandboxed process cannot consume unbounded memory
+or CPU. The limits are enforced by the kernel's cgroup controller and cannot
+be modified by the sandboxed process (which has no write access to the
+cgroup filesystem after seccomp is loaded).
+
+### 7. /proc Hardening
+
+**Files:** `overlay.rs` (mount_proc function)
+
+After mounting `/proc` inside the sandbox, Canister masks sensitive paths
+following Docker's default behavior:
+
+**Masked files** (bind-mount `/dev/null` over them):
+- `/proc/kcore` — physical memory access
+- `/proc/keys` — kernel keyring contents
+- `/proc/sysrq-trigger` — kernel SysRq commands
+- `/proc/timer_list` — timer details (information leak)
+- `/proc/latency_stats` — latency statistics
+
+**Masked directories** (mount empty read-only tmpfs over them):
+- `/proc/acpi` — ACPI interface
+- `/proc/scsi` — SCSI device interface
+
+**Read-only remount:**
+- `/proc/sys` — prevents writing to sysctl tunables
+
+**Failure handling:** Individual mask failures are logged at debug level and
+are non-fatal. The sandbox continues with whatever masking succeeded.
+
+**Security property:** The sandboxed process cannot read sensitive kernel
+information from /proc, trigger SysRq commands, or modify sysctl values.
+
+### 8. Monitor Mode
 
 **Flag:** `--monitor`
 
@@ -486,6 +597,34 @@ can run --config my_policy.toml -- ./my_program
 
 **Security property:** Monitor mode provides NO security guarantees. It is
 a development/debugging tool for iterating on sandbox policies.
+
+**Warning:** A malicious process can detect monitor mode (e.g., by
+attempting a denied syscall and observing it succeeds) and behave
+differently. Always validate policies with enforcement enabled.
+
+### 9. Strict Mode
+
+**Flag:** `--strict` (or `strict = true` in config)
+
+Strict mode is the inverse of monitor mode: instead of relaxing
+enforcement, it tightens it. Every point where normal mode gracefully
+degrades becomes a hard failure in strict mode.
+
+**Changes in strict mode:**
+
+| Enforcement point | Normal mode | Strict mode |
+|-------------------|-------------|-------------|
+| Filesystem isolation | Falls back if AppArmor blocks mounts | **Aborts** |
+| Network setup | Logs warning on failure | **Aborts** |
+| Loopback bring-up | Skips with warning | **Aborts** |
+| Seccomp deny action | `SECCOMP_RET_ERRNO` (EPERM) | `SECCOMP_RET_KILL_PROCESS` |
+| Cgroup setup | Logs warning on failure | **Aborts** |
+
+**Mutual exclusion:** `--strict` and `--monitor` cannot be used together.
+This is enforced at the CLI level.
+
+**Recommended for:** CI pipelines, production deployments, and any
+environment where reduced isolation is worse than no execution.
 
 ---
 
@@ -563,15 +702,15 @@ mount and umount permissions to processes in the `unprivileged_userns` profile.
 ### Not yet implemented
 
 - **IP-level connect() filtering.** Whitelisted domains are pre-resolved but
-  the resolved IPs are not used to filter actual connections. Requires
-  `SECCOMP_RET_USER_NOTIF` with a supervisor thread.
+  the resolved IPs are not used to filter actual connections. The sandbox in
+  "filtered" network mode can connect to any IP reachable via slirp4netns.
+  Requires `SECCOMP_RET_USER_NOTIF` with a supervisor thread to intercept
+  `connect()` syscalls and validate the target IP against the whitelist.
 
 - **Ongoing execve enforcement.** `allow_execve` validates the initial command
-  but child processes inside the sandbox can exec arbitrary binaries.
-  Requires `SECCOMP_RET_USER_NOTIF` for path-based argument inspection.
-
-- **Resource limits.** `memory_mb` and `cpu_percent` require cgroups v2
-  delegation (Phase 7).
+  but child processes inside the sandbox can exec arbitrary binaries that are
+  visible in the mount namespace. Requires `SECCOMP_RET_USER_NOTIF` for
+  path-based argument inspection of every `execve()` call.
 
 ### Fundamental limitations
 

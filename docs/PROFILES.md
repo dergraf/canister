@@ -25,19 +25,28 @@ built-in profile blocks, and how to choose the right one.
 
 Canister generates a classic BPF (Berkeley Packet Filter) program at runtime
 and loads it via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` right before
-`execve()`. The filter uses a **deny-list model**:
+`execve()`.
 
-- **Default action:** ALLOW. Any syscall not explicitly listed is permitted.
-- **Denied syscalls:** Return `EPERM` to the caller.
+### Two enforcement modes
 
-This approach was chosen over an allow-list because:
+| Mode | Default action | Listed syscalls | Config value |
+|------|---------------|-----------------|--------------|
+| **Allow-list** (default) | DENY | Only listed syscalls permitted | `seccomp_mode = "allow-list"` |
+| **Deny-list** | ALLOW | Only listed syscalls blocked | `seccomp_mode = "deny-list"` |
 
-1. **Compatibility.** Real-world programs use dozens of syscalls. An allow-list
-   would break most software out of the box.
-2. **Simplicity.** The deny-list is short (16-22 syscalls) and easy to reason
-   about.
-3. **Graceful failure.** Programs can handle `EPERM` and continue operating,
-   rather than being killed by a missing syscall.
+**Allow-list mode** (recommended, default) inverts the security model:
+every syscall not explicitly listed in the profile is denied. This provides
+a much smaller kernel attack surface. Each profile defines ~171-177 syscalls
+that are permitted — everything else is blocked.
+
+**Deny-list mode** is the permissive fallback: everything is allowed except
+the ~16-22 syscalls explicitly blocked per profile. Use this when you need
+maximum compatibility with unknown workloads, at the cost of a larger
+attack surface.
+
+Both modes share the same profile definitions — each profile specifies both
+an allow list and a deny list. The `seccomp_mode` setting selects which one
+is used at filter load time.
 
 The filter cannot be removed or modified after loading. The `PR_SET_NO_NEW_PRIVS`
 flag is set first, which is required for unprivileged seccomp and also prevents
@@ -50,11 +59,12 @@ binaries.
 
 ### `generic`
 
-**16 denied syscalls.** The most permissive profile. Suitable for arbitrary
-binaries where you don't know what syscalls they need.
+**177 allowed syscalls / 16 denied syscalls.** The most permissive profile.
+Suitable for arbitrary binaries where you don't know what syscalls they need.
 
-Blocks kernel-level operations that no sandboxed process should ever perform,
-plus namespace escape vectors.
+Allows everything in the base set plus ptrace, personality, io_uring, and
+seccomp (self-sandboxing). Only denies the always-dangerous set plus
+namespace escape vectors (unshare/setns).
 
 | Category | Blocked syscalls |
 |----------|-----------------|
@@ -70,10 +80,10 @@ Use `generic` when:
 
 ### `python`
 
-**22 denied syscalls.** Tighter than generic. Adds restrictions on debugging,
-io_uring, and further seccomp filter loading.
+**171 allowed syscalls / 22 denied syscalls.** Tighter than generic. Removes
+ptrace, personality, io_uring, and seccomp from the allow list.
 
-Everything in `generic`, plus:
+Everything in `generic`'s deny list, plus:
 
 | Category | Blocked syscalls |
 |----------|-----------------|
@@ -96,10 +106,11 @@ process should not be able to inspect or manipulate other processes.
 
 ### `node`
 
-**22 denied syscalls.** Same restrictions as `python`. Preserves `clone` and
-`clone3` (not blocked) since Node.js uses them for `worker_threads`.
+**171 allowed syscalls / 22 denied syscalls.** Same restrictions as `python`.
+Preserves `clone` and `clone3` (allowed in all profiles) since Node.js uses
+them for `worker_threads`.
 
-Everything in `generic`, plus:
+Everything in `generic`'s deny list, plus:
 
 | Category | Blocked syscalls |
 |----------|-----------------|
@@ -114,12 +125,12 @@ Use `node` when:
 
 ### `elixir`
 
-**21 denied syscalls.** Tailored for the BEAM virtual machine (Erlang/OTP,
-Elixir). Slightly less restrictive than python/node because it preserves
+**172 allowed syscalls / 21 denied syscalls.** Tailored for the BEAM virtual
+machine (Erlang/OTP, Elixir). Allows one more syscall than python/node:
 `ptrace`, which BEAM tooling (`:observer`, `:dbg`, `recon`) uses for
 runtime introspection.
 
-Everything in `generic`, plus:
+Everything in `generic`'s deny list, plus:
 
 | Category | Blocked syscalls |
 |----------|-----------------|
@@ -211,17 +222,17 @@ seccomp denial is likely the cause.
 
 ---
 
-## Deny Action: Errno vs Kill
+## Deny Action: Errno, Kill, and Strict Mode
 
-Canister uses **Errno mode** (`SECCOMP_RET_ERRNO | EPERM`) rather than
-**Kill mode** (`SECCOMP_RET_KILL_PROCESS`).
+Canister supports three deny actions depending on the mode:
 
-| Mode | Behavior | Tradeoff |
-|------|----------|----------|
-| **Errno** | Denied syscall returns -1 with `errno = EPERM` | Process can handle the error gracefully |
-| **Kill** | Process is immediately terminated with `SIGSYS` | Stronger enforcement but no error handling |
+| Mode | Deny action | Behavior |
+|------|-------------|----------|
+| **Normal** | `SECCOMP_RET_ERRNO \| EPERM` | Denied syscall returns -1 with `errno = EPERM`. Process survives. |
+| **Strict** (`--strict`) | `SECCOMP_RET_KILL_PROCESS` | Process is immediately terminated with `SIGSYS`. |
+| **Monitor** (`--monitor`) | `SECCOMP_RET_LOG` | Syscall is allowed but logged to kernel audit. |
 
-Errno mode was chosen because:
+**Normal mode** (default) uses Errno because:
 
 1. Most programs check return values and can handle `EPERM` gracefully.
 2. Kill mode makes debugging harder (process just dies with no error message).
@@ -229,9 +240,15 @@ Errno mode was chosen because:
    accidentally -- if a program calls `reboot()`, it's intentional and
    getting EPERM back is the right response.
 
+**Strict mode** (`--strict`) uses Kill because:
+
+1. In CI/production, a denied syscall indicates a policy violation or attack.
+2. Immediate termination prevents any further execution after a violation.
+3. The process cannot observe or react to the denial (no information leak).
+
 The architecture validation check (wrong CPU architecture) always uses
-`SECCOMP_RET_KILL_PROCESS` since an architecture mismatch indicates an
-actual attack (e.g., x32 ABI bypass attempt).
+`SECCOMP_RET_KILL_PROCESS` regardless of mode, since an architecture
+mismatch indicates an actual attack (e.g., x32 ABI bypass attempt).
 
 ---
 
@@ -299,12 +316,14 @@ List all available profiles:
 $ can profiles
 Available seccomp profiles:
 
-  generic      Generic profile for arbitrary binaries. (16 denied syscalls)
-  python       Profile for Python scripts. (22 denied syscalls)
-  node         Profile for Node.js scripts. (22 denied syscalls)
-  elixir       Profile for Elixir/Erlang (BEAM VM). (21 denied syscalls)
+  generic      Generic profile for arbitrary binaries. (177 allowed, 16 denied)
+  python       Profile for Python scripts. (171 allowed, 22 denied)
+  node         Profile for Node.js scripts. (171 allowed, 22 denied)
+  elixir       Profile for Elixir/Erlang (BEAM VM). (172 allowed, 21 denied)
 ```
 
-To see exactly which syscalls a profile blocks, check the source at
-`crates/can-policy/src/profile.rs`. The `DENY_ALWAYS` constant contains the
-shared base set, and each profile's constructor adds its specific additions.
+To see exactly which syscalls a profile allows/blocks, check the source at
+`crates/can-policy/src/profile.rs`. The `ALLOW_BASE` constant contains the
+shared allow set (~171 syscalls), `DENY_ALWAYS` contains the shared deny
+base (~14 syscalls), and each profile's constructor adds its specific
+additions.
