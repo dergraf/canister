@@ -13,3 +13,7 @@ match_prefix = ["/snap"]
 
 [filesystem]
 allow = ["/snap"]
+
+[process]
+# Allow execution of any binary installed as a Snap package.
+allow_execve = ["/snap/*"]

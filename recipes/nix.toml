@@ -17,3 +17,9 @@ match_prefix = ["/nix/store"]
 # Mount the entire Nix store — binaries reference sibling entries
 # via rpaths and wrapper scripts.
 allow = ["/nix/store"]
+
+[process]
+# Allow execution of any binary within the Nix store.
+# Nix paths contain content hashes that change on every rebuild,
+# so exact paths cannot be known ahead of time.
+allow_execve = ["/nix/store/*"]

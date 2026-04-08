@@ -183,6 +183,7 @@ allow = [
     "getegid",
     "gettid",
     "getpgid",
+    "getpgrp",
     "setpgid",
     "setsid",
     "getgroups",

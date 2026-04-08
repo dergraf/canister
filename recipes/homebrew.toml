@@ -14,3 +14,7 @@ match_prefix = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]
 
 [filesystem]
 allow = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]
+
+[process]
+# Allow execution of any binary installed by Homebrew.
+allow_execve = ["/opt/homebrew/*", "/home/linuxbrew/.linuxbrew/*"]

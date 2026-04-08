@@ -14,3 +14,8 @@ match_prefix = ["/gnu/store"]
 
 [filesystem]
 allow = ["/gnu/store"]
+
+[process]
+# Allow execution of any binary within the GNU Guix store.
+# Like Nix, Guix paths contain content hashes.
+allow_execve = ["/gnu/store/*"]

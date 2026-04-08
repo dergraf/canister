@@ -14,3 +14,7 @@ match_prefix = ["$HOME/.cargo", "$HOME/.rustup"]
 
 [filesystem]
 allow = ["$HOME/.cargo", "$HOME/.rustup"]
+
+[process]
+# Allow execution of any binary installed by Cargo or rustup.
+allow_execve = ["$HOME/.cargo/*", "$HOME/.rustup/*"]

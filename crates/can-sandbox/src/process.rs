@@ -97,6 +97,10 @@ pub fn filter_environment(config: &ProcessConfig) -> Vec<CString> {
 ///
 /// If `allow_execve` is empty, all commands are allowed (no restriction).
 /// If non-empty, the command's canonical path must match one of the entries.
+///
+/// Entries ending in `/*` are treated as **prefix rules**: any executable
+/// whose canonical path starts with the directory prefix is allowed.
+/// For example, `/nix/store/*` allows any binary under `/nix/store/`.
 pub fn validate_execve(command_path: &Path, config: &ProcessConfig) -> Result<(), ProcessError> {
     if config.allow_execve.is_empty() {
         return Ok(());
@@ -108,14 +112,32 @@ pub fn validate_execve(command_path: &Path, config: &ProcessConfig) -> Result<()
         .unwrap_or_else(|_| command_path.to_path_buf());
 
     for allowed in &config.allow_execve {
-        let allowed_canonical = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
+        let allowed_str = allowed.as_os_str().to_string_lossy();
 
-        if canonical == allowed_canonical {
-            tracing::debug!(
-                path = %canonical.display(),
-                "command allowed by allow_execve whitelist"
-            );
-            return Ok(());
+        if allowed_str.ends_with("/*") {
+            // Prefix rule: strip the trailing /* and check starts_with.
+            let prefix = &allowed_str[..allowed_str.len() - 2];
+            let canonical_str = canonical.to_string_lossy();
+            if canonical_str.starts_with(prefix)
+                && canonical_str.as_bytes().get(prefix.len()) == Some(&b'/')
+            {
+                tracing::debug!(
+                    path = %canonical.display(),
+                    prefix = prefix,
+                    "command allowed by allow_execve prefix rule"
+                );
+                return Ok(());
+            }
+        } else {
+            // Exact match (existing behaviour).
+            let allowed_canonical = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
+            if canonical == allowed_canonical {
+                tracing::debug!(
+                    path = %canonical.display(),
+                    "command allowed by allow_execve whitelist"
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -176,6 +198,12 @@ pub fn enter_pid_namespace() -> Result<(), ProcessError> {
         }
         nix::unistd::ForkResult::Child => {
             // We are now PID 1 in the new PID namespace.
+            // Create a new session so that getpgrp() works correctly.
+            // Without this, bash (and other shells) fail with
+            // "initialize_job_control: getpgrp failed" because the inherited
+            // session/process-group leader lives in the parent PID namespace
+            // and is invisible from within this one.
+            nix::unistd::setsid().map_err(ProcessError::PidFork)?;
             tracing::debug!(pid = std::process::id(), "entered PID namespace as PID 1");
             Ok(())
         }
@@ -318,6 +346,67 @@ mod tests {
         let result = validate_execve(Path::new("/bin/ls"), &config);
         assert!(result.is_err());
         assert!(matches!(result, Err(ProcessError::ExecNotAllowed(_))));
+    }
+
+    #[test]
+    fn validate_execve_prefix_allows_nested_binary() {
+        let config = ProcessConfig {
+            max_pids: None,
+            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            env_passthrough: vec![],
+        };
+        // A deeply nested nix store binary should match the prefix rule.
+        let result = validate_execve(Path::new("/nix/store/abc123-elixir-1.18/bin/mix"), &config);
+        assert!(result.is_ok(), "prefix rule should allow nested binary");
+    }
+
+    #[test]
+    fn validate_execve_prefix_rejects_outside_path() {
+        let config = ProcessConfig {
+            max_pids: None,
+            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            env_passthrough: vec![],
+        };
+        let result = validate_execve(Path::new("/usr/bin/echo"), &config);
+        assert!(result.is_err(), "prefix rule should not match outside path");
+    }
+
+    #[test]
+    fn validate_execve_prefix_rejects_partial_match() {
+        // "/nix/store-extra/bin/foo" should NOT match "/nix/store/*"
+        // because "store-extra" != "store".
+        let config = ProcessConfig {
+            max_pids: None,
+            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            env_passthrough: vec![],
+        };
+        let result = validate_execve(Path::new("/nix/store-extra/bin/foo"), &config);
+        assert!(
+            result.is_err(),
+            "prefix rule must not match partial directory names"
+        );
+    }
+
+    #[test]
+    fn validate_execve_prefix_and_exact_coexist() {
+        let config = ProcessConfig {
+            max_pids: None,
+            allow_execve: vec![PathBuf::from("/nix/store/*"), PathBuf::from("/bin/echo")],
+            env_passthrough: vec![],
+        };
+        // Both should work.
+        assert!(
+            validate_execve(Path::new("/nix/store/abc/bin/mix"), &config).is_ok(),
+            "prefix rule should match"
+        );
+        assert!(
+            validate_execve(Path::new("/bin/echo"), &config).is_ok(),
+            "exact rule should match"
+        );
+        assert!(
+            validate_execve(Path::new("/usr/bin/ls"), &config).is_err(),
+            "unmatched path should be rejected"
+        );
     }
 
     #[test]

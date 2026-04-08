@@ -561,6 +561,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "getegid" => libc::SYS_getegid,
         "gettid" => libc::SYS_gettid,
         "getpgid" => libc::SYS_getpgid,
+        "getpgrp" => libc::SYS_getpgrp,
         "setpgid" => libc::SYS_setpgid,
         "setsid" => libc::SYS_setsid,
         "getgroups" => libc::SYS_getgroups,
