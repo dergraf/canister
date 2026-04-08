@@ -119,7 +119,7 @@ lookup is deferred to Phase 2.
 - [x] Ship example recipes in `recipes/` directory
 - [x] Update `docs/CONFIGURATION.md` and `docs/PROFILES.md`
 - [x] Remove `--config` backward compatibility — `--recipe` is the only way
-- [ ] Phase 2 ADR: recipe composition, name-based lookup, remote registries
+- [x] Phase 2 ADR: recipe composition, name-based lookup, remote registries → ADR-0002
 - [ ] Phase 3 ADR: versioning, signing
 
 ## Amendments
