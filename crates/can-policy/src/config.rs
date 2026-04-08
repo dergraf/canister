@@ -108,19 +108,14 @@ pub struct ResourceConfig {
 ///   syscalls are allowed. This is the secure choice for production/CI.
 /// - **DenyList**: default action is ALLOW. Only explicitly listed syscalls
 ///   are blocked. More permissive, useful when compatibility is paramount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeccompMode {
     /// Default deny — only allow-listed syscalls are permitted.
+    #[default]
     AllowList,
     /// Default allow — only deny-listed syscalls are blocked.
     DenyList,
-}
-
-impl Default for SeccompMode {
-    fn default() -> Self {
-        Self::AllowList
-    }
 }
 
 impl fmt::Display for SeccompMode {
