@@ -193,6 +193,138 @@ pub enum ConfigError {
 
     #[error("invalid config format: {0}")]
     Parse(toml::de::Error),
+
+    #[error("unknown baseline/profile: \"{0}\" (available: generic, python, node, elixir)")]
+    UnknownBaseline(String),
+}
+
+// ---------------------------------------------------------------------------
+// Recipe support
+// ---------------------------------------------------------------------------
+
+/// Metadata section for recipe files.
+///
+/// Recipes are the primary user-facing policy format. They compose a
+/// complete sandbox policy by selecting a baseline (syscall set) and
+/// layering filesystem, network, process, and resource rules on top.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeMeta {
+    /// Human-readable recipe name. Defaults to the filename stem when omitted.
+    pub name: Option<String>,
+
+    /// One-line description of what this recipe is for.
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Opaque version string (for humans, not parsed).
+    #[serde(default)]
+    pub version: Option<String>,
+
+    /// Baseline syscall profile. One of: "generic", "python", "node", "elixir".
+    ///
+    /// When set, overrides `[profile].name`. This is the preferred way to
+    /// select a syscall baseline in recipes.
+    pub baseline: Option<String>,
+}
+
+/// A recipe file — superset of `SandboxConfig` with optional metadata.
+///
+/// Both `--recipe` and `--config` parse through this struct. Files without
+/// a `[recipe]` section are valid (the field defaults to `None`), which
+/// preserves full backward compatibility with existing config files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeFile {
+    /// Recipe metadata (optional).
+    #[serde(default)]
+    pub recipe: Option<RecipeMeta>,
+
+    /// Strict mode: fail hard instead of degrading gracefully.
+    #[serde(default)]
+    pub strict: bool,
+
+    /// Filesystem access policy.
+    #[serde(default)]
+    pub filesystem: FilesystemConfig,
+
+    /// Network access policy.
+    #[serde(default)]
+    pub network: NetworkConfig,
+
+    /// Process and environment restrictions.
+    #[serde(default)]
+    pub process: ProcessConfig,
+
+    /// Resource limits (CPU, memory).
+    #[serde(default)]
+    pub resources: ResourceConfig,
+
+    /// Seccomp profile selection.
+    #[serde(default)]
+    pub profile: ProfileConfig,
+}
+
+impl RecipeFile {
+    /// Load a recipe from a TOML file.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(ConfigError::ReadFile)?;
+        toml::from_str(&content).map_err(ConfigError::Parse)
+    }
+
+    /// Resolve into a `SandboxConfig`, applying baseline override.
+    ///
+    /// If the recipe has a `[recipe] baseline = "..."`, that overrides
+    /// the `[profile] name = "..."` field. The resulting profile name is
+    /// validated against known baselines.
+    pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
+        let mut profile = self.profile;
+
+        // baseline takes precedence over profile.name
+        if let Some(ref meta) = self.recipe {
+            if let Some(ref baseline) = meta.baseline {
+                profile.name = baseline.clone();
+            }
+        }
+
+        // Validate the profile/baseline name resolves to a known builtin.
+        if crate::SeccompProfile::builtin(&profile.name).is_none() {
+            return Err(ConfigError::UnknownBaseline(profile.name));
+        }
+
+        Ok(SandboxConfig {
+            strict: self.strict,
+            filesystem: self.filesystem,
+            network: self.network,
+            process: self.process,
+            resources: self.resources,
+            profile,
+        })
+    }
+
+    /// Get the display name for this recipe.
+    pub fn display_name(&self, fallback: &str) -> String {
+        self.recipe
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    /// Get the description for this recipe.
+    pub fn description(&self) -> &str {
+        self.recipe
+            .as_ref()
+            .and_then(|m| m.description.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Get the effective baseline name (resolved).
+    pub fn baseline_name(&self) -> &str {
+        self.recipe
+            .as_ref()
+            .and_then(|m| m.baseline.as_deref())
+            .unwrap_or(&self.profile.name)
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +394,94 @@ bogus_field = true
 "#;
         let result: Result<SandboxConfig, _> = toml.parse();
         assert!(result.is_err());
+    }
+
+    // ---- Recipe tests ----
+
+    #[test]
+    fn parse_recipe_with_metadata() {
+        let toml = r#"
+[recipe]
+name = "python-pip"
+description = "Install Python packages with pip"
+version = "1"
+baseline = "python"
+
+[filesystem]
+allow = ["/usr/lib", "/tmp"]
+
+[network]
+allow_domains = ["pypi.org", "files.pythonhosted.org"]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+"#;
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        assert_eq!(recipe.display_name("fallback"), "python-pip");
+        assert_eq!(recipe.description(), "Install Python packages with pip");
+        assert_eq!(recipe.baseline_name(), "python");
+
+        let config = recipe.into_sandbox_config().unwrap();
+        assert_eq!(config.profile.name, "python");
+        assert_eq!(config.filesystem.allow.len(), 2);
+    }
+
+    #[test]
+    fn parse_recipe_without_metadata() {
+        // A recipe file without [recipe] is a valid legacy config.
+        let toml = r#"
+[filesystem]
+allow = ["/usr/lib"]
+
+[profile]
+name = "node"
+"#;
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        assert!(recipe.recipe.is_none());
+        assert_eq!(recipe.display_name("fallback"), "fallback");
+        assert_eq!(recipe.baseline_name(), "node");
+
+        let config = recipe.into_sandbox_config().unwrap();
+        assert_eq!(config.profile.name, "node");
+    }
+
+    #[test]
+    fn recipe_baseline_overrides_profile_name() {
+        let toml = r#"
+[recipe]
+baseline = "elixir"
+
+[profile]
+name = "generic"
+seccomp_mode = "allow-list"
+"#;
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        let config = recipe.into_sandbox_config().unwrap();
+        // baseline wins over profile.name
+        assert_eq!(config.profile.name, "elixir");
+        // seccomp_mode preserved
+        assert_eq!(config.profile.seccomp_mode, SeccompMode::AllowList);
+    }
+
+    #[test]
+    fn recipe_unknown_baseline_rejected() {
+        let toml = r#"
+[recipe]
+baseline = "nonexistent"
+"#;
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        let result = recipe.into_sandbox_config();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn recipe_defaults_to_generic() {
+        let toml = "";
+        let recipe: RecipeFile = toml::from_str(toml).unwrap();
+        let config = recipe.into_sandbox_config().unwrap();
+        assert_eq!(config.profile.name, "generic");
     }
 }
