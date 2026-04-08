@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use can_policy::profile::baseline_search_dirs;
-use can_policy::{RecipeFile, SandboxConfig, SeccompProfile};
+use can_policy::{RecipeFile, SandboxConfig, SeccompProfile, resolve_base};
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
 use can_sandbox::setup::{self, ProfileStatus};
@@ -45,15 +45,50 @@ fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
 
 /// Load and merge all recipe arguments into a single `SandboxConfig`.
 ///
-/// Recipes are merged left-to-right using `RecipeFile::merge()`.
-fn load_recipes(recipe_args: &[String]) -> Result<SandboxConfig> {
-    if recipe_args.is_empty() {
-        tracing::info!("no recipe specified, using default deny-all policy");
-        return Ok(SandboxConfig::default_deny());
+/// Composition order:
+/// 1. `base.toml` — essential OS filesystem mounts (always loaded)
+/// 2. Auto-detected recipes — matched by `match_prefix` against the
+///    resolved command binary path
+/// 3. Explicit `--recipe` arguments — merged left-to-right
+///
+/// The seccomp baseline (`default.toml`) is resolved separately by the
+/// seccomp layer and is NOT part of this composition stack.
+fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<SandboxConfig> {
+    // 1. Start with base.toml (essential OS mounts).
+    let mut merged = resolve_base().context("loading base.toml")?;
+    tracing::debug!("loaded base.toml (essential OS mounts)");
+
+    // 2. Auto-detect recipes based on the resolved command path.
+    if let Some(cmd) = command {
+        match can_sandbox::resolve_command(cmd) {
+            Ok(command_path) => {
+                let auto_recipes = discover_auto_recipes(&command_path)?;
+                for (path, recipe) in &auto_recipes {
+                    let name = recipe.display_name(
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown"),
+                    );
+                    tracing::info!(
+                        recipe = name,
+                        path = %path.display(),
+                        command = %command_path.display(),
+                        "auto-detected recipe for command"
+                    );
+                }
+                for (_path, recipe) in auto_recipes {
+                    merged = merged.merge(recipe);
+                }
+            }
+            Err(e) => {
+                // Command resolution may fail (e.g., command not found).
+                // Skip auto-detection; the sandbox will report the error later.
+                tracing::debug!(command = cmd, error = %e, "skipping auto-detection (command resolution failed)");
+            }
+        }
     }
 
-    let mut merged: Option<RecipeFile> = None;
-
+    // 3. Merge explicit --recipe arguments left-to-right.
     for arg in recipe_args {
         let path = resolve_recipe_path(arg)?;
         let recipe = RecipeFile::from_file(&path)
@@ -69,16 +104,76 @@ fn load_recipes(recipe_args: &[String]) -> Result<SandboxConfig> {
             "loaded recipe"
         );
 
-        merged = Some(match merged {
-            Some(base) => base.merge(recipe),
-            None => recipe,
-        });
+        merged = merged.merge(recipe);
     }
 
     merged
-        .expect("recipe_args was non-empty")
         .into_sandbox_config()
         .context("resolving merged recipe")
+}
+
+/// Discover recipes whose `match_prefix` matches the resolved command path.
+///
+/// Scans all `.toml` recipe files across the recipe search path, expands
+/// env vars in `match_prefix`, and returns those where the command path
+/// starts with a matching prefix.
+///
+/// `default.toml` and `base.toml` are excluded (they serve different roles).
+fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile)>> {
+    let mut matches = Vec::new();
+
+    for dir in baseline_search_dirs() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "toml")
+                    && p.file_stem().is_some_and(|s| s != "default" && s != "base")
+            })
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            let recipe = match RecipeFile::from_file(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "skipping recipe (parse error)");
+                    continue;
+                }
+            };
+
+            let prefixes = recipe.match_prefixes_expanded();
+            if prefixes.is_empty() {
+                continue;
+            }
+
+            let command_str = command_path.to_string_lossy();
+            let matched = prefixes
+                .iter()
+                .any(|prefix| command_str.starts_with(prefix));
+
+            if matched {
+                // Avoid duplicates: skip if we already matched a recipe with the same name.
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                let already_matched = matches.iter().any(|(p, _): &(PathBuf, RecipeFile)| {
+                    p.file_stem().and_then(|s| s.to_str()) == Some(stem)
+                });
+                if !already_matched {
+                    matches.push((path, recipe));
+                }
+            }
+        }
+    }
+
+    Ok(matches)
 }
 
 /// Execute the `can run` command.
@@ -88,7 +183,8 @@ pub fn run(
     strict: bool,
     command: Vec<String>,
 ) -> Result<i32> {
-    let config = load_recipes(recipe_args)?;
+    let cmd_name = command.first().map(|s| s.as_str());
+    let config = load_recipes(recipe_args, cmd_name)?;
 
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;

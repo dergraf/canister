@@ -74,43 +74,15 @@ const SKELETON_DIRS: &[&str] = &[
     "var/tmp",
 ];
 
-/// Paths that are always bind-mounted read-only into the sandbox
-/// for basic operation (binaries, shared libraries, dynamic linker, etc.).
-/// These are mounted regardless of the whitelist config.
-const ESSENTIAL_BIND_MOUNTS: &[&str] = &[
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/usr/bin",
-    "/usr/sbin",
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/share",
-    "/etc/ld.so.cache",
-    "/etc/ld.so.conf",
-    "/etc/ld.so.conf.d",
-    "/etc/resolv.conf",
-    "/etc/nsswitch.conf",
-    "/etc/hosts",
-    "/etc/ssl",
-    "/etc/ca-certificates",
-    "/etc/localtime",
-    "/etc/alternatives",
-];
-
 /// Attempt filesystem isolation, falling back gracefully if mounts are blocked.
 ///
-/// `command_prefix` is the auto-detected package-manager prefix for the
-/// command binary (e.g. `/nix/store`, `/opt/homebrew`). If present, it is
-/// bind-mounted read-only into the sandbox.
+/// All filesystem paths (essential OS mounts, auto-detected package manager
+/// prefixes, and user-specified paths) are expected to be already merged
+/// into `config.allow` via recipe composition.
 ///
 /// Returns `true` if full isolation was applied, `false` if running in degraded mode.
-pub fn try_setup_filesystem(
-    config: &FilesystemConfig,
-    command_prefix: Option<&Path>,
-) -> Result<bool, OverlayError> {
-    match setup_filesystem(config, command_prefix) {
+pub fn try_setup_filesystem(config: &FilesystemConfig) -> Result<bool, OverlayError> {
+    match setup_filesystem(config) {
         Ok(()) => Ok(true),
         Err(OverlayError::Mount { ref path, source }) if is_permission_error(source) => {
             tracing::error!(
@@ -135,14 +107,11 @@ fn is_permission_error(err: nix::Error) -> bool {
 /// This must be called from within the child process, after namespaces
 /// have been created and UID/GID maps written.
 ///
-/// Creates a tmpfs root, bind-mounts essentials + whitelisted paths,
-/// mounts /proc, and does pivot_root.
+/// Creates a tmpfs root, bind-mounts whitelisted paths (which now include
+/// essential OS paths from base.toml), mounts /proc, and does pivot_root.
 ///
 /// Returns `Err` if mount operations are blocked (e.g., by AppArmor).
-pub fn setup_filesystem(
-    config: &FilesystemConfig,
-    command_prefix: Option<&Path>,
-) -> Result<(), OverlayError> {
+pub fn setup_filesystem(config: &FilesystemConfig) -> Result<(), OverlayError> {
     let sandbox_root = PathBuf::from("/tmp/canister-root");
 
     // 0. Break mount propagation. First make slave (allowed from shared),
@@ -169,28 +138,23 @@ pub fn setup_filesystem(
     // 3. Create the directory skeleton.
     create_skeleton(&sandbox_root)?;
 
-    // 4. Bind-mount essential system paths (read-only).
-    bind_mount_essentials(&sandbox_root)?;
-
-    // 5. Bind-mount user-configured whitelist paths (read-only).
+    // 4. Bind-mount all whitelisted paths (read-only).
+    //    This includes essential OS paths (from base.toml), auto-detected
+    //    package manager paths, and user-specified paths — all merged into
+    //    config.allow via recipe composition.
     bind_mount_whitelist(&sandbox_root, config)?;
 
-    // 5b. Bind-mount auto-detected command prefix (read-only).
-    if let Some(prefix) = command_prefix {
-        bind_mount_command_prefix(&sandbox_root, prefix, config)?;
-    }
-
-    // 6. Create a writable /tmp inside the sandbox.
+    // 5. Create a writable /tmp inside the sandbox.
     let sandbox_tmp = sandbox_root.join("tmp");
     mount_tmpfs(&sandbox_tmp)?;
 
-    // 7. Mount a fresh /proc for PID namespace.
+    // 6. Mount a fresh /proc for PID namespace.
     mount_proc(&sandbox_root)?;
 
-    // 8. Create minimal /dev entries.
+    // 7. Create minimal /dev entries.
     setup_minimal_dev(&sandbox_root)?;
 
-    // 9. Pivot root: make sandbox_root the new /.
+    // 8. Pivot root: make sandbox_root the new /.
     do_pivot_root(&sandbox_root)?;
 
     tracing::debug!("filesystem isolation complete");
@@ -221,36 +185,14 @@ fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
     Ok(())
 }
 
-/// Bind-mount essential system paths into the sandbox root.
-fn bind_mount_essentials(root: &Path) -> Result<(), OverlayError> {
-    for source in ESSENTIAL_BIND_MOUNTS {
-        let source_path = Path::new(source);
-        if !source_path.exists() {
-            tracing::debug!(path = source, "essential path not found, skipping");
-            continue;
-        }
-
-        let target = root.join(source.trim_start_matches('/'));
-
-        // Ensure target parent exists.
-        if let Some(parent) = target.parent() {
-            mkdir_p(parent)?;
-        }
-
-        // Create mount point: directory or file depending on source.
-        if source_path.is_dir() {
-            mkdir_p(&target)?;
-        } else {
-            // Create an empty file as a mount point.
-            touch(&target)?;
-        }
-
-        bind_mount_ro(source_path, &target)?;
-    }
-    Ok(())
-}
-
-/// Bind-mount user-configured whitelist paths into the sandbox.
+/// Bind-mount whitelisted paths into the sandbox.
+///
+/// This handles all paths in `config.allow`, which includes:
+/// - Essential OS paths (from base.toml)
+/// - Auto-detected package manager paths (from matched recipes)
+/// - User-specified paths (from explicit recipe arguments)
+///
+/// All are merged into a single list via recipe composition.
 fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
     for source in &config.allow {
         if !source.exists() {
@@ -281,68 +223,6 @@ fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), Ov
         bind_mount_ro(source, &target)?;
         tracing::debug!(source = %source.display(), target = %target.display(), "whitelisted path mounted");
     }
-    Ok(())
-}
-
-/// Bind-mount the auto-detected command prefix into the sandbox.
-///
-/// This mounts the entire prefix tree (e.g. `/nix/store`, `/opt/homebrew`)
-/// read-only. Paths already covered by essential bind mounts or the user
-/// whitelist are skipped.
-fn bind_mount_command_prefix(
-    root: &Path,
-    prefix: &Path,
-    config: &FilesystemConfig,
-) -> Result<(), OverlayError> {
-    if !prefix.exists() {
-        tracing::debug!(path = %prefix.display(), "command prefix not found, skipping");
-        return Ok(());
-    }
-
-    // Skip if the prefix is already fully covered by a user whitelist entry.
-    // Only skip when a whitelist entry is an ancestor of (or equal to) the prefix,
-    // meaning the prefix is entirely contained within an already-mounted tree.
-    // Do NOT skip when a whitelist entry is a *child* of the prefix — that only
-    // covers a subtree, not the whole prefix.
-    let already_covered = config
-        .allow
-        .iter()
-        .any(|allowed| prefix.starts_with(allowed));
-    if already_covered {
-        tracing::debug!(path = %prefix.display(), "command prefix already covered by whitelist, skipping");
-        return Ok(());
-    }
-
-    // Check if denied by policy.
-    let denied = config.deny.iter().any(|d| prefix.starts_with(d));
-    if denied {
-        tracing::warn!(
-            path = %prefix.display(),
-            "command prefix is in deny list, skipping (command may fail)"
-        );
-        return Ok(());
-    }
-
-    let rel = prefix.strip_prefix("/").unwrap_or(prefix);
-    let target = root.join(rel);
-
-    if let Some(parent) = target.parent() {
-        mkdir_p(parent)?;
-    }
-
-    if prefix.is_dir() {
-        mkdir_p(&target)?;
-    } else {
-        touch(&target)?;
-    }
-
-    bind_mount_ro(prefix, &target)?;
-    tracing::debug!(
-        prefix = %prefix.display(),
-        target = %target.display(),
-        "command prefix mounted"
-    );
-
     Ok(())
 }
 

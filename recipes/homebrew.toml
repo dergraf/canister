@@ -1,0 +1,16 @@
+# Canister recipe for Homebrew (Linuxbrew) package manager.
+#
+# On Linux, Homebrew installs to /home/linuxbrew/.linuxbrew or
+# /opt/homebrew (rare on Linux, common path on macOS). Binaries
+# reference the Cellar and shared libraries within the prefix.
+#
+# Auto-detection: triggered by match_prefix
+
+[recipe]
+name = "homebrew"
+description = "Homebrew/Linuxbrew package manager"
+version = "1"
+match_prefix = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]
+
+[filesystem]
+allow = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]

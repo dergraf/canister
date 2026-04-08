@@ -1,0 +1,53 @@
+# Canister base recipe — essential OS bind mounts.
+#
+# This recipe provides the minimal set of system paths required for any
+# Linux binary to execute inside the sandbox. It replaces the hardcoded
+# ESSENTIAL_BIND_MOUNTS list for auditability and customization.
+#
+# Composition order: base.toml is always loaded first, before default.toml,
+# auto-detected recipes, and explicit --recipe arguments.
+#
+# Override: Place a base.toml in $XDG_CONFIG_HOME/canister/recipes/ or
+# ./recipes/ to customize. The embedded copy is used as fallback.
+
+[recipe]
+name = "base"
+description = "Essential OS paths for any Linux binary"
+version = "1"
+
+[filesystem]
+# Paths bind-mounted read-only for basic execution. These provide:
+# - Shell utilities and system binaries (/bin, /sbin, /usr/bin, /usr/sbin)
+# - Shared libraries and the dynamic linker (/lib, /lib64, /usr/lib, /usr/lib64)
+# - Shared data files (/usr/share)
+# - Dynamic linker cache and configuration (/etc/ld.so.*)
+# - DNS and network resolution (/etc/resolv.conf, /etc/nsswitch.conf, /etc/hosts)
+# - TLS certificates (/etc/ssl, /etc/ca-certificates)
+# - Timezone data (/etc/localtime)
+# - Alternatives system (/etc/alternatives)
+allow = [
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/share",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/resolv.conf",
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/localtime",
+    "/etc/alternatives",
+]
+
+deny = [
+    "/etc/shadow",
+    "/etc/gshadow",
+]

@@ -1,0 +1,16 @@
+# Canister recipe for GNU Guix package manager.
+#
+# Guix uses a content-addressed store at /gnu/store, similar to Nix.
+# Binaries reference sibling store entries, so the entire store must
+# be mounted.
+#
+# Auto-detection: triggered by match_prefix
+
+[recipe]
+name = "gnu-store"
+description = "GNU Guix package manager (/gnu/store)"
+version = "1"
+match_prefix = ["/gnu/store"]
+
+[filesystem]
+allow = ["/gnu/store"]

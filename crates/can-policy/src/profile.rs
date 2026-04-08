@@ -11,6 +11,13 @@ use crate::config::{ConfigError, RecipeFile, SyscallConfig};
 /// in the source tree.
 const EMBEDDED_DEFAULT: &str = include_str!("../../../recipes/default.toml");
 
+/// The base recipe TOML, embedded at compile time.
+///
+/// This provides essential OS bind mounts (binaries, libraries, etc.)
+/// that every sandbox needs. Replaces the hardcoded ESSENTIAL_BIND_MOUNTS
+/// for auditability and customization.
+const EMBEDDED_BASE: &str = include_str!("../../../recipes/base.toml");
+
 /// A seccomp profile defines which syscalls are allowed or denied.
 ///
 /// There is one canonical baseline defined in `recipes/default.toml`.
@@ -174,6 +181,28 @@ impl SeccompProfile {
     }
 }
 
+/// Resolve the base recipe (essential OS mounts).
+///
+/// Search order (same as `default.toml`):
+/// 1. `./recipes/base.toml` (project-local)
+/// 2. `$XDG_CONFIG_HOME/canister/recipes/base.toml` (per-user)
+/// 3. `/etc/canister/recipes/base.toml` (system-wide)
+/// 4. Embedded fallback (compiled into the binary)
+///
+/// Returns the parsed `RecipeFile` for merging into the composition stack.
+pub fn resolve_base() -> Result<RecipeFile, ConfigError> {
+    for dir in baseline_search_dirs() {
+        let path = dir.join("base.toml");
+        if path.is_file() {
+            tracing::debug!(path = %path.display(), "loading external base.toml");
+            return RecipeFile::from_file(&path);
+        }
+    }
+
+    tracing::debug!("using embedded base.toml");
+    RecipeFile::from_str(EMBEDDED_BASE)
+}
+
 /// Directories searched for the default baseline, in priority order.
 ///
 /// This is also used by `can-cli` for recipe discovery.
@@ -280,5 +309,35 @@ mod tests {
         // We just verify it doesn't error.
         let resolved = SeccompProfile::resolve_baseline().unwrap();
         assert!(resolved.profile.allow_syscalls.len() > 100);
+    }
+
+    #[test]
+    fn embedded_base_parses() {
+        let base = resolve_base().unwrap();
+        assert_eq!(base.display_name("base"), "base");
+        // base.toml should have essential paths in filesystem.allow
+        assert!(
+            !base.filesystem.allow.is_empty(),
+            "base.toml should have filesystem.allow entries"
+        );
+        // Verify key paths are present
+        let paths: Vec<String> = base
+            .filesystem
+            .allow
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            paths.contains(&"/bin".to_string()),
+            "base should include /bin"
+        );
+        assert!(
+            paths.contains(&"/usr/lib".to_string()),
+            "base should include /usr/lib"
+        );
+        assert!(
+            paths.contains(&"/etc/resolv.conf".to_string()),
+            "base should include /etc/resolv.conf"
+        );
     }
 }

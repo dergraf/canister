@@ -1,0 +1,15 @@
+# Canister recipe for Snap packages.
+#
+# Snap installs applications under /snap with the runtime under
+# /snap/core*. Binaries are launched via /snap/bin wrappers.
+#
+# Auto-detection: triggered by match_prefix
+
+[recipe]
+name = "snap"
+description = "Snap package manager (/snap)"
+version = "1"
+match_prefix = ["/snap"]
+
+[filesystem]
+allow = ["/snap"]

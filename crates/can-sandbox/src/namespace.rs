@@ -295,26 +295,14 @@ fn child_entry(
 
     // From here on, we are PID 1 in the new PID namespace.
 
-    // Detect the package-manager prefix for the command binary.
-    // Instead of chasing the full transitive dependency graph, we mount
-    // the entire prefix tree (e.g. /nix/store, /opt/homebrew) so all
-    // sibling packages are available at runtime. Security is enforced at
-    // the exec layer, not the filesystem layer.
-    let command_prefix = crate::detect_command_prefix(command_path);
-    if let Some(ref prefix) = command_prefix {
-        tracing::warn!(
-            prefix = %prefix.display(),
-            command = %command_path.display(),
-            "auto-mounting package prefix for command \
-             (add to [filesystem] allow to silence this warning)"
-        );
-    }
-
     // Set up isolated filesystem with bind mounts and pivot_root.
+    // All necessary paths (essential OS mounts, auto-detected package manager
+    // prefixes, and user-specified paths) are pre-merged into config.filesystem
+    // via recipe composition in the CLI layer.
     // In strict mode, failures are fatal. Otherwise falls back to degraded mode
     // if AppArmor blocks mount operations.
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
-    let fs_isolated = overlay::try_setup_filesystem(&config.filesystem, command_prefix.as_deref())?;
+    let fs_isolated = overlay::try_setup_filesystem(&config.filesystem)?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
     } else if strict {

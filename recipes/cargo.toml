@@ -1,0 +1,16 @@
+# Canister recipe for Cargo (Rust) toolchain.
+#
+# Cargo installs binaries to $HOME/.cargo/bin and stores the toolchain
+# (rustc, rustup) under $HOME/.rustup. Both are needed for Rust
+# compilation and tool execution.
+#
+# Auto-detection: triggered by match_prefix (uses env var expansion)
+
+[recipe]
+name = "cargo"
+description = "Rust/Cargo toolchain ($HOME/.cargo, $HOME/.rustup)"
+version = "1"
+match_prefix = ["$HOME/.cargo", "$HOME/.rustup"]
+
+[filesystem]
+allow = ["$HOME/.cargo", "$HOME/.rustup"]

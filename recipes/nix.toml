@@ -1,0 +1,19 @@
+# Canister recipe for Nix package manager.
+#
+# Nix stores all packages in /nix/store with content-addressed paths.
+# Binaries freely reference sibling store entries, so the entire store
+# must be mounted. This recipe is auto-detected when the resolved
+# command binary lives under /nix/store.
+#
+# Auto-detection: triggered by match_prefix
+
+[recipe]
+name = "nix"
+description = "Nix package manager (/nix/store)"
+version = "1"
+match_prefix = ["/nix/store"]
+
+[filesystem]
+# Mount the entire Nix store — binaries reference sibling entries
+# via rpaths and wrapper scripts.
+allow = ["/nix/store"]

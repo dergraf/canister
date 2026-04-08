@@ -7,9 +7,9 @@ use can_policy::{RecipeFile, SeccompProfile};
 
 /// Discover all `.toml` recipe files across search directories.
 ///
-/// Returns `(path, RecipeFile)` pairs. `default.toml` is excluded — it
-/// is the baseline, not a regular recipe. Files that fail to parse are
-/// skipped with a warning (tracing).
+/// Returns `(path, RecipeFile)` pairs. `default.toml` and `base.toml` are
+/// excluded — they are infrastructure recipes (always loaded), not regular
+/// user-facing recipes. Files that fail to parse are skipped with a warning.
 fn discover() -> Vec<(PathBuf, RecipeFile)> {
     let mut recipes = Vec::new();
 
@@ -24,7 +24,7 @@ fn discover() -> Vec<(PathBuf, RecipeFile)> {
             .map(|e| e.path())
             .filter(|p| {
                 p.extension().is_some_and(|ext| ext == "toml")
-                    && p.file_stem().is_some_and(|s| s != "default")
+                    && p.file_stem().is_some_and(|s| s != "default" && s != "base")
             })
             .collect();
         paths.sort();

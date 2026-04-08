@@ -1,0 +1,15 @@
+# Canister recipe for Flatpak applications.
+#
+# Flatpak installs applications under /var/lib/flatpak (system-wide)
+# and $HOME/.local/share/flatpak (per-user).
+#
+# Auto-detection: triggered by match_prefix
+
+[recipe]
+name = "flatpak"
+description = "Flatpak applications"
+version = "1"
+match_prefix = ["/var/lib/flatpak", "$HOME/.local/share/flatpak"]
+
+[filesystem]
+allow = ["/var/lib/flatpak", "$HOME/.local/share/flatpak"]
