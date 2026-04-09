@@ -82,27 +82,14 @@ Canister can run on this system.
 Download the latest release from [GitHub Releases](https://github.com/dergraf/canister/releases):
 
 ```bash
-# x86_64 (glibc)
 curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv can /usr/local/bin/
-
-# x86_64 (static, musl -- no glibc dependency)
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-unknown-linux-musl.tar.gz | tar xz
-sudo mv can /usr/local/bin/
-
-# aarch64 (glibc)
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-aarch64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv can /usr/local/bin/
-
-# aarch64 (static, musl)
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-aarch64-unknown-linux-musl.tar.gz | tar xz
 sudo mv can /usr/local/bin/
 ```
 
 Verify the download:
 
 ```bash
-sha256sum -c canister-x86_64-unknown-linux-musl.tar.gz.sha256
+curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-unknown-linux-gnu.tar.gz.sha256 | sha256sum -c
 ```
 
 ### Build from source
