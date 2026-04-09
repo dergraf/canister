@@ -108,7 +108,7 @@ impl SeccompProfile {
 
     /// Build a baseline from the embedded default.toml.
     fn from_embedded() -> Result<ResolvedBaseline, ConfigError> {
-        let recipe = RecipeFile::from_str(EMBEDDED_DEFAULT)?;
+        let recipe = RecipeFile::parse(EMBEDDED_DEFAULT)?;
         let config = recipe.into_sandbox_config()?;
         let profile = Self::from_baseline_config(&config.syscalls)?;
         Ok(ResolvedBaseline {
@@ -200,7 +200,7 @@ pub fn resolve_base() -> Result<RecipeFile, ConfigError> {
     }
 
     tracing::debug!("using embedded base.toml");
-    RecipeFile::from_str(EMBEDDED_BASE)
+    RecipeFile::parse(EMBEDDED_BASE)
 }
 
 /// Directories searched for the default baseline, in priority order.

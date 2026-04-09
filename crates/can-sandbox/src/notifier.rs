@@ -511,8 +511,7 @@ pub fn send_fd(socket: &OwnedFd, fd_to_send: &OwnedFd) -> Result<(), NotifierErr
     // Fill in the cmsg header.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
-        return Err(NotifierError::SendFd(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(NotifierError::SendFd(std::io::Error::other(
             "CMSG_FIRSTHDR returned null",
         )));
     }
@@ -564,16 +563,14 @@ pub fn recv_fd(socket: &OwnedFd) -> Result<OwnedFd, NotifierError> {
     // Extract the fd from the control message.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
-        return Err(NotifierError::RecvFd(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(NotifierError::RecvFd(std::io::Error::other(
             "no control message received",
         )));
     }
 
     unsafe {
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return Err(NotifierError::RecvFd(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(NotifierError::RecvFd(std::io::Error::other(
                 "unexpected cmsg type",
             )));
         }
@@ -610,9 +607,7 @@ pub fn start_supervisor(
         .spawn(move || {
             supervisor_loop(raw_fd, &policy, &shutdown_clone);
         })
-        .map_err(|e| {
-            NotifierError::SeccompSyscall(std::io::Error::new(std::io::ErrorKind::Other, e))
-        })?;
+        .map_err(|e| NotifierError::SeccompSyscall(std::io::Error::other(e)))?;
 
     Ok(SupervisorHandle {
         shutdown,
@@ -833,7 +828,7 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
     let addr_len = notif.data.args[2] as usize;
 
     // Sanity check addr_len.
-    if addr_len < 2 || addr_len > 128 {
+    if !(2..=128).contains(&addr_len) {
         tracing::warn!(pid, addr_len, "connect: suspicious addr_len, denying");
         return Verdict::Deny(libc::EPERM as u32);
     }
@@ -1227,9 +1222,8 @@ pub fn policy_from_config(
 
     for p in &config.process.allow_execve {
         let s = p.as_os_str().to_string_lossy();
-        if s.ends_with("/*") {
+        if let Some(prefix_str) = s.strip_suffix("/*") {
             // Strip trailing "/*" to get the directory prefix.
-            let prefix_str = &s[..s.len() - 2];
             let prefix_path = PathBuf::from(prefix_str);
             // Canonicalize the prefix directory if it exists.
             let canonical = prefix_path
@@ -1556,8 +1550,10 @@ mod tests {
 
     #[test]
     fn evaluate_socket_respects_allow_af_unix_false() {
-        let mut policy = NotifierPolicy::default();
-        policy.allow_af_unix = false;
+        let policy = NotifierPolicy {
+            allow_af_unix: false,
+            ..Default::default()
+        };
         let args = [AF_UNIX, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
         match evaluate_socket(&args, 1234, &policy) {
             Verdict::Deny(_) => {}
@@ -1567,8 +1563,10 @@ mod tests {
 
     #[test]
     fn evaluate_socket_respects_allow_af_inet_false() {
-        let mut policy = NotifierPolicy::default();
-        policy.allow_af_inet = false;
+        let policy = NotifierPolicy {
+            allow_af_inet: false,
+            ..Default::default()
+        };
         let args = [AF_INET, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
         match evaluate_socket(&args, 1234, &policy) {
             Verdict::Deny(_) => {}

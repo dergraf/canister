@@ -114,9 +114,8 @@ pub fn validate_execve(command_path: &Path, config: &ProcessConfig) -> Result<()
     for allowed in &config.allow_execve {
         let allowed_str = allowed.as_os_str().to_string_lossy();
 
-        if allowed_str.ends_with("/*") {
+        if let Some(prefix) = allowed_str.strip_suffix("/*") {
             // Prefix rule: strip the trailing /* and check starts_with.
-            let prefix = &allowed_str[..allowed_str.len() - 2];
             let canonical_str = canonical.to_string_lossy();
             if canonical_str.starts_with(prefix)
                 && canonical_str.as_bytes().get(prefix.len()) == Some(&b'/')

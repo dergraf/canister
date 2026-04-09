@@ -64,7 +64,7 @@ pub struct FilesystemConfig {
     pub deny: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Whitelisted domain names (resolved via internal DNS proxy).
@@ -82,16 +82,6 @@ pub struct NetworkConfig {
     /// the earlier value. `into_sandbox_config()` resolves `None` to `true`.
     #[serde(default)]
     pub deny_all: Option<bool>,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            allow_domains: Vec::new(),
-            allow_ips: Vec::new(),
-            deny_all: None,
-        }
-    }
 }
 
 impl NetworkConfig {
@@ -368,11 +358,11 @@ impl RecipeFile {
     /// Load a recipe from a TOML file.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(ConfigError::ReadFile)?;
-        Self::from_str(&content)
+        Self::parse(&content)
     }
 
     /// Parse a recipe from a TOML string.
-    pub fn from_str(content: &str) -> Result<Self, ConfigError> {
+    pub fn parse(content: &str) -> Result<Self, ConfigError> {
         let recipe: Self = toml::from_str(content).map_err(ConfigError::Parse)?;
         recipe.syscalls.validate()?;
         Ok(recipe)
@@ -790,7 +780,7 @@ name = "default"
 allow = ["read", "write", "exit_group"]
 deny = ["reboot", "mount"]
 "#;
-        let recipe = RecipeFile::from_str(toml).unwrap();
+        let recipe = RecipeFile::parse(toml).unwrap();
         let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.syscalls.allow, vec!["read", "write", "exit_group"]);
         assert_eq!(config.syscalls.deny, vec!["reboot", "mount"]);
@@ -807,7 +797,7 @@ deny = ["reboot", "mount"]
 allow = ["read", "write"]
 allow_extra = ["ptrace"]
 "#;
-        let result = RecipeFile::from_str(toml);
+        let result = RecipeFile::parse(toml);
         assert!(result.is_err(), "mixing allow and allow_extra should fail");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -823,7 +813,7 @@ allow_extra = ["ptrace"]
 deny = ["reboot"]
 deny_extra = ["ptrace"]
 "#;
-        let result = RecipeFile::from_str(toml);
+        let result = RecipeFile::parse(toml);
         assert!(result.is_err(), "mixing deny and deny_extra should fail");
     }
 
@@ -834,7 +824,7 @@ deny_extra = ["ptrace"]
 allow = ["read", "write"]
 deny_extra = ["ptrace"]
 "#;
-        let result = RecipeFile::from_str(toml);
+        let result = RecipeFile::parse(toml);
         assert!(result.is_err(), "mixing allow and deny_extra should fail");
     }
 
@@ -850,7 +840,7 @@ deny_extra = ["ptrace"]
     fn parse_default_toml_as_baseline() {
         // Verify the actual default.toml can be parsed as a baseline.
         let content = include_str!("../../../recipes/default.toml");
-        let recipe = RecipeFile::from_str(content).unwrap();
+        let recipe = RecipeFile::parse(content).unwrap();
         assert_eq!(recipe.display_name("fallback"), "default");
         let config = recipe.into_sandbox_config().unwrap();
         assert!(config.syscalls.is_baseline());
@@ -871,7 +861,7 @@ deny_extra = ["ptrace"]
 
     /// Helper to create a minimal recipe from TOML.
     fn parse_recipe(toml: &str) -> RecipeFile {
-        RecipeFile::from_str(toml).unwrap()
+        RecipeFile::parse(toml).unwrap()
     }
 
     #[test]

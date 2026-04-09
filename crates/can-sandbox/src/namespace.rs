@@ -203,48 +203,6 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                                 tracing::warn!(error = %e, "failed to start seccomp supervisor");
                             }
                         }
-
-                        #[cfg(test)]
-                        mod tests {
-                            use super::*;
-                            use can_policy::SyscallConfig;
-
-                            #[test]
-                            fn resolve_notifier_disabled_in_monitor_mode() {
-                                let config = SyscallConfig::default();
-                                assert!(!resolve_notifier_enabled(&config, true));
-                            }
-
-                            #[test]
-                            fn resolve_notifier_explicit_true() {
-                                let mut config = SyscallConfig::default();
-                                config.notifier = Some(true);
-                                assert!(resolve_notifier_enabled(&config, false));
-                            }
-
-                            #[test]
-                            fn resolve_notifier_explicit_false() {
-                                let mut config = SyscallConfig::default();
-                                config.notifier = Some(false);
-                                assert!(!resolve_notifier_enabled(&config, false));
-                            }
-
-                            #[test]
-                            fn resolve_notifier_explicit_true_still_disabled_in_monitor() {
-                                let mut config = SyscallConfig::default();
-                                config.notifier = Some(true);
-                                // Monitor mode takes priority over explicit config.
-                                assert!(!resolve_notifier_enabled(&config, true));
-                            }
-
-                            #[test]
-                            fn resolve_notifier_auto_detect_returns_bool() {
-                                // Auto-detect: None means check kernel version.
-                                // We can't predict the result, but it shouldn't panic.
-                                let config = SyscallConfig::default();
-                                let _ = resolve_notifier_enabled(&config, false);
-                            }
-                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to receive notifier fd from child");
