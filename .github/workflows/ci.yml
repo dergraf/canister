@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  MISE_YES: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Setup toolchain
+        run: mise install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+
+      - name: Format
+        run: mise run fmt
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Check
+        run: mise run check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Setup toolchain
+        run: mise install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+
+      - name: Unit tests
+        run: mise run test-std
+
+      - name: Install slirp4netns
+        run: sudo apt-get update && sudo apt-get install -y slirp4netns
+
+      - name: Integration tests
+        run: mise run integration-test
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        run: |
+          rustup toolchain install 1.85 --profile minimal
+          rustup default 1.85
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: msrv-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: msrv-${{ runner.os }}-
+
+      - name: Check MSRV
+        run: cargo check --workspace

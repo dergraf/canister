@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_YES: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: x86_64-unknown-linux-musl
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Setup toolchain
+        run: |
+          mise install
+          rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --package can-cli
+          else
+            cargo build --release --target ${{ matrix.target }} --package can-cli
+          fi
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../canister-${{ matrix.target }}.tar.gz can
+          cd ../../..
+          sha256sum canister-${{ matrix.target }}.tar.gz > canister-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canister-${{ matrix.target }}
+          path: |
+            canister-${{ matrix.target }}.tar.gz
+            canister-${{ matrix.target }}.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" artifacts/canister-* --generate-notes
