@@ -8,8 +8,13 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 
 ## Table of Contents
 
+- [Recipe Composition](#recipe-composition)
+  - [Merge Semantics](#merge-semantics)
+  - [Name-Based Lookup](#name-based-lookup)
+  - [Auto-Detection via match_prefix](#auto-detection-via-match_prefix)
+  - [Environment Variable Expansion](#environment-variable-expansion)
+- [recipe (metadata)](#recipe-metadata)
 - [filesystem](#filesystem)
-  - [Auto-Mounting](#auto-mounting)
 - [network](#network)
 - [process](#process)
 - [resources](#resources)
@@ -17,6 +22,118 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 - [Strict Mode](#strict-mode)
 - [Monitor Mode](#monitor-mode)
 - [Examples](#examples)
+
+---
+
+## Recipe Composition
+
+Canister supports composing multiple recipes via repeated `-r` / `--recipe`
+flags. Recipes are merged left-to-right into a single resolved config.
+
+**Composition order:** `base.toml` → auto-detected recipes → explicit `--recipe` args.
+
+`base.toml` provides essential OS bind mounts and is always loaded first
+(embedded in the binary, overridable on disk). Auto-detected recipes are
+matched by `match_prefix` before explicit recipes are applied. The
+`default.toml` seccomp baseline is resolved separately by the seccomp module
+and is NOT part of this composition chain.
+
+```bash
+# base.toml (always) → nix.toml (auto-detected) → elixir.toml (explicit)
+can run -r elixir -- mix test    # mix resolves to /nix/store/..., nix.toml auto-detected
+
+# Explicit composition
+can run -r nix -r elixir -- mix test
+can run -r cargo -r generic-strict -- cargo build
+```
+
+### Merge Semantics
+
+When multiple recipes are merged, each field type follows a specific strategy:
+
+| Field type | Strategy | Example |
+|---|---|---|
+| `Vec` fields (paths, domains, syscalls, env vars) | **Union** — deduplicated, order preserved | Two recipes allowing `/a` and `/b` → `["/a", "/b"]` |
+| `strict` (`Option<bool>`) | **OR** — any `Some(true)` wins, can never be loosened | Recipe A: `strict = true`, Recipe B: omitted → `true` |
+| `deny_all` (`Option<bool>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `deny_all = true`, Recipe B: `deny_all = false` → `false` |
+| `seccomp_mode` (`Option<SeccompMode>`) | **Last-Some-wins** | Same as `deny_all` |
+| Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-Some-wins** | Recipe A: `max_pids = 64`, Recipe B: `max_pids = 128` → `128` |
+| `RecipeMeta` | **Overlay** — later recipe's metadata wins if present | — |
+
+The "last-Some-wins" strategy means `None` (field not specified) preserves
+the value from an earlier recipe, while `Some(value)` overwrites it.
+
+### Name-Based Lookup
+
+The `-r` argument is resolved as follows:
+
+1. If the argument contains `/` or ends with `.toml`, treat as a **file path**.
+2. Otherwise, search for `<name>.toml` in the recipe search path:
+   - `./recipes/`
+   - `$XDG_CONFIG_HOME/canister/recipes/`
+   - `/etc/canister/recipes/`
+3. First match wins (project-local takes precedence over user-global).
+
+```bash
+can run -r elixir -- mix test              # name lookup → elixir.toml
+can run -r recipes/custom.toml -- mix test # file path
+can run -r ./my-policy.toml -- echo hi     # file path (contains /)
+```
+
+### Auto-Detection via match_prefix
+
+Recipes can declare `match_prefix` patterns in their `[recipe]` metadata.
+During CLI setup (before forking), the command binary path is resolved and
+canonicalized. Each discovered recipe's `match_prefix` is checked against
+the resolved path. Matching recipes are automatically merged into the chain
+between `base.toml` and explicit `-r` args.
+
+This replaces the previous hardcoded `detect_command_prefix()` logic.
+Adding support for a new package manager is "write a `.toml` file" rather
+than "modify Rust code".
+
+### Environment Variable Expansion
+
+Recipe paths support environment variable expansion:
+
+| Syntax | Expansion |
+|--------|-----------|
+| `$HOME` | Value of `$HOME` |
+| `$USER` | Value of `$USER` |
+| `${XDG_CONFIG_HOME}` | Value of `$XDG_CONFIG_HOME` |
+| `$$` | Literal `$` |
+
+Expansion applies to `[filesystem].allow`, `[filesystem].deny`,
+`[process].allow_execve`, and `[recipe].match_prefix`. It is performed
+during config resolution (after merge, before the sandbox uses the paths).
+
+```toml
+[filesystem]
+allow = ["$HOME/.cargo", "$HOME/.rustup", "$HOME/project"]
+
+[recipe]
+match_prefix = ["$HOME/.cargo"]
+```
+
+---
+
+## `[recipe]` (metadata)
+
+Optional metadata section for recipe files. Not used for policy enforcement
+but controls recipe discovery and composition behavior.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `string` (optional) | — | Human-readable recipe name |
+| `description` | `string` (optional) | — | Short description shown by `can recipes` |
+| `match_prefix` | `string[]` | `[]` | Path prefixes for auto-detection (env vars expanded) |
+
+```toml
+[recipe]
+name = "nix"
+description = "Nix package manager (/nix/store)"
+match_prefix = ["/nix/store"]
+```
 
 ---
 
@@ -37,13 +154,14 @@ paths and essential system paths are bind-mounted read-only.
 
 - Deny rules take precedence over allow rules.
 - Paths are matched by prefix: allowing `/usr/lib` also allows `/usr/lib/python3`.
-- Essential paths (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`,
-  `/usr/lib`) are always mounted regardless of config.
-- **Auto-mounting:** When the command binary lives outside standard FHS paths
-  (e.g., installed via Nix, Homebrew, Guix, Snap, Cargo, or similar), Canister
-  automatically detects the package-manager prefix and bind-mounts it read-only.
-  A warning is logged suggesting you add the prefix to `allow` to silence it.
-  See [Auto-Mounting](#auto-mounting) below.
+- Essential paths are defined in `recipes/base.toml` (embedded in the binary,
+  overridable on disk) and always bind-mounted: `/bin`, `/sbin`, `/usr/bin`,
+  `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, `/etc`.
+- **Auto-detection:** When the command binary lives outside standard FHS paths
+  (e.g., installed via Nix, Homebrew, Cargo, etc.), Canister auto-detects the
+  appropriate package manager recipe via `match_prefix` and merges it into the
+  recipe chain, bringing the necessary mount paths automatically. See
+  [Auto-Detection via match_prefix](#auto-detection-via-match_prefix).
 - When filesystem isolation is degraded (AppArmor blocks mounts), these
   settings have no effect -- the process sees the full host filesystem.
 
@@ -53,49 +171,41 @@ allow = ["/usr/lib", "/usr/bin", "/tmp/workspace", "/home/user/data"]
 deny  = ["/etc/shadow", "/etc/passwd", "/root", "/home/user/.ssh"]
 ```
 
-### Auto-Mounting
+### Package Manager Support
 
 When the command binary is installed outside standard system paths, Canister
-automatically detects and mounts the package-manager prefix so the command
-can execute inside the sandbox. This works generically across package managers:
+uses recipe-based auto-detection to ensure the binary is visible inside the
+sandbox. Each package manager has a recipe with `match_prefix` patterns:
 
-| Package manager | Example command path                     | Auto-mounted prefix  |
-|-----------------|------------------------------------------|----------------------|
-| Nix / NixOS     | `/nix/store/<hash>-elixir/bin/iex`       | `/nix/store`         |
-| GNU Guix        | `/gnu/store/<hash>-guile/bin/guile`      | `/gnu/store`         |
-| Homebrew        | `/opt/homebrew/bin/python3`              | `/opt/homebrew`      |
-| Snap            | `/snap/core22/current/usr/bin/hello`     | `/snap`              |
-| Flatpak         | `/var/lib/flatpak/app/.../bin/foo`       | `/var/lib/flatpak`   |
-| Cargo           | `/home/user/.cargo/bin/rg`              | `/home/user/.cargo`  |
-| pipx / npm      | `/home/user/.local/bin/tool`            | `/home/user/.local`  |
+| Recipe | Auto-detects when binary is under | Mounts |
+|--------|----------------------------------|--------|
+| `nix.toml` | `/nix/store` | `/nix/store` (read-only) |
+| `homebrew.toml` | `/opt/homebrew`, `/home/linuxbrew/.linuxbrew` | The matching prefix |
+| `cargo.toml` | `$HOME/.cargo`, `$HOME/.rustup` | `$HOME/.cargo`, `$HOME/.rustup` |
+| `snap.toml` | `/snap` | `/snap` |
+| `flatpak.toml` | `/var/lib/flatpak`, `$HOME/.local/share/flatpak` | The matching prefix |
+| `gnu-store.toml` | `/gnu/store` | `/gnu/store` |
 
 **How it works:**
 
 1. The command path is **canonicalized** (all symlinks resolved) at startup.
-2. The package-manager root is detected from the canonical path.
-3. The entire prefix tree is bind-mounted read-only into the sandbox.
-4. A warning is logged:
-   ```
-   WARN auto-mounting package prefix for command (add to [filesystem] allow to silence this warning)
-        prefix=/nix/store command=/nix/store/abc-elixir/bin/iex
-   ```
+2. Each discovered recipe's `match_prefix` is checked against the resolved path.
+3. Matching recipes are merged into the composition chain, bringing their
+   `[filesystem].allow` paths, `[process].allow_execve` entries, and any
+   other policy fields.
+4. For content-addressed stores like `/nix/store`, the entire tree is mounted.
+   Binaries reference sibling store entries freely, making individual-entry
+   mounting impractical.
 
-**To silence the warning**, add the detected prefix to `[filesystem] allow`:
-
-```toml
-[filesystem]
-allow = ["/nix/store"]   # or /opt/homebrew, /home/user/.cargo, etc.
-```
-
-**Security note:** Auto-mounting makes the prefix *visible* inside the
+**Security note:** Auto-detection makes the prefix *visible* inside the
 sandbox but does not grant execution permission. The `[process] allow_execve`
-whitelist independently controls what binaries can be executed.
+whitelist independently controls what binaries can be executed. Package
+manager recipes include `allow_execve` prefix rules (e.g., `/nix/store/*`)
+to authorize execution within the mounted tree.
 
-**Interaction with deny:**
-
-If the auto-detected prefix is in `[filesystem] deny`, it is **not** mounted
-and the command will likely fail with ENOENT. This is intentional — deny
-rules always take precedence.
+**Adding a new package manager:** Create a new `.toml` recipe with
+appropriate `match_prefix`, `[filesystem].allow`, and
+`[process].allow_execve` entries. No Rust code changes needed.
 
 ---
 
@@ -201,6 +311,13 @@ user).
 When non-empty, the resolved command path must match one of the listed paths.
 If the command is not whitelisted, execution is rejected before forking.
 
+**Prefix rules:** Entries ending in `/*` match any binary under that
+directory tree. For example, `/nix/store/*` allows any binary whose resolved
+path starts with `/nix/store/`. The match requires a `/` boundary — 
+`/nix/store-extra/foo` does NOT match `/nix/store/*`. This is essential for
+content-addressed stores like Nix where binary paths contain unpredictable
+hashes.
+
 **Limitation:** `allow_execve` only validates the *initial* command. Child
 processes inside the sandbox can exec arbitrary binaries. Full ongoing
 enforcement requires `SECCOMP_RET_USER_NOTIF` (planned for a future phase).
@@ -208,7 +325,7 @@ enforcement requires `SECCOMP_RET_USER_NOTIF` (planned for a future phase).
 ```toml
 [process]
 max_pids = 64
-allow_execve = ["/usr/bin/python3", "/usr/bin/pip"]
+allow_execve = ["/usr/bin/python3", "/usr/bin/pip", "/nix/store/*"]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM", "VIRTUAL_ENV"]
 ```
 
@@ -252,7 +369,7 @@ cpu_percent = 100
 Customizes the seccomp BPF baseline and enforcement mode.
 
 Canister ships a single default seccomp baseline defined in
-`recipes/default.toml` (~130 allowed syscalls, ~16 always-denied). The
+`recipes/default.toml` (~170 allowed syscalls, ~16 always-denied). The
 baseline is embedded in the binary at compile time and can be overridden by
 placing a `default.toml` in the recipe search path (`./recipes/`,
 `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
@@ -505,8 +622,13 @@ seccomp_mode = "allow-list"
 ### Elixir/Erlang (mix tasks, iex, Phoenix)
 
 Run mix tasks, iex shells, or Phoenix servers with hex.pm access.
+Use with `-r nix` or `-r homebrew` if Elixir is installed via a package manager.
 
 ```toml
+[recipe]
+name = "elixir"
+description = "Elixir/Erlang (BEAM VM) — mix, iex, Phoenix"
+
 [filesystem]
 allow = [
     "/usr/lib",
@@ -535,10 +657,15 @@ env_passthrough = [
 allow_extra = ["ptrace"]   # BEAM tracing tools (:observer, :dbg, recon)
 ```
 
-Usage:
+Usage with composition:
 
 ```bash
-can run --recipe elixir.toml -- mix test
-can run --recipe elixir.toml -- iex -S mix
-can run --recipe elixir.toml -- mix phx.server
+# Nix-installed Elixir: nix.toml auto-detected, elixir.toml explicit
+can run -r elixir -- mix test
+
+# Explicit composition
+can run -r nix -r elixir -- mix test
+
+# Strict CI
+can run --strict -r elixir -- mix test
 ```

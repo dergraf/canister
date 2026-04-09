@@ -63,8 +63,8 @@ of the binary.
 
 The baseline provides:
 
-- **~130 allowed syscalls** — the common syscalls needed by most programs
-  (read, write, open, mmap, clone, futex, etc.)
+- **~170 allowed syscalls** — the common syscalls needed by most programs
+  (read, write, open, mmap, clone, futex, getpgrp, etc.)
 - **~16 always-denied syscalls** — dangerous operations that no sandboxed
   process should ever need (reboot, kexec_load, mount, etc.)
 
@@ -248,7 +248,7 @@ Discovered recipes:
                        +ptrace                        recipes/elixir.toml
   ...
 
-Default baseline: ~130 allowed, ~16 denied syscalls
+Default baseline: ~170 allowed, ~16 denied syscalls
   Customize per-recipe with [syscalls] allow_extra / deny_extra
 ```
 

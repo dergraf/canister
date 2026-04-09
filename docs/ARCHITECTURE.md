@@ -51,16 +51,20 @@ of a sandboxed process, and the security properties of each isolation layer.
 
 ```
 canister/
-├── can-cli        CLI binary. Argument parsing (clap), dispatches to
-│                  can-sandbox. No business logic.
+├── can-cli        CLI binary. Argument parsing (clap), recipe
+│                  resolution (name-based lookup, auto-detection
+│                  via match_prefix), composition chain assembly,
+│                  can init / can update lifecycle commands.
 │
 ├── can-sandbox    Core runtime. Orchestrates the fork/unshare/exec
 │                  sequence. Contains the namespace, overlay, and
 │                  seccomp modules.
 │
-├── can-policy     Policy engine. TOML config parsing, whitelist
-│                  enforcement (path, domain, IP/CIDR), seccomp
-│                  profile definitions. No Linux-specific code.
+├── can-policy     Policy engine. TOML config parsing, RecipeFile
+│                  merge logic, environment variable expansion
+│                  ($HOME, $USER, etc.), whitelist enforcement
+│                  (path, domain, IP/CIDR), seccomp profile
+│                  definitions. No Linux-specific code.
 │
 ├── can-net        Network isolation. Network namespace setup,
 │                  loopback interface, slirp4netns integration,
@@ -78,14 +82,19 @@ Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 
 ## Execution Flow
 
-The complete lifecycle of `can run --recipe example.toml -- python3 script.py`:
+The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. CLI SETUP                                                        │
-│    Parse args, load TOML config, resolve + canonicalize command     │
-│    path (following all symlinks), validate against allow_execve,    │
-│    determine network mode from config                               │
+│    a. Parse args, resolve + canonicalize command path               │
+│    b. Load base.toml (embedded, overridable)                        │
+│    c. Auto-detect recipes: match resolved binary path against       │
+│       match_prefix in all discovered recipe files                   │
+│    d. Load explicit --recipe args (name-based lookup or file path)  │
+│    e. Merge recipe chain: base → auto-detected → explicit (L-to-R) │
+│    f. Expand env vars ($HOME, $USER, etc.) in merged config         │
+│    g. Validate allow_execve, determine network mode                 │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
@@ -124,19 +133,17 @@ The complete lifecycle of `can run --recipe example.toml -- python3 script.py`:
     │             │                        │ 6. PID NS   │
     │             │                        │    Inner    │
     │             │                        │    fork()   │
+    │             │                        │    setsid() │
     │             │                        │    (PID 1)  │
-    │             │                        │             │
-    │             │                        │ 6b. PREFIX  │
-    │             │                        │    Detect   │
-    │             │                        │    pkg mgr  │
-    │             │                        │    prefix   │
     │             │                        │             │
     │             │                        │ 7. OVERLAY  │
     │             │                        │    tmpfs    │
     │             │                        │    root,    │
     │             │                        │    bind     │
     │             │                        │    mounts   │
-    │             │                        │    +prefix, │
+    │             │                        │    (from    │
+    │             │                        │    merged   │
+    │             │                        │    config)  │
     │             │                        │    pivot_   │
     │             │                        │    root     │
     │             │                        │             │
@@ -184,6 +191,9 @@ The complete lifecycle of `can run --recipe example.toml -- python3 script.py`:
 
 **Critical ordering constraints:**
 
+- Recipe composition (load, merge, env expansion) happens entirely in the
+  CLI layer **before** forking. The child receives an already-resolved
+  `SandboxConfig`.
 - `unshare()` must be a single atomic call. Splitting `CLONE_NEWUSER` and
   `CLONE_NEWNS` into separate calls fails under AppArmor.
 - UID/GID maps must be written from the **parent** process. The child cannot
@@ -192,8 +202,10 @@ The complete lifecycle of `can run --recipe example.toml -- python3 script.py`:
   before the child tries to use the network.
 - The inner fork for PID namespace must happen before filesystem setup so
   `/proc` mount reflects the new PID namespace.
-- Command prefix detection must happen after PID namespace entry but before
-  overlay setup, so the prefix can be bind-mounted into the new root.
+- `setsid()` must be called after the inner PID namespace fork. PID 1
+  inherits an invisible session/process-group from the parent namespace;
+  without `setsid()`, bash's job control initialization fails (`getpgrp`
+  returns the parent-namespace group).
 - /proc hardening must happen after overlay + /proc mount but before seccomp.
 - `RLIMIT_NPROC` must be set before seccomp (which blocks `prctl`).
 - Cgroups v2 setup must happen after RLIMIT but before seccomp, because
@@ -236,9 +248,8 @@ The child gets its own mount table. The setup sequence:
 1.  mount("", "/", MS_SLAVE | MS_REC)     # stop propagation to host
 2.  mount("tmpfs", new_root)               # empty tmpfs as new root
 3.  mkdir skeleton dirs                     # /bin, /lib, /usr, /proc, /dev, /tmp, ...
-4.  bind-mount essentials (read-only)       # /bin, /sbin, /usr/bin, /usr/sbin, /lib, ...
-5.  bind-mount whitelisted paths (RO)       # from config [filesystem].allow
-5b. bind-mount command prefix (RO)          # auto-detected package-manager root (see below)
+4.  bind-mount essentials (read-only)       # from base.toml: /bin, /sbin, /usr/bin, ...
+5.  bind-mount whitelisted paths (RO)       # from merged [filesystem].allow (all recipes)
 6.  mount /tmp (read-write)                 # ephemeral writable space
 7.  mount /proc                             # needed by many programs
 8.  set up /dev                             # null, zero, urandom, tty, fd symlinks
@@ -246,53 +257,51 @@ The child gets its own mount table. The setup sequence:
 10. umount(old_root, MNT_DETACH)           # detach host filesystem entirely
 ```
 
-**Command prefix auto-detection (step 5b):**
+**Recipe-based mount resolution:**
 
-When the command binary lives outside standard FHS paths (e.g., under
-`/nix/store`, `/opt/homebrew`, `/home/user/.cargo`), the sandbox would fail
-with ENOENT after `pivot_root` since the binary's path doesn't exist in the
-new root.
+The paths visible inside the sandbox come from the merged recipe chain
+(`base.toml` → auto-detected → explicit). There is no hardcoded prefix
+detection at runtime. Instead:
 
-Canister handles this generically:
+1. **`base.toml`** defines essential OS bind mounts (`/bin`, `/sbin`,
+   `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/usr/lib`, `/etc`). It is
+   embedded in the binary via `include_str!()` and overridable on disk,
+   following the same pattern as `default.toml`.
 
-1. **Canonicalize** the command path at startup (`std::fs::canonicalize`),
-   resolving all symlinks. This is critical for package managers like Nix
-   that use multi-hop symlink chains (e.g., `~/.nix-profile/bin/iex` →
-   `/nix/store/<hash>-elixir/bin/iex`).
+2. **Auto-detected recipes** provide package-manager mounts. Each recipe
+   declares `match_prefix` patterns in its `[recipe]` metadata. During CLI
+   setup (before fork), the resolved binary path is matched against all
+   discovered recipes. Matching recipes are merged into the chain, bringing
+   their `[filesystem].allow` paths with them:
 
-2. **Detect** the package-manager prefix from the canonical path:
+   | Recipe | `match_prefix` | Adds to `allow` |
+   |--------|---------------|-----------------|
+   | `nix.toml` | `/nix/store` | `/nix/store` |
+   | `homebrew.toml` | `/opt/homebrew`, `/home/linuxbrew/.linuxbrew` | `/opt/homebrew` (or linuxbrew) |
+   | `cargo.toml` | `$HOME/.cargo`, `$HOME/.rustup` | `$HOME/.cargo`, `$HOME/.rustup` |
+   | `snap.toml` | `/snap` | `/snap` |
+   | `flatpak.toml` | `/var/lib/flatpak`, `$HOME/.local/share/flatpak` | prefix paths |
+   | `gnu-store.toml` | `/gnu/store` | `/gnu/store` |
 
-   | Command path                           | Detected prefix      |
-   |----------------------------------------|----------------------|
-   | `/nix/store/<hash>-elixir/bin/iex`     | `/nix/store`         |
-   | `/gnu/store/<hash>-guile/bin/guile`    | `/gnu/store`         |
-   | `/opt/homebrew/bin/python3`            | `/opt/homebrew`      |
-   | `/snap/core22/current/usr/bin/hello`   | `/snap`              |
-   | `/var/lib/flatpak/app/.../bin/foo`     | `/var/lib/flatpak`   |
-   | `/home/user/.cargo/bin/rg`            | `/home/user/.cargo`  |
-   | `/usr/bin/python3`                     | None (essential)     |
+3. **Explicit recipes** (`--recipe` / `-r` flags) add whatever
+   `[filesystem].allow` paths they declare.
 
-3. **Bind-mount** the entire prefix tree read-only. For content-addressed
-   stores like `/nix/store`, this is the only practical approach — binaries
-   reference sibling store entries freely, making individual-entry mounting
-   an unbounded dependency chase.
+4. **Environment variable expansion** (`$HOME`, `$USER`, `${XDG_CONFIG_HOME}`)
+   is performed during `into_sandbox_config()`, after merge but before the
+   paths are used by the overlay module.
 
-4. **Log a warning** telling the user to add the prefix to
-   `[filesystem] allow` to silence it.
-
-The prefix mount is skipped if:
-- The path is under an essential mount (e.g., `/usr/bin`)
-- The prefix is already covered by the user's `[filesystem] allow` list
-- The prefix is in the `[filesystem] deny` list
+This design means adding support for a new package manager is "write a
+`.toml` file" rather than "modify Rust code". The `detect_command_prefix()`
+function was removed entirely.
 
 **Security model:** Filesystem visibility does not equal execution permission.
-The prefix mount makes files *visible* inside the sandbox, but `allow_execve`
-(and future `SECCOMP_RET_USER_NOTIF`-based enforcement) controls what can
-actually be *executed*.
+Mounted paths are visible inside the sandbox, but `allow_execve` (and future
+`SECCOMP_RET_USER_NOTIF`-based enforcement) controls what can actually be
+*executed*.
 
 **Security property:** The process cannot see or access any host path that
-was not explicitly bind-mounted or auto-detected as a command prefix. All
-writes go to tmpfs and are discarded when the process exits.
+was not explicitly included in the merged recipe chain. All writes go to
+tmpfs and are discarded when the process exits.
 
 **Degraded mode:** When AppArmor blocks mount operations (Ubuntu 24.04+),
 all mount steps are skipped. The process runs with the full host filesystem.
@@ -350,8 +359,8 @@ is no network isolation.
 
 A classic BPF program is loaded right before `execve()`. The filter is
 generated at runtime from the default baseline defined in
-`recipes/default.toml` plus any `[syscalls]` overrides (`allow_extra` /
-`deny_extra`).
+`recipes/default.toml` (~170 allowed, ~16 always-denied) plus any
+`[syscalls]` overrides (`allow_extra` / `deny_extra`).
 
 The baseline is embedded in the binary via `include_str!()` so it works
 standalone. At runtime, Canister searches for an external `default.toml` in
@@ -430,13 +439,21 @@ allow_execve validation)
 
 Process control enforces the `[process]` config section:
 
-**PID Namespace** (`CLONE_NEWPID` + inner fork):
+**PID Namespace** (`CLONE_NEWPID` + inner fork + `setsid()`):
 
 The child calls `unshare(CLONE_NEWPID)` atomically with the other namespace
 flags. Since `CLONE_NEWPID` affects children of the calling process (not the
 caller itself), the child forks once more. The inner child becomes PID 1 in
-the new PID namespace. The intermediate parent waits and propagates the exit
-code.
+the new PID namespace.
+
+After the inner fork, `setsid()` is called to create a new session and
+process group. This is necessary because PID 1 inherits an invisible
+session/process-group from the parent namespace. Without `setsid()`,
+bash's job control initialization fails because `getpgrp()` returns the
+parent-namespace process group ID, which doesn't exist in the new PID
+namespace — causing "initialize_job_control: getpgrp failed".
+
+The intermediate parent waits and propagates the exit code.
 
 ```
   Outer child (after unshare)
@@ -444,6 +461,7 @@ code.
        ├── fork()
        │     │
        │     ├── Inner child (PID 1 in new ns)
+       │     │     ├── setsid() — new session + process group
        │     │     ├── setup overlay, network, seccomp
        │     │     └── execve()
        │     │
@@ -483,6 +501,13 @@ gets `EAGAIN` from `fork()`.
 The resolved command path is checked against the `allow_execve` whitelist
 before forking. If the command is not in the list (and the list is non-empty),
 execution is rejected immediately.
+
+**Prefix rules:** Entries ending in `/*` match any binary under that
+directory tree. For example, `/nix/store/*` allows any binary whose
+resolved path starts with `/nix/store/`. The match requires a `/` boundary
+to prevent false positives (e.g., `/nix/store-extra/foo` does NOT match
+`/nix/store/*`). This is essential for content-addressed stores like Nix
+where binary paths contain unpredictable hashes.
 
 **Limitation:** This only validates the *initial* command. Child processes
 spawned inside the sandbox can exec arbitrary binaries. Full ongoing execve

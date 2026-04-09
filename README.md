@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#recipe-composition">Recipe Composition</a> &middot;
   <a href="#how-it-works">How It Works</a> &middot;
   <a href="#configuration">Configuration</a> &middot;
   <a href="docs/ARCHITECTURE.md">Architecture</a> &middot;
@@ -34,8 +35,10 @@ discarded.
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via slirp4netns), or full
-- **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~130 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
-- **Process isolation** -- PID namespace, environment filtering, RLIMIT_NPROC, execve whitelisting
+- **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~170 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
+- **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
+- **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
+- **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
 - **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS, all degradation is fatal
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
@@ -89,26 +92,42 @@ The binary is at `target/release/can`.
 # Minimal -- default deny-all policy, default seccomp baseline
 can run -- echo "hello from the sandbox"
 
-# With a recipe file
+# With a recipe file (path)
 can run --recipe recipes/example.toml -- python3 script.py
 
-# Strict mode for CI -- all degradation is fatal, seccomp kills on violation
-can run --strict --recipe recipes/example.toml -- python3 script.py
+# With a recipe by name (searches ./recipes/, $XDG_CONFIG_HOME/canister/recipes/, /etc/canister/recipes/)
+can run -r elixir -- mix test
 
-# Elixir/Erlang -- run mix tasks or iex (recipe adds ptrace to baseline)
-can run --recipe recipes/elixir.toml -- mix test
-can run --recipe recipes/elixir.toml -- iex -S mix
+# Compose multiple recipes -- merged left-to-right
+can run -r nix -r elixir -- mix test
+can run -r cargo -r generic-strict -- cargo build
 
 # Commands from any package manager work automatically:
-# Nix, Homebrew, Cargo, pipx, etc. -- prefix is auto-detected and mounted
+# Nix, Homebrew, Cargo, Snap, Flatpak, Guix -- prefix is auto-detected via match_prefix
 can run -- iex -e 'IO.puts("hello")'        # Nix-installed Elixir
 can run -- rg --help                         # Cargo-installed ripgrep
 
+# Strict mode for CI -- all degradation is fatal, seccomp kills on violation
+can run --strict -r elixir -- mix test
+
 # Monitor mode -- observe what would be blocked without enforcing
-can run --monitor --recipe my_policy.toml -- ./my_program
+can run --monitor -r elixir -- mix test
 
 # Verbose logging (debug level)
 can -v run -- ls /
+```
+
+### Install community recipes
+
+```bash
+# Download recipes from the canister GitHub repository
+can init
+
+# Update to latest recipes
+can update
+
+# Use a custom recipe source
+can init --repo myorg/canister-recipes --branch main
 ```
 
 ### Inspect seccomp baseline
@@ -117,11 +136,13 @@ can -v run -- ls /
 $ can recipes
 Discovered recipes:
 
-  elixir               Elixir/Erlang (BEAM VM) — mix, iex, Phoenix
+  elixir               Elixir/Erlang (BEAM VM) -- mix, iex, Phoenix
                        +ptrace                        recipes/elixir.toml
+  nix                  Nix package manager (/nix/store)
+                                                      recipes/nix.toml
   ...
 
-Default baseline: ~130 allowed, ~16 denied syscalls
+Default baseline: ~170 allowed, ~16 denied syscalls
   Customize per-recipe with [syscalls] allow_extra / deny_extra
 ```
 
@@ -155,10 +176,10 @@ Canister combines seven Linux isolation mechanisms:
    user maps to root inside the namespace). No actual privileges are gained.
 
 2. **Mount namespace + pivot_root** -- an ephemeral tmpfs becomes the new root.
-   Essential system paths (`/bin`, `/lib`, `/usr`, `/proc`) and whitelisted
-   paths are bind-mounted read-only. For commands installed via Nix, Homebrew,
-   or other package managers, the install prefix is auto-detected and mounted.
-   The host filesystem is unmounted.
+   Essential system paths are defined in `recipes/base.toml` (embedded, overridable)
+   and bind-mounted read-only. For commands installed via Nix, Homebrew, Cargo, or
+   other package managers, the install prefix is auto-detected via `match_prefix`
+   rules in recipe files and mounted automatically. The host filesystem is unmounted.
 
 3. **PID namespace** -- the sandboxed process becomes PID 1 in its own PID
    namespace. It cannot see or signal any host processes.
@@ -183,6 +204,62 @@ Canister combines seven Linux isolation mechanisms:
 
 For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Recipe Composition
+
+Canister supports composing multiple recipes via repeated `-r` flags. Recipes
+are merged left-to-right with well-defined semantics:
+
+```bash
+# base.toml (always) → nix.toml (auto-detected) → elixir.toml (explicit)
+can run -r nix -r elixir -- mix test
+```
+
+**Composition order:** `base.toml` → auto-detected recipes → explicit `--recipe` args.
+
+**Name-based lookup:** `-r nix` resolves to `nix.toml` in the recipe search path
+(`./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
+If the argument contains `/` or `.toml`, it's treated as a file path.
+
+**Auto-detection:** Recipes declare `match_prefix` patterns in `[recipe]` metadata.
+When the resolved command binary path matches a prefix, the recipe is automatically
+composed into the stack. For example, running a nix-installed `mix` auto-detects
+`nix.toml` because the binary lives under `/nix/store`.
+
+### Merge semantics
+
+| Field type | Strategy |
+|---|---|
+| `Vec` fields (paths, domains, syscalls, env vars) | **Union** (deduplicated) |
+| `strict` | **OR** -- any `true` wins, can never be loosened |
+| `deny_all`, `seccomp_mode` | **Last-wins** -- `None` preserves earlier value |
+| Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-wins** |
+
+### Environment variable expansion
+
+Recipe paths support `$HOME`, `$USER`, `${XDG_CONFIG_HOME}`, and `$$` (literal `$`):
+
+```toml
+[filesystem]
+allow = ["$HOME/.cargo", "$HOME/.rustup"]
+
+[recipe]
+match_prefix = ["$HOME/.cargo"]
+```
+
+### Package manager recipes
+
+| Recipe | Auto-detected when binary is under |
+|--------|-----------------------------------|
+| `nix.toml` | `/nix/store` |
+| `homebrew.toml` | `/opt/homebrew`, `/home/linuxbrew/.linuxbrew` |
+| `cargo.toml` | `$HOME/.cargo`, `$HOME/.rustup` |
+| `snap.toml` | `/snap` |
+| `flatpak.toml` | `/var/lib/flatpak`, `$HOME/.local/share/flatpak` |
+| `gnu-store.toml` | `/gnu/store` |
+
+These replace hardcoded prefix detection -- adding support for a new package
+manager is "write a .toml file" not "modify Rust code".
+
 ## Configuration
 
 Canister uses TOML recipe files. All fields have sensible defaults.
@@ -193,9 +270,10 @@ section and a `[syscalls]` section to customize the seccomp baseline.
 [recipe]
 name = "my-policy"
 description = "Policy for my project"
+match_prefix = ["/nix/store"]  # auto-detect when binary is under this path
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/tmp/workspace"]
+allow = ["/usr/lib", "/usr/bin", "/tmp/workspace", "$HOME/.config"]
 deny  = ["/etc/shadow"]
 
 [network]
@@ -205,7 +283,7 @@ deny_all      = true   # default
 
 [process]
 max_pids       = 64
-allow_execve   = ["/usr/bin/python3"]
+allow_execve   = ["/usr/bin/python3", "/nix/store/*"]  # prefix rules with /*
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [resources]
@@ -313,22 +391,34 @@ sudo apparmor_parser -r /etc/apparmor.d/unprivileged_userns
 ```
 canister/
 ├── crates/
-│   ├── can-cli/        # CLI binary (clap)
-│   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp
-│   ├── can-policy/     # Config parsing, whitelist logic, profile definitions
+│   ├── can-cli/        # CLI binary (clap): commands, recipe resolution, can init/update
+│   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp, process control
+│   ├── can-policy/     # Config parsing, recipe merge, whitelist logic, env var expansion
 │   ├── can-net/        # Network isolation: netns, slirp4netns, DNS proxy
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
 │   ├── default.toml    # Default seccomp baseline (embedded + overridable)
-│   ├── example.toml    # Example recipe (all options documented)
+│   ├── base.toml       # Essential OS bind mounts (embedded + overridable)
+│   ├── nix.toml        # Nix package manager (auto-detected)
+│   ├── homebrew.toml   # Homebrew/Linuxbrew (auto-detected)
+│   ├── cargo.toml      # Rust/Cargo toolchain (auto-detected)
+│   ├── snap.toml       # Snap packages (auto-detected)
+│   ├── flatpak.toml    # Flatpak applications (auto-detected)
+│   ├── gnu-store.toml  # GNU Guix (auto-detected)
 │   ├── elixir.toml     # Elixir/Erlang development recipe
+│   ├── example.toml    # Example recipe (all options documented)
 │   ├── python-pip.toml # Python pip install recipe
 │   ├── node-build.toml # Node.js build recipe
 │   └── generic-strict.toml # Strict deny-all recipe for CI
 ├── docs/
 │   ├── ARCHITECTURE.md # Design and execution flow
 │   ├── CONFIGURATION.md# Complete config reference
-│   └── SECCOMP.md      # Seccomp baseline and filtering docs
+│   ├── SECCOMP.md      # Seccomp baseline and filtering docs
+│   └── adr/            # Architecture Decision Records
+│       ├── 0001-recipes-over-profiles.md
+│       └── 0002-recipe-composition-and-lifecycle.md
+├── tests/
+│   └── integration/    # Bash integration tests (15 test files)
 └── canister.apparmor   # AppArmor override for Ubuntu 24.04+
 ```
 
