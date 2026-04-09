@@ -1,5 +1,5 @@
 [tools]
-rust = "1.93"
+rust = { version = "1.93", profile = "default" }
 
 [tasks.build]
 description = "Build all crates"
