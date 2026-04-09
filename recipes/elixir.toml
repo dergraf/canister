@@ -19,7 +19,8 @@ version = "1"
 
 [syscalls]
 # BEAM needs ptrace for tracing/debugging tools (:observer, :dbg).
-allow_extra = ["ptrace"]
+# BEAM uses memfd_create for JIT code loading (moved to deny list in default baseline).
+allow_extra = ["ptrace", "memfd_create"]
 
 [filesystem]
 # Paths the sandboxed BEAM process can access.

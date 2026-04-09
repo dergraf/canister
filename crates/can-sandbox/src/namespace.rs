@@ -9,7 +9,9 @@ use nix::unistd::{ForkResult, Pid, fork, pipe};
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
 
-use crate::{SandboxOpts, cgroups, overlay, process, resolve_command, seccomp, to_cstring};
+use crate::{
+    SandboxOpts, cgroups, notifier, overlay, process, resolve_command, seccomp, to_cstring,
+};
 
 /// Errors specific to namespace operations.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +45,9 @@ pub enum NamespaceError {
 
     #[error("cgroup resource limit failed: {0}")]
     Cgroup(#[from] crate::cgroups::CgroupError),
+
+    #[error("seccomp notifier failed: {0}")]
+    Notifier(#[from] notifier::NotifierError),
 }
 
 /// Spawn a process inside new namespaces.
@@ -90,6 +95,26 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let net_mode = NetworkMode::from_config(&opts.config.network);
     tracing::debug!(?net_mode, "network isolation mode");
 
+    // Determine whether to enable the seccomp notifier.
+    let notifier_enabled = resolve_notifier_enabled(&opts.config.syscalls, opts.monitor);
+
+    // Create the fd channel for passing the notifier fd from child to parent.
+    // Created before fork so both sides inherit their end.
+    let notifier_channel = if notifier_enabled {
+        match notifier::create_fd_channel() {
+            Ok((parent_fd, child_fd)) => {
+                tracing::debug!("created notifier fd channel");
+                Some((parent_fd, child_fd))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create notifier fd channel, continuing without notifier");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create two pipes for parent-child synchronization.
     let child_ready = pipe().map_err(NamespaceError::Fork)?;
     let parent_done = pipe().map_err(NamespaceError::Fork)?;
@@ -109,6 +134,12 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             drop(child_ready.1);
             drop(parent_done.0);
 
+            // Drop the child end of the notifier channel in the parent.
+            let parent_notifier_fd = notifier_channel.map(|(parent_fd, child_fd)| {
+                drop(child_fd);
+                parent_fd
+            });
+
             // Wait for child to signal that namespaces are created.
             let mut buf = [0u8; 1];
             let mut ready_r = std::fs::File::from(child_ready.0);
@@ -126,16 +157,21 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 
             // Set up network infrastructure from the parent side.
             let mut net_state = NetworkState::new();
+            let mut resolved_ips: Vec<(String, Vec<std::net::IpAddr>)> = Vec::new();
             if net_mode == NetworkMode::Filtered {
-                match setup_parent_network(child, &opts.config, &mut net_state) {
+                match setup_parent_network(child, &opts.config, &mut net_state, &mut resolved_ips) {
                     Ok(()) => tracing::debug!("parent network setup complete"),
                     Err(e) if opts.strict => {
                         tracing::error!(error = %e, "STRICT: parent network setup failed");
                         return Err(NamespaceError::Network(e));
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "parent network setup failed, child will run without filtered network");
+                    Err(e) if opts.allow_degraded => {
+                        tracing::warn!(error = %e, "parent network setup failed, child will run without filtered network (--allow-degraded)");
                         // Don't fail hard — child will detect missing network
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "parent network setup failed (use --allow-degraded to continue without it)");
+                        return Err(NamespaceError::Network(e));
                     }
                 }
             }
@@ -145,9 +181,82 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             done_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
             drop(done_w);
 
+            // Receive the notifier fd from the child and start the supervisor.
+            let mut supervisor_handle = None;
+            if let Some(parent_fd) = parent_notifier_fd {
+                match notifier::recv_fd(&parent_fd) {
+                    Ok(notifier_fd) => {
+                        let policy = notifier::policy_from_config(&opts.config, &resolved_ips);
+                        tracing::info!(
+                            allowed_ips = policy.allowed_ips.len(),
+                            allowed_cidrs = policy.allowed_cidrs.len(),
+                            allowed_exec_paths = policy.allowed_exec_paths.len(),
+                            "starting seccomp supervisor"
+                        );
+                        match notifier::start_supervisor(notifier_fd, policy) {
+                            Ok(handle) => {
+                                supervisor_handle = Some(handle);
+                                tracing::debug!("seccomp supervisor started");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to start seccomp supervisor");
+                            }
+                        }
+
+                        #[cfg(test)]
+                        mod tests {
+                            use super::*;
+                            use can_policy::SyscallConfig;
+
+                            #[test]
+                            fn resolve_notifier_disabled_in_monitor_mode() {
+                                let config = SyscallConfig::default();
+                                assert!(!resolve_notifier_enabled(&config, true));
+                            }
+
+                            #[test]
+                            fn resolve_notifier_explicit_true() {
+                                let mut config = SyscallConfig::default();
+                                config.notifier = Some(true);
+                                assert!(resolve_notifier_enabled(&config, false));
+                            }
+
+                            #[test]
+                            fn resolve_notifier_explicit_false() {
+                                let mut config = SyscallConfig::default();
+                                config.notifier = Some(false);
+                                assert!(!resolve_notifier_enabled(&config, false));
+                            }
+
+                            #[test]
+                            fn resolve_notifier_explicit_true_still_disabled_in_monitor() {
+                                let mut config = SyscallConfig::default();
+                                config.notifier = Some(true);
+                                // Monitor mode takes priority over explicit config.
+                                assert!(!resolve_notifier_enabled(&config, true));
+                            }
+
+                            #[test]
+                            fn resolve_notifier_auto_detect_returns_bool() {
+                                // Auto-detect: None means check kernel version.
+                                // We can't predict the result, but it shouldn't panic.
+                                let config = SyscallConfig::default();
+                                let _ = resolve_notifier_enabled(&config, false);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to receive notifier fd from child");
+                    }
+                }
+            }
+
             let result = wait_for_child(child);
 
-            // Clean up network infrastructure.
+            // Clean up: supervisor first (closes ioctl fd), then network.
+            if let Some(handle) = supervisor_handle {
+                handle.shutdown();
+            }
             net_state.shutdown();
 
             result
@@ -155,6 +264,12 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         ForkResult::Child => {
             drop(child_ready.0);
             drop(parent_done.1);
+
+            // Drop the parent end of the notifier channel in the child.
+            let child_notifier_fd = notifier_channel.map(|(parent_fd, child_fd)| {
+                drop(parent_fd);
+                child_fd
+            });
 
             let result = child_entry(
                 &cmd,
@@ -166,6 +281,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 net_mode,
                 opts.monitor,
                 opts.strict,
+                opts.allow_degraded,
+                child_notifier_fd,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -178,15 +295,16 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     }
 }
 
-/// Set up parent-side network infrastructure (slirp4netns).
+/// Set up parent-side network infrastructure (slirp4netns + DNS proxy).
 ///
-/// For filtered mode, we also pre-resolve whitelisted domains to build
-/// an IP allow-set. Actual IP-level filtering of connect() syscalls
-/// will be enforced via seccomp in Phase 4.
+/// For filtered mode, we pre-resolve whitelisted domains to build an IP
+/// allow-set for the seccomp notifier's connect() filtering. We also
+/// start the DNS proxy and wire slirp4netns to use it.
 fn setup_parent_network(
     child_pid: Pid,
     config: &SandboxConfig,
     state: &mut NetworkState,
+    resolved_ips: &mut Vec<(String, Vec<std::net::IpAddr>)>,
 ) -> Result<(), can_net::NetError> {
     if !can_net::slirp::is_available() {
         tracing::warn!(
@@ -198,7 +316,7 @@ fn setup_parent_network(
         ));
     }
 
-    // Pre-resolve whitelisted domains to IPs for future seccomp filtering.
+    // Pre-resolve whitelisted domains to IPs for seccomp connect() filtering.
     if !config.network.allow_domains.is_empty() {
         let resolved = can_net::resolve_allowed_domains(&config.network);
         if resolved.is_empty() {
@@ -212,10 +330,33 @@ fn setup_parent_network(
                 tracing::debug!(domain, ips = ?ips, "resolved");
             }
         }
-        // TODO(Phase 4): Pass resolved IPs to seccomp connect() filter.
+        *resolved_ips = resolved;
     }
 
-    // Start slirp4netns for connectivity.
+    // Start the DNS proxy if there are domain-based rules.
+    // The DNS proxy filters queries: whitelisted domains are forwarded,
+    // others get REFUSED.
+    let has_domain_rules = !config.network.allow_domains.is_empty();
+    if has_domain_rules {
+        let dns_config = can_net::dns::DnsProxyConfig::default_with_policy(config.network.clone());
+        match can_net::dns::start_dns_proxy(dns_config) {
+            Ok(handle) => {
+                let dns_port = handle.local_port();
+                tracing::info!(port = dns_port, "DNS proxy started");
+                state.dns_shutdown = Some(handle);
+
+                // Start slirp4netns with DNS forwarded to our proxy.
+                let slirp_child = can_net::slirp::start_with_dns(child_pid, dns_port)?;
+                state.slirp_child = Some(slirp_child);
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DNS proxy failed to start, falling back to plain slirp");
+            }
+        }
+    }
+
+    // Start slirp4netns without custom DNS (no domain rules, or DNS proxy failed).
     let slirp_child = can_net::slirp::start(child_pid)?;
     state.slirp_child = Some(slirp_child);
 
@@ -241,6 +382,8 @@ fn setup_parent_network(
 /// Security hardening:
 /// - `strict` flag: when true, any setup failure is fatal and seccomp uses
 ///   KILL_PROCESS instead of ERRNO. Intended for CI / production.
+/// - `allow_degraded` flag: when true, sandbox may continue with reduced
+///   isolation if setup fails. When false (default), setup failures are fatal.
 #[allow(clippy::too_many_arguments)]
 fn child_entry(
     cmd: &CString,
@@ -252,6 +395,8 @@ fn child_entry(
     net_mode: NetworkMode,
     monitor: bool,
     strict: bool,
+    allow_degraded: bool,
+    notifier_channel: Option<std::os::fd::OwnedFd>,
 ) -> Result<(), NamespaceError> {
     // Build clone flags: always user + mount + PID namespaces.
     let mut clone_flags =
@@ -299,12 +444,16 @@ fn child_entry(
     // All necessary paths (essential OS mounts, auto-detected package manager
     // prefixes, and user-specified paths) are pre-merged into config.filesystem
     // via recipe composition in the CLI layer.
-    // In strict mode, failures are fatal. Otherwise falls back to degraded mode
-    // if AppArmor blocks mount operations.
+    // By default, failures are fatal. Only with --allow-degraded does the sandbox
+    // fall back to degraded mode (host filesystem) if AppArmor blocks mount ops.
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
     let fs_isolated = overlay::try_setup_filesystem(&config.filesystem)?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
+    } else if allow_degraded {
+        tracing::warn!(
+            "filesystem isolation DISABLED — running with host filesystem (--allow-degraded)"
+        );
     } else if strict {
         tracing::error!("STRICT: filesystem isolation failed — aborting");
         return Err(NamespaceError::Overlay(overlay::OverlayError::Mount {
@@ -312,7 +461,14 @@ fn child_entry(
             source: nix::Error::EPERM,
         }));
     } else {
-        tracing::warn!("filesystem isolation DISABLED — running with host filesystem");
+        tracing::error!(
+            "filesystem isolation failed — aborting (use --allow-degraded to permit degraded mode)"
+        );
+        return Err(NamespaceError::Overlay(overlay::OverlayError::Mount {
+            path: "/ (filesystem isolation required; use --allow-degraded to run without it)"
+                .to_string(),
+            source: nix::Error::EPERM,
+        }));
     }
 
     // Set up network inside the sandbox.
@@ -325,17 +481,26 @@ fn child_entry(
                     tracing::error!(error = %e, "STRICT: failed to bring up loopback");
                     return Err(NamespaceError::Network(e));
                 }
-                Err(e) => tracing::warn!(error = %e, "failed to bring up loopback"),
+                Err(e) if allow_degraded => {
+                    tracing::warn!(error = %e, "failed to bring up loopback (--allow-degraded)");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to bring up loopback (use --allow-degraded to continue)");
+                    return Err(NamespaceError::Network(e));
+                }
             }
         }
         NetworkMode::Filtered => {
             // In Filtered mode, slirp4netns provides user-mode networking.
-            // DNS resolution works via slirp's built-in DNS forwarding.
-            // IP-level filtering (connect() interception) will be added
-            // in a future phase via seccomp SECCOMP_RET_USER_NOTIF.
+            // The parent-side DNS proxy filters queries by domain allowlist.
+            // The seccomp USER_NOTIF supervisor filters connect() by IP.
+            // Override resolv.conf to point at the DNS proxy (127.0.0.1).
+            if let Err(e) = can_net::netns::write_resolv_conf("10.0.2.3") {
+                tracing::warn!(error = %e, "failed to write sandbox resolv.conf, DNS may not work");
+            }
             tracing::info!(
-                "network: filtered mode via slirp4netns. \
-                 NOTE: IP-level connect() filtering not yet enforced"
+                notifier = notifier_channel.is_some(),
+                "network: filtered mode via slirp4netns + seccomp notifier"
             );
         }
         NetworkMode::Full => {
@@ -375,12 +540,67 @@ fn child_entry(
                     tracing::error!(error = %e, "STRICT: cgroup resource limits failed");
                     return Err(NamespaceError::Cgroup(e));
                 }
-                Err(e) => {
+                Err(e) if allow_degraded => {
                     tracing::warn!(
                         error = %e,
-                        "cgroup resource limits unavailable — running without memory/CPU limits"
+                        "cgroup resource limits unavailable — running without memory/CPU limits (--allow-degraded)"
                     );
                 }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "cgroup resource limits failed (use --allow-degraded to continue without them)"
+                    );
+                    return Err(NamespaceError::Cgroup(e));
+                }
+            }
+        }
+    }
+
+    // Install the seccomp notifier filter BEFORE the main filter.
+    //
+    // The kernel evaluates seccomp filters in reverse install order, so the
+    // last-installed filter runs first. By installing the notifier filter
+    // first and the main filter second, the main filter runs first for most
+    // syscalls. BUT: for syscalls that match USER_NOTIF, the notifier filter
+    // (installed first, evaluated second) would normally be shadowed. That's
+    // actually wrong — we need the notifier filter to run first.
+    //
+    // Correction: we install the notifier filter SECOND (after the main filter),
+    // so it runs FIRST in the kernel's reverse-order evaluation. But we need
+    // the notifier fd before the main filter is installed. So the actual order
+    // must be:
+    //   1. Install notifier filter (returns fd) — this runs first in kernel
+    //   2. Send fd to parent
+    //   3. Install main filter — this runs second in kernel
+    //
+    // This is correct: the notifier filter catches connect/clone/socket/execve
+    // with USER_NOTIF (supervisor decides), and the main filter handles
+    // everything else. The kernel takes the most restrictive result when
+    // multiple filters match, but USER_NOTIF is special — it suspends the
+    // syscall for supervisor decision, which takes precedence.
+    if let Some(channel_fd) = notifier_channel {
+        match notifier::install_notifier_filter() {
+            Ok(notifier_fd) => {
+                tracing::debug!("installed USER_NOTIF seccomp filter in child");
+                if let Err(e) = notifier::send_fd(&channel_fd, &notifier_fd) {
+                    tracing::warn!(error = %e, "failed to send notifier fd to parent");
+                }
+                // Close both fds — the parent now has the notifier fd.
+                drop(notifier_fd);
+                drop(channel_fd);
+            }
+            Err(e) if allow_degraded => {
+                tracing::warn!(error = %e, "notifier filter install failed (--allow-degraded), continuing without it");
+                drop(channel_fd);
+            }
+            Err(e) if strict => {
+                tracing::error!(error = %e, "STRICT: notifier filter install failed");
+                return Err(NamespaceError::Notifier(e));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "notifier filter install failed (use --allow-degraded to skip)");
+                return Err(NamespaceError::Notifier(e));
             }
         }
     }
@@ -487,6 +707,37 @@ fn wait_for_child(child: Pid) -> Result<i32, NamespaceError> {
                 return Ok(128 + signal as i32);
             }
             _ => continue,
+        }
+    }
+}
+
+/// Determine whether the seccomp USER_NOTIF supervisor should be enabled.
+///
+/// Resolution logic:
+/// 1. If the config explicitly sets `notifier = false`, disable.
+/// 2. If the config explicitly sets `notifier = true`, enable.
+/// 3. If `None` (auto-detect): enable if the kernel supports it (Linux 5.9+).
+/// 4. In monitor mode, the notifier is always disabled (it would interfere
+///    with the LOG-only seccomp policy).
+fn resolve_notifier_enabled(syscall_config: &can_policy::SyscallConfig, monitor: bool) -> bool {
+    if monitor {
+        tracing::debug!("notifier disabled: monitor mode");
+        return false;
+    }
+
+    match syscall_config.notifier_enabled() {
+        Some(true) => {
+            tracing::debug!("notifier enabled: explicit config");
+            true
+        }
+        Some(false) => {
+            tracing::debug!("notifier disabled: explicit config");
+            false
+        }
+        None => {
+            let supported = notifier::is_notifier_supported();
+            tracing::debug!(supported, "notifier auto-detect (requires Linux 5.9+)");
+            supported
         }
     }
 }

@@ -192,5 +192,5 @@ stores expanded paths. Unset variables expand to empty string.
 - [x] Remove hardcoded `ESSENTIAL_BIND_MOUNTS`, `detect_command_prefix()`, etc.
 - [x] Implement `can init` and `can update` with git clone
 - [x] Integration tests for composition, env expansion, auto-detection, and registry
-- [ ] Recipe signing/verification (future ADR)
+- [x] Recipe signing/verification (ADR-0003 supersedes; SHA-256 checksums implemented in WS4)
 - [ ] `can init --generate` from `--monitor` output (future ADR)

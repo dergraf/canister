@@ -1,6 +1,7 @@
 pub mod capabilities;
 pub mod cgroups;
 pub mod namespace;
+pub mod notifier;
 pub mod overlay;
 pub mod process;
 pub mod seccomp;
@@ -58,6 +59,16 @@ pub struct SandboxOpts {
     /// - Filesystem isolation failures are fatal (no degraded mode)
     /// - All setup failures abort instead of warning
     pub strict: bool,
+
+    /// Allow degraded mode: permit sandbox to continue when isolation
+    /// features are unavailable.
+    ///
+    /// By default (`false`), canister fails hard when isolation cannot
+    /// be established. Set to `true` to allow running with reduced
+    /// isolation (e.g., host filesystem fallback).
+    ///
+    /// Mutually exclusive with `strict`.
+    pub allow_degraded: bool,
 }
 
 /// Run a command inside the sandbox.
@@ -74,6 +85,7 @@ pub fn run(opts: &SandboxOpts) -> Result<i32, SandboxError> {
         args = ?opts.args,
         monitor = opts.monitor,
         strict = opts.strict,
+        allow_degraded = opts.allow_degraded,
         "starting sandbox"
     );
 

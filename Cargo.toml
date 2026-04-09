@@ -42,6 +42,9 @@ libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Crypto (recipe checksum verification)
+sha2 = "0.10"
+
 # Internal crates
 can-sandbox = { path = "crates/can-sandbox" }
 can-policy = { path = "crates/can-policy" }

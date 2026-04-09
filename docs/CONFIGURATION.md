@@ -318,9 +318,11 @@ path starts with `/nix/store/`. The match requires a `/` boundary —
 content-addressed stores like Nix where binary paths contain unpredictable
 hashes.
 
-**Limitation:** `allow_execve` only validates the *initial* command. Child
-processes inside the sandbox can exec arbitrary binaries. Full ongoing
-enforcement requires `SECCOMP_RET_USER_NOTIF` (planned for a future phase).
+**Limitation:** `allow_execve` only validates the *initial* command. Ongoing
+enforcement of child process `execve()` calls inside the sandbox is provided
+by the USER_NOTIF supervisor when enabled (see [SECCOMP.md](SECCOMP.md#user_notif-supervisor)).
+When the notifier is disabled, child processes can exec any binary visible
+in the mount namespace.
 
 ```toml
 [process]
@@ -387,6 +389,7 @@ either IS the baseline (uses `allow`/`deny`) or EXTENDS it (uses
 | `seccomp_mode` | `string` | `"allow-list"` | Seccomp mode: `"allow-list"` (default deny) or `"deny-list"` (default allow) |
 | `allow_extra` | `string[]` | `[]` | Syscalls to add to the baseline allow list |
 | `deny_extra` | `string[]` | `[]` | Syscalls to add to the deny list (also removed from allow list) |
+| `notifier` | `bool` (optional) | auto-detect | Enable/disable the USER_NOTIF supervisor for argument-level syscall filtering |
 
 ### Absolute fields (for `default.toml` only)
 
@@ -427,6 +430,40 @@ seccomp_mode = "deny-list"
 
 See [SECCOMP.md](SECCOMP.md) for details on the baseline syscall set and
 how the embed+override resolution works.
+
+### USER_NOTIF supervisor (`notifier`)
+
+The `notifier` field controls the `SECCOMP_RET_USER_NOTIF` supervisor, which
+provides argument-level filtering for `connect()`, `clone()`/`clone3()`,
+`socket()`, `execve()`, and `execveat()`.
+
+| Value | Behavior |
+|-------|----------|
+| `true` | Force the notifier on (fails if kernel < 5.9) |
+| `false` | Force the notifier off |
+| omitted | Auto-detect: enabled if kernel >= 5.9 and not in monitor mode |
+
+When the notifier is active, `connect()` calls are filtered against the
+resolved IPs from `allow_domains` and `allow_ips`, `clone()`/`clone3()` are
+blocked from creating new namespaces, `socket()` is blocked from creating
+`AF_NETLINK` or `SOCK_RAW` sockets, and `execve()`/`execveat()` are validated
+against `allow_execve` paths for every execution (not just the initial command).
+
+The notifier is merged using the **last-Some-wins** strategy during recipe
+composition, consistent with other `Option<bool>` scalar fields.
+
+```toml
+# Disable the notifier for compatibility with older kernels
+[syscalls]
+notifier = false
+
+# Force it on (fail loudly if not supported)
+[syscalls]
+notifier = true
+```
+
+See [SECCOMP.md](SECCOMP.md#user_notif-supervisor) for the full technical
+description.
 
 ---
 

@@ -20,6 +20,17 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub strict: bool,
 
+    /// Allow degraded mode: permit sandbox to continue when isolation
+    /// features are unavailable.
+    ///
+    /// By default (`false`), canister fails hard when isolation cannot be
+    /// established (e.g., filesystem overlay fails). Set to `true` to
+    /// allow running with reduced isolation.
+    ///
+    /// Mutually exclusive with `strict`.
+    #[serde(default)]
+    pub allow_degraded: bool,
+
     /// Filesystem access policy.
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -164,6 +175,14 @@ pub struct SyscallConfig {
     #[serde(default)]
     pub seccomp_mode: Option<SeccompMode>,
 
+    /// Enable the SECCOMP_RET_USER_NOTIF supervisor for argument-level
+    /// syscall filtering (connect, clone, socket, execve).
+    ///
+    /// Requires Linux 5.9+. When `None`, auto-detected based on kernel
+    /// version. Set to `false` to explicitly disable.
+    #[serde(default)]
+    pub notifier: Option<bool>,
+
     // --- Absolute fields (baseline only) ---
     /// Absolute allow list — the complete set of permitted syscalls.
     /// Only valid in `default.toml`. Mutually exclusive with `allow_extra`.
@@ -195,6 +214,14 @@ impl SyscallConfig {
         self.seccomp_mode.unwrap_or_default()
     }
 
+    /// Return whether the notifier should be enabled.
+    ///
+    /// `None` means auto-detect (caller checks kernel version).
+    /// `Some(true)` forces on, `Some(false)` forces off.
+    pub fn notifier_enabled(&self) -> Option<bool> {
+        self.notifier
+    }
+
     /// Returns true if this config uses absolute allow/deny fields (baseline mode).
     pub fn is_baseline(&self) -> bool {
         !self.allow.is_empty() || !self.deny.is_empty()
@@ -223,6 +250,7 @@ impl SandboxConfig {
     pub fn default_deny() -> Self {
         Self {
             strict: false,
+            allow_degraded: false,
             filesystem: FilesystemConfig::default(),
             network: NetworkConfig::default(),
             process: ProcessConfig::default(),
@@ -302,6 +330,19 @@ pub struct RecipeFile {
     #[serde(default)]
     pub strict: Option<bool>,
 
+    /// Allow degraded mode: permit sandbox to continue when isolation
+    /// features are unavailable (e.g., AppArmor blocks mount operations).
+    ///
+    /// By default, canister fails hard when isolation cannot be established.
+    /// Set this to `true` to allow running with reduced isolation (e.g.,
+    /// host filesystem fallback when overlay setup fails).
+    ///
+    /// `None` means "not specified" — merge preserves earlier value.
+    /// Uses OR semantics: any `Some(true)` wins. Resolved to `false`
+    /// via `into_sandbox_config()`.
+    #[serde(default)]
+    pub allow_degraded: Option<bool>,
+
     /// Filesystem access policy.
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -341,6 +382,7 @@ impl RecipeFile {
     ///
     /// Fills in defaults for all `Option` fields:
     /// - `strict` → `false`
+    /// - `allow_degraded` → `false`
     /// - `deny_all` → `true`
     /// - `seccomp_mode` → `AllowList`
     ///
@@ -350,6 +392,7 @@ impl RecipeFile {
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
+            allow_degraded: self.allow_degraded.unwrap_or(false),
             filesystem: FilesystemConfig {
                 allow: self
                     .filesystem
@@ -399,6 +442,13 @@ impl RecipeFile {
                 (s, None) => s,
             },
 
+            // Allow degraded: OR — any Some(true) wins.
+            allow_degraded: match (self.allow_degraded, overlay.allow_degraded) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (_, s @ Some(_)) => s,
+                (s, None) => s,
+            },
+
             // Filesystem: union of paths.
             filesystem: FilesystemConfig {
                 allow: union_vecs(self.filesystem.allow, overlay.filesystem.allow),
@@ -431,12 +481,13 @@ impl RecipeFile {
                 cpu_percent: overlay.resources.cpu_percent.or(self.resources.cpu_percent),
             },
 
-            // Syscalls: seccomp_mode is last-Some-wins, extras are unioned.
+            // Syscalls: seccomp_mode is last-Some-wins, notifier is last-Some-wins, extras are unioned.
             // Absolute fields (allow/deny) are also unioned — this supports
             // merging a baseline on top of another, though in practice only
             // one recipe should use absolute fields.
             syscalls: SyscallConfig {
                 seccomp_mode: overlay.syscalls.seccomp_mode.or(self.syscalls.seccomp_mode),
+                notifier: overlay.syscalls.notifier.or(self.syscalls.notifier),
                 allow: union_vecs(self.syscalls.allow, overlay.syscalls.allow),
                 deny: union_vecs(self.syscalls.deny, overlay.syscalls.deny),
                 allow_extra: union_vecs(self.syscalls.allow_extra, overlay.syscalls.allow_extra),
@@ -810,8 +861,8 @@ deny_extra = ["ptrace"]
             config.syscalls.allow.len()
         );
         assert!(
-            config.syscalls.deny.len() >= 14,
-            "default baseline should have >=14 denied syscalls, got {}",
+            config.syscalls.deny.len() >= 16,
+            "default baseline should have >=16 denied syscalls, got {}",
             config.syscalls.deny.len()
         );
     }

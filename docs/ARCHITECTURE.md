@@ -13,6 +13,7 @@ of a sandboxed process, and the security properties of each isolation layer.
   - [Mount Namespace + pivot_root](#2-mount-namespace--pivot_root)
   - [Network Namespace](#3-network-namespace)
   - [Seccomp BPF](#4-seccomp-bpf)
+  - [Seccomp USER_NOTIF Supervisor](#4b-seccomp-user_notif-supervisor)
   - [Process Control](#5-process-control)
   - [Cgroups v2](#6-cgroups-v2)
   - [/proc Hardening](#7-proc-hardening)
@@ -98,6 +99,16 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
+│ 1b. NOTIFIER SETUP (before fork)                                     │
+│    a. Resolve notifier_enabled (config override / monitor mode /    │
+│       kernel version auto-detect)                                   │
+│    b. If enabled: create anonymous Unix socket pair for fd passing  │
+│       (parent_sock, child_sock)                                     │
+│    c. Pre-resolve allowed domains to IPs (already done in network   │
+│       setup — IPs stored for building notifier policy)              │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────────┐
 │ 2. FORK                                                             │
 │    Create two pipes (child_ready, parent_done).                     │
 │    Capture UID/GID. Call fork().                                    │
@@ -155,7 +166,8 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │ 8. NET      │
     │             │                        │    SETUP    │
     │             │                        │    loopback │
-    │             │                        │    or log   │
+    │             │                        │    resolv.  │
+    │             │                        │    conf     │
     │             │                        │             │
     │             │                        │ 9. PROCESS  │
     │             │                        │    RLIMIT   │
@@ -166,24 +178,53 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │    .max +   │
     │             │                        │    cpu.max  │
     │             │                        │             │
-    │             │                        │ 10. SECCOMP │
-    │             │                        │    Load BPF │
+    │             │                        │ 10. NOTIF   │
+    │             │                        │    FILTER   │
+    │             │                        │    Install  │
+    │             │                        │    USER_    │
+    │             │                        │    NOTIF    │
+    │             │                        │    BPF,     │
+    │             │                        │    send fd  │
+    │             │                        │    to parent│
+    │             │                        │    via SCM_ │
+    │             │                        │    RIGHTS   │
+    │             │                        │             │
+    │ 10b.NOTIF   │                        │             │
+    │    RECV     │                        │             │
+    │    Receive  │                        │             │
+    │    notifier │                        │             │
+    │    fd via   │                        │             │
+    │    SCM_     │                        │             │
+    │    RIGHTS,  │                        │             │
+    │    spawn    │                        │             │
+    │    super-   │                        │             │
+    │    visor    │                        │             │
+    │    thread   │                        │             │
+    │             │                        │             │
+    │             │                        │ 11. SECCOMP │
+    │             │                        │    Load     │
+    │             │                        │    main BPF │
     │             │                        │    filter   │
     │             │                        │             │
-    │             │                        │ 11. ENV     │
+    │             │                        │ 12. ENV     │
     │             │                        │    Filter   │
     │             │                        │    env vars │
     │             │                        │             │
-    │             │                        │ 12. EXEC    │
+    │             │                        │ 13. EXEC    │
     │             │                        │    execve() │
     │             │                        │             │
-    │ 13. WAIT   │                        │  (running)  │
+    │ 14. WAIT   │                        │  (running)  │
     │     waitpid │                        │             │
     │             │                        │ (exits)     │
     │             │                        └─────────────┘
-    │ 14. CLEANUP│
+    │ 15. CLEANUP│
+    │    Stop     │
+    │    notifier │
+    │    thread   │
     │    Kill     │
     │    slirp    │
+    │    Stop DNS │
+    │    proxy    │
     │    Return   │
     │    exit code│
     └─────────────┘
@@ -210,6 +251,13 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 - `RLIMIT_NPROC` must be set before seccomp (which blocks `prctl`).
 - Cgroups v2 setup must happen after RLIMIT but before seccomp, because
   creating cgroups requires write access to the cgroup filesystem.
+- The notifier filter must be installed **before** the main seccomp filter.
+  The `seccomp()` syscall with `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns
+  the notification fd. The child sends this fd to the parent via SCM_RIGHTS,
+  then installs the main filter via `prctl(PR_SET_SECCOMP)`.
+- The parent must receive the notifier fd and spawn the supervisor thread
+  before the child calls `execve()`, so the supervisor is ready to handle
+  notifications from the target program.
 - Seccomp must be loaded **after** all setup is complete, right before exec.
 - Environment filtering happens at exec time — `execve()` receives the
   filtered environment directly.
@@ -295,9 +343,9 @@ This design means adding support for a new package manager is "write a
 function was removed entirely.
 
 **Security model:** Filesystem visibility does not equal execution permission.
-Mounted paths are visible inside the sandbox, but `allow_execve` (and future
-`SECCOMP_RET_USER_NOTIF`-based enforcement) controls what can actually be
-*executed*.
+Mounted paths are visible inside the sandbox, but `allow_execve` and the
+USER_NOTIF supervisor's `execve()`/`execveat()` filtering control what can
+actually be *executed*.
 
 **Security property:** The process cannot see or access any host path that
 was not explicitly included in the merged recipe chain. All writes go to
@@ -343,15 +391,19 @@ child's network namespace and provides user-mode TCP/IP:
 ```
 
 Whitelisted domains are pre-resolved to IP addresses at startup (from the
-parent, which still has host DNS access). These resolved IPs are intended
-for future connect() syscall filtering via `SECCOMP_RET_USER_NOTIF`.
+parent, which still has host DNS access). These resolved IPs are passed to
+the USER_NOTIF supervisor, which intercepts `connect()` syscalls and validates
+the destination IP against the allowlist. A DNS proxy running inside the
+sandbox (on `10.0.2.3:53`) restricts name resolution to whitelisted domains,
+preventing DNS-based information exfiltration.
 
 **Full mode:** No `CLONE_NEWNET`. The sandbox shares the host network.
 
 **Security property:** In None mode, the process has zero network access.
-In Filtered mode, it has connectivity through slirp4netns (full IP-level
-filtering of connect() is planned for a future phase). In Full mode, there
-is no network isolation.
+In Filtered mode, connectivity is routed through slirp4netns, and the
+USER_NOTIF supervisor enforces IP-level connect() filtering against the
+allowed domain/IP whitelist. DNS queries are restricted to whitelisted
+domains. In Full mode, there is no network isolation.
 
 ### 4. Seccomp BPF
 
@@ -361,6 +413,24 @@ A classic BPF program is loaded right before `execve()`. The filter is
 generated at runtime from the default baseline defined in
 `recipes/default.toml` (~170 allowed, ~16 always-denied) plus any
 `[syscalls]` overrides (`allow_extra` / `deny_extra`).
+
+When the USER_NOTIF supervisor is enabled, two BPF filters are installed:
+
+1. **Notifier filter** (installed first, via `seccomp()` with
+   `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for
+   six intercepted syscalls (`connect`, `clone`, `clone3`, `socket`, `execve`,
+   `execveat`). All others return `SECCOMP_RET_ALLOW`.
+
+2. **Main filter** (installed second, via `prctl(PR_SET_SECCOMP)`): The
+   standard allow-list or deny-list filter described below.
+
+The kernel evaluates filters in reverse install order, but
+`SECCOMP_RET_USER_NOTIF` takes special precedence — when present, the kernel
+always delivers the notification to the supervisor. See
+[Seccomp USER_NOTIF Supervisor](#4b-seccomp-user_notif-supervisor) for details.
+
+When the notifier is disabled (kernel < 5.9, monitor mode, or `notifier = false`),
+only the main filter is installed.
 
 The baseline is embedded in the binary via `include_str!()` so it works
 standalone. At runtime, Canister searches for an external `default.toml` in
@@ -431,6 +501,70 @@ process is killed immediately on any denied syscall.
 it cannot invoke unlisted syscalls. The filter is enforced by the kernel and
 cannot be removed or modified by the filtered process (loading new seccomp
 filters is blocked by the default baseline's deny list).
+
+### 4b. Seccomp USER_NOTIF Supervisor
+
+**Syscall:** `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`
+**Module:** `notifier.rs`
+
+The USER_NOTIF supervisor extends seccomp BPF with argument-level inspection.
+Classic BPF can only check the syscall number and architecture — it cannot
+dereference pointers or read memory. The supervisor intercepts specific
+syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
+`/proc/<pid>/mem`, and makes a policy decision.
+
+**Architecture:**
+
+```
+  Child process                          Parent process
+  ─────────────                          ──────────────
+  seccomp() → notifier fd               recv_fd() via SCM_RIGHTS
+  send_fd() via SCM_RIGHTS              spawn supervisor thread
+  install main BPF filter                 │
+  execve()                                ▼
+       │                               ┌─────────────────────┐
+       │    connect(AF_INET, ...)      │  Supervisor thread   │
+       │ ──── SUSPENDED ────────────►  │  1. NOTIF_RECV       │
+       │                               │  2. Read /proc/mem   │
+       │                               │  3. Check policy     │
+       │                               │  4. NOTIF_ID_VALID   │
+       │    ALLOW / ERRNO(EPERM)       │  5. NOTIF_SEND       │
+       │ ◄──────────────────────────── └─────────────────────┘
+       │
+       ▼  (continues or gets EPERM)
+```
+
+**Filtered syscalls:**
+
+| Syscall | What is inspected | Policy enforcement |
+|---------|------------------|--------------------|
+| `connect()` | `sockaddr` struct (IP + port) | Must match resolved `allow_domains` IPs, `allow_ips` CIDRs, or loopback |
+| `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWUSER`, etc.) denied |
+| `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/mem` |
+| `socket()` | `domain` + `type` registers | `AF_NETLINK` and `SOCK_RAW` denied |
+| `execve()` | Pathname string in userspace memory | Must match `allow_execve` paths (empty = allow all) |
+| `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
+
+**TOCTOU mitigation:** Between reading `/proc/<pid>/mem` and sending the
+verdict, a multi-threaded sandbox process could modify the inspected memory.
+The supervisor calls `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` after the policy
+check — if the notification ID is no longer valid (thread exited or memory
+was remapped), the verdict is skipped.
+
+**Fd passing protocol:** Before `fork()`, the parent creates an anonymous
+Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). After install, the
+child sends the notifier fd to the parent as `SCM_RIGHTS` ancillary data.
+The parent receives it and spawns a supervisor thread that blocks on
+`ioctl(SECCOMP_IOCTL_NOTIF_RECV)`.
+
+**Requirements:** Linux 5.9+ (auto-detected from `/proc/sys/kernel/osrelease`).
+Disabled in monitor mode (incompatible with `SECCOMP_RET_LOG`). Configurable
+via `[syscalls] notifier` in recipe config.
+
+**Security property:** Even syscalls that pass the main BPF filter are
+subject to argument-level inspection. A sandboxed process cannot connect to
+unauthorized IPs, create new namespaces via clone flags, open raw/netlink
+sockets, or exec binaries outside the `allow_execve` whitelist.
 
 ### 5. Process Control
 
@@ -509,10 +643,13 @@ to prevent false positives (e.g., `/nix/store-extra/foo` does NOT match
 `/nix/store/*`). This is essential for content-addressed stores like Nix
 where binary paths contain unpredictable hashes.
 
-**Limitation:** This only validates the *initial* command. Child processes
-spawned inside the sandbox can exec arbitrary binaries. Full ongoing execve
-enforcement requires `SECCOMP_RET_USER_NOTIF` with a supervisor thread
-(planned for a future phase).
+**Limitation:** `allow_execve` validates the *initial* command at the CLI
+level. Ongoing enforcement of every `execve()` call inside the sandbox is
+provided by the USER_NOTIF supervisor (see
+[Seccomp USER_NOTIF Supervisor](#4b-seccomp-user_notif-supervisor)), which
+intercepts `execve()` and `execveat()` syscalls and validates the pathname
+against the `allow_execve` whitelist. When the notifier is disabled (kernel
+< 5.9 or `notifier = false`), only the initial command is validated.
 
 ### 6. Cgroups v2
 
@@ -592,6 +729,7 @@ observation) but relaxes policy enforcement. Each enforcement point logs what
 | `env_passthrough` | Strips unlisted env vars | Logs what would be stripped, passes full env |
 | `max_pids` | Sets `RLIMIT_NPROC` | Logs the limit, skips `setrlimit()` |
 | Seccomp BPF | `SECCOMP_RET_ERRNO` (EPERM) | `SECCOMP_RET_LOG` (allowed but kernel-logged) |
+| USER_NOTIF supervisor | Active (intercepts syscalls) | Disabled (incompatible with `SECCOMP_RET_LOG`) |
 | Filesystem isolation | Full overlay + pivot_root | Full overlay + pivot_root (unchanged) |
 | Network isolation | Namespace + slirp4netns | Namespace + slirp4netns (unchanged) |
 
@@ -607,11 +745,16 @@ observation) but relaxes policy enforcement. Each enforcement point logs what
    View these with `journalctl -k | grep seccomp`. This uses a real BPF
    filter (same structure as enforcement mode) so the observation is exact.
 
-3. **Pre-run policy preview.** Before forking, the CLI prints a summary of
+3. **USER_NOTIF is disabled.** The notifier supervisor is incompatible with
+   monitor mode because `SECCOMP_RET_USER_NOTIF` suspends the syscall (it
+   does not log-and-allow like `SECCOMP_RET_LOG`). In monitor mode, all
+   syscalls pass through to the kernel with logging only.
+
+4. **Pre-run policy preview.** Before forking, the CLI prints a summary of
    the active policy so the user knows what enforcement points will be
    observed.
 
-4. **Post-run summary.** After the sandboxed process exits, the CLI prints
+5. **Post-run summary.** After the sandboxed process exits, the CLI prints
    a summary with the exit code and hints for reviewing the monitor output.
 
 **Intended workflow:**
@@ -681,8 +824,11 @@ Timeline:
   Parent: write(parent_done, 0x00)      ← "maps written, network ready"
 
   Child: read(parent_done)              ← unblocks
+  Child: install notifier filter, send fd to parent (if enabled)
   Child: setup overlay, network, seccomp
   Child: execve()
+
+  Parent: receive notifier fd, spawn supervisor thread (if enabled)
 ```
 
 This protocol is necessary because:
@@ -696,6 +842,11 @@ This protocol is necessary because:
 
 3. **Mount operations need mapped UIDs.** The child cannot mount anything
    until its UID is mapped (otherwise the kernel rejects it).
+
+4. **The notifier fd must be passed from child to parent.** The `seccomp()`
+   syscall returns the notifier fd in the child's process. The fd is sent to
+   the parent via `SCM_RIGHTS` over an anonymous Unix socket pair created
+   before `fork()`.
 
 ---
 
@@ -720,6 +871,7 @@ When a process calls `unshare(CLONE_NEWUSER)`, AppArmor transitions it to the
 | Loopback bring-up | Fails (no CAP_NET_ADMIN) | Works |
 | slirp4netns | Works (runs in parent) | Works |
 | Seccomp | Works | Works |
+| USER_NOTIF supervisor | Works | Works |
 
 **Detection:** `can check` reads
 `/sys/kernel/security/apparmor/policy/unprivileged_userns` and
@@ -732,19 +884,6 @@ mount and umount permissions to processes in the `unprivileged_userns` profile.
 ---
 
 ## Known Limitations
-
-### Not yet implemented
-
-- **IP-level connect() filtering.** Whitelisted domains are pre-resolved but
-  the resolved IPs are not used to filter actual connections. The sandbox in
-  "filtered" network mode can connect to any IP reachable via slirp4netns.
-  Requires `SECCOMP_RET_USER_NOTIF` with a supervisor thread to intercept
-  `connect()` syscalls and validate the target IP against the whitelist.
-
-- **Ongoing execve enforcement.** `allow_execve` validates the initial command
-  but child processes inside the sandbox can exec arbitrary binaries that are
-  visible in the mount namespace. Requires `SECCOMP_RET_USER_NOTIF` for
-  path-based argument inspection of every `execve()` call.
 
 ### Fundamental limitations
 
@@ -762,3 +901,10 @@ mount and umount permissions to processes in the `unprivileged_userns` profile.
 - **DNS resolution timing.** Domain pre-resolution happens at sandbox startup.
   If DNS records change during execution, the resolved IP set becomes stale.
   TTL-aware re-resolution is not implemented.
+
+- **USER_NOTIF TOCTOU window.** The `SECCOMP_IOCTL_NOTIF_ID_VALID` check
+  mitigates but does not fully eliminate the time-of-check-time-of-use race
+  in the USER_NOTIF supervisor. A highly concurrent, adversarial workload
+  with precise timing could theoretically modify memory between the supervisor's
+  read and verdict. This is an inherent limitation of the `seccomp_unotify`
+  mechanism.

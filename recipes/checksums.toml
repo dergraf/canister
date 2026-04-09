@@ -1,0 +1,25 @@
+# SHA-256 checksums for official Canister recipes.
+#
+# These are verified during `can init` and `can update` to ensure recipe
+# integrity when downloading from the community repository.
+#
+# To regenerate:
+#   cd recipes && for f in *.toml; do [ "$f" != "checksums.toml" ] && \
+#     echo "\"$f\" = \"$(sha256sum "$f" | cut -d' ' -f1)\""; done
+#
+# Use --no-verify to skip verification (e.g., for custom/forked repos).
+
+[checksums]
+"base.toml" = "ced42166fb559b931f6c256dc4913e68d2b3c13c1996746b8506e7eb646f5256"
+"cargo.toml" = "464dd108add4d8ac853c1eeb012d409fae00a0e15a5b510d697a7837f63db492"
+"default.toml" = "dbda70d56a964b9dbc99b2b4077fe3222e385372c9521bb68f898fe8aa6b8700"
+"elixir.toml" = "71eb027b544f020722c522118334161646c5dc3732f87e09a4d39608390a5d82"
+"example.toml" = "622a3fa3da82934702469872787ef9ce60dc3939551e1948baf786833b5ea5b7"
+"flatpak.toml" = "85a5cc8efb7e396592583cd5a9addd9e51a80d9f9b146e690d0603a163e79dc0"
+"generic-strict.toml" = "29130a323aafe702e0ead285180a5699d7af14a28300c3b005f9e50b211ddcf9"
+"gnu-store.toml" = "822a0b229cb9fac12b514c093c51de216948539393c63e9106b79189f2ae04cf"
+"homebrew.toml" = "bb6af74a34aecbb10fd14dcd3232ee5bccea771ce4d8d48f48c65beb5aa59d2a"
+"nix.toml" = "8e4fc01b7f418f3b7c0a1984ad2b8309f71972d0cd2b15dca1cd8b5f8af10843"
+"node-build.toml" = "cf788530fcc3e0ce6d7cef4ec11fe17ff795840b6a7ae92a256e3c9624990430"
+"python-pip.toml" = "fc22b6c50844edbe6aba03c28380b7f056e26be1f4b4f0d00d881e8e583dee19"
+"snap.toml" = "471083d46a4da23386455214f778f3f9cb6b75a4ccc0de44ee6adb0dff46492a"

@@ -13,6 +13,7 @@ how recipes customize it, and the enforcement modes available.
 - [Deny Action: Errno vs Kill](#deny-action-errno-vs-kill)
 - [Monitor Mode and SECCOMP_RET_LOG](#monitor-mode-and-seccomp_ret_log)
 - [Architecture Validation](#architecture-validation)
+- [USER_NOTIF Supervisor](#user_notif-supervisor)
 - [Inspecting the Baseline](#inspecting-the-baseline)
 
 ---
@@ -233,6 +234,138 @@ If the architecture doesn't match, the process is killed immediately
 32-bit ABI with 64-bit pointers). x32 syscalls use different numbers than
 native x86_64. Without this check, an attacker could invoke x32 syscalls
 to bypass the filter (since the BPF checks are against x86_64 numbers).
+
+---
+
+## USER_NOTIF Supervisor
+
+Classic BPF can only inspect the syscall number and architecture (`seccomp_data.nr`
+and `seccomp_data.arch`). It cannot inspect syscall **arguments** — for pointer-based
+arguments like `connect()`'s `sockaddr` or `execve()`'s pathname, the BPF filter
+only sees the raw pointer value, not the data it points to.
+
+Canister uses `SECCOMP_RET_USER_NOTIF` (Linux 5.9+) to bridge this gap. When the
+child invokes a syscall that requires argument inspection, the kernel suspends the
+calling thread and delivers a notification to a supervisor thread running in the
+parent process. The supervisor reads the actual argument data (from `/proc/<pid>/mem`),
+makes a policy decision, and sends an ALLOW or DENY verdict back to the kernel.
+
+### How it works
+
+```
+  Child (sandboxed)                    Parent (supervisor)
+  ──────────────────                   ────────────────────
+  1. seccomp(SET_MODE_FILTER,          4. Receive notifier fd via
+     NEW_LISTENER, &bpf_prog)             Unix socket (SCM_RIGHTS)
+     → returns notifier fd
+  2. Send notifier fd to parent        5. Spawn supervisor thread
+     via Unix socket (SCM_RIGHTS)
+  3. Install main BPF filter           6. Loop:
+     (prctl PR_SET_SECCOMP)               a. ioctl(NOTIF_RECV) → read notification
+  ... execve() target command ...         b. Read /proc/<pid>/mem for arguments
+                                          c. Evaluate against policy
+                                          d. ioctl(NOTIF_ID_VALID) → TOCTOU check
+                                          e. ioctl(NOTIF_SEND) → verdict
+```
+
+The notifier filter is installed **before** the main seccomp filter. The child
+sends the notification fd to the parent via an anonymous Unix socket pair created
+before `fork()`, using `SCM_RIGHTS` ancillary data. After the parent receives the
+fd, it spawns a dedicated supervisor thread that blocks on `ioctl(NOTIF_RECV)`.
+
+### Two-filter architecture
+
+The child installs two seccomp filters:
+
+1. **Notifier filter** (installed first via `seccomp()` syscall with
+   `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for the
+   six intercepted syscalls (`connect`, `clone`, `clone3`, `socket`, `execve`,
+   `execveat`). All other syscalls return `SECCOMP_RET_ALLOW`.
+
+2. **Main filter** (installed second via `prctl(PR_SET_SECCOMP)`): The existing
+   allow-list or deny-list BPF filter. Returns `SECCOMP_RET_ERRNO`,
+   `SECCOMP_RET_KILL_PROCESS`, or `SECCOMP_RET_LOG` depending on mode.
+
+The kernel evaluates filters in reverse install order, but `SECCOMP_RET_USER_NOTIF`
+takes special precedence — when any filter returns USER_NOTIF, the kernel always
+delivers the notification to the supervisor, regardless of what other filters return.
+
+### Intercepted syscalls
+
+| Syscall | Argument inspected | Policy |
+|---------|-------------------|--------|
+| `connect()` | `sockaddr` (destination address) | Allow only IPs from pre-resolved `allow_domains` and explicit `allow_ips`. Loopback and Unix domain sockets always allowed. |
+| `clone()` | `flags` (register value) | Deny namespace-creating flags: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` |
+| `clone3()` | `clone_args.flags` (read from userspace struct) | Same flag check as `clone()`, read from the `clone_args` struct via `/proc/<pid>/mem` |
+| `socket()` | `domain`, `type` (register values) | Deny `AF_NETLINK` (domain 16) and `SOCK_RAW` (type 3). Normal TCP/UDP/Unix sockets allowed. |
+| `execve()` | `pathname` (read from userspace string) | Validate against `allow_execve` paths. If `allow_execve` is empty, allow all. |
+| `execveat()` | `pathname` (read from userspace string) | Same as `execve()`. Resolves the path relative to the `dirfd` argument. |
+
+### TOCTOU protection
+
+A time-of-check-time-of-use race exists: a multi-threaded sandboxed process
+could modify the memory that the supervisor reads between the read and the
+verdict. Canister mitigates this with `SECCOMP_IOCTL_NOTIF_ID_VALID`:
+
+1. Read notification (gets syscall args and a unique notification ID).
+2. Read memory from `/proc/<pid>/mem` for pointer-based arguments.
+3. Evaluate policy.
+4. Call `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID, &id)` — if the kernel returns
+   an error (`ENOENT`), the syscall was interrupted (the thread exited or
+   the memory was unmapped) and the notification is stale. The supervisor
+   skips sending a verdict.
+5. Send verdict.
+
+This is the standard mitigation recommended by the `seccomp_unotify(2)` man page.
+It is not airtight against a determined attacker with precise timing, but it
+eliminates the most common race windows.
+
+### CIDR matching
+
+For `connect()` filtering, the supervisor supports both exact IP matches and CIDR
+range matches (e.g., `10.0.0.0/8`, `2606:2800:220:1::/64`). The resolved IPs from
+`allow_domains` are combined with any `allow_ips` CIDR ranges from the config to
+build the allowlist. Loopback addresses (`127.0.0.0/8`, `::1`) and `AF_UNIX`
+sockets are always permitted.
+
+### DNS proxy integration
+
+When the notifier is active, a DNS proxy is started inside the sandbox (listening
+on `10.0.2.3:53`). DNS queries from the sandboxed process are intercepted by the
+proxy, which only resolves domains in the `allow_domains` list. This prevents
+DNS-based information exfiltration and ensures the sandbox can only resolve
+whitelisted domains.
+
+### Configuration
+
+The notifier is controlled by the `notifier` field in `[syscalls]`:
+
+```toml
+[syscalls]
+notifier = true     # force on
+notifier = false    # force off
+# omit             → auto-detect (default)
+```
+
+**Auto-detection logic:**
+
+1. If `notifier` is explicitly set in the config, that value is used.
+2. If running in monitor mode, the notifier is disabled (monitor mode uses
+   `SECCOMP_RET_LOG`, which is incompatible with `SECCOMP_RET_USER_NOTIF`).
+3. Otherwise, the notifier is enabled if the kernel version is 5.9 or later
+   (the minimum version that supports all required `seccomp_unotify` ioctls).
+
+Kernel version detection reads `/proc/sys/kernel/osrelease` and parses the
+major.minor version.
+
+### Requirements
+
+- **Linux 5.9+** — for `SECCOMP_IOCTL_NOTIF_RECV`, `SECCOMP_IOCTL_NOTIF_SEND`,
+  and `SECCOMP_IOCTL_NOTIF_ID_VALID`.
+- **`PR_SET_NO_NEW_PRIVS`** must be set before installing the filter (already done
+  by both the notifier and main filter installation paths).
+- **`/proc/<pid>/mem`** must be readable by the parent (always true since the parent
+  has the same UID as the child).
 
 ---
 

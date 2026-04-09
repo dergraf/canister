@@ -181,6 +181,7 @@ pub fn run(
     recipe_args: &[String],
     monitor: bool,
     strict: bool,
+    allow_degraded: bool,
     command: Vec<String>,
 ) -> Result<i32> {
     let cmd_name = command.first().map(|s| s.as_str());
@@ -189,8 +190,15 @@ pub fn run(
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;
 
+    // CLI --allow-degraded flag OR'd with config value.
+    let effective_allow_degraded = allow_degraded || config.allow_degraded;
+
     if monitor && effective_strict {
         anyhow::bail!("--monitor and --strict are mutually exclusive");
+    }
+
+    if effective_strict && effective_allow_degraded {
+        anyhow::bail!("--strict and --allow-degraded are mutually exclusive");
     }
 
     if effective_strict {
@@ -214,6 +222,7 @@ pub fn run(
         config,
         monitor,
         strict: effective_strict,
+        allow_degraded: effective_allow_degraded,
     };
 
     let exit_code = can_sandbox::run(&opts)?;

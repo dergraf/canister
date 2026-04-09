@@ -30,7 +30,6 @@ allow = [
     "clone",
     "clone3",
     "execve",
-    "execveat",
     "kill",
     "tkill",
     "tgkill",
@@ -217,7 +216,6 @@ allow = [
     "uname",
     "sysinfo",
     "getrandom",
-    "memfd_create",
     "copy_file_range",
     "sendfile",
     "splice",
@@ -248,4 +246,10 @@ deny = [
     # namespaces or join existing ones.
     "unshare",
     "setns",
+    # In-memory code execution — memfd_create + execveat enables fileless
+    # execution, a common technique for running malicious payloads without
+    # touching disk. Recipes that legitimately need these (e.g., BEAM VM)
+    # can opt in via allow_extra.
+    "memfd_create",
+    "execveat",
 ]

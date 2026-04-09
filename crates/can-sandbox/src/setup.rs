@@ -28,7 +28,7 @@ const PROFILE_TEMPLATE: &str = r#"# Canister sandbox AppArmor profile
 # Binary: {bin_path}
 #
 # This profile grants the `can` binary permission to use mount, pivot_root,
-# and capabilities inside unprivileged user namespaces.
+# and specific capabilities inside unprivileged user namespaces.
 #
 # To remove: can setup --remove
 #   or: sudo rm /etc/apparmor.d/canister && sudo apparmor_parser -R canister
@@ -38,7 +38,13 @@ abi <abi/4.0>,
 include <tunables/global>
 
 profile canister {bin_path} flags=(attach_disconnected) {
-  allow capability,
+  # Grant only the specific capabilities needed for namespace + filesystem setup.
+  allow capability sys_admin,
+  allow capability net_admin,
+  allow capability sys_chroot,
+  allow capability dac_override,
+  allow capability dac_read_search,
+
   allow file rwlkm /{**,},
   allow network,
   allow unix,
@@ -48,7 +54,6 @@ profile canister {bin_path} flags=(attach_disconnected) {
   allow mount,
   allow umount,
   allow pivot_root,
-  allow dbus,
   allow mqueue,
   allow io_uring,
 
@@ -63,18 +68,18 @@ profile canister_sandboxed flags=(attach_disconnected) {
   allow network,
   allow unix,
   allow signal,
-  allow ptrace,
-  allow userns,
-  allow mount,
-  allow umount,
-  allow pivot_root,
-  allow dbus,
   allow mqueue,
   allow io_uring,
 
   allow pix /** -> &canister_sandboxed,
 
   audit deny capability,
+  audit deny mount,
+  audit deny umount,
+  audit deny pivot_root,
+  audit deny userns,
+  audit deny ptrace,
+  deny dbus,
 
   include if exists <local/canister_sandboxed>
 }
@@ -358,7 +363,8 @@ mod tests {
         assert!(profile.contains("profile canister /usr/local/bin/can flags="));
         assert!(profile.contains("allow mount,"));
         assert!(profile.contains("allow pivot_root,"));
-        assert!(profile.contains("allow capability,"));
+        assert!(profile.contains("allow capability sys_admin,"));
+        assert!(profile.contains("allow capability net_admin,"));
     }
 
     #[test]
@@ -366,6 +372,12 @@ mod tests {
         let profile = generate_profile("/usr/bin/can");
         assert!(profile.contains("profile canister_sandboxed"));
         assert!(profile.contains("audit deny capability,"));
+        assert!(profile.contains("audit deny mount,"));
+        assert!(profile.contains("audit deny umount,"));
+        assert!(profile.contains("audit deny pivot_root,"));
+        assert!(profile.contains("audit deny userns,"));
+        assert!(profile.contains("audit deny ptrace,"));
+        assert!(profile.contains("deny dbus,"));
     }
 
     #[test]

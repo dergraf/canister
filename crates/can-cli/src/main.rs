@@ -46,6 +46,15 @@ enum Commands {
         #[arg(short, long)]
         strict: bool,
 
+        /// Allow degraded mode: permit sandbox to continue when isolation
+        /// features are unavailable.
+        ///
+        /// By default, canister fails hard when isolation cannot be
+        /// established (e.g., AppArmor blocks mount operations). This flag
+        /// opts into reduced isolation instead of aborting.
+        #[arg(long)]
+        allow_degraded: bool,
+
         /// The command to execute.
         #[arg(required = true)]
         command: Vec<String>,
@@ -77,6 +86,11 @@ enum Commands {
         /// Branch to fetch.
         #[arg(long, default_value = None)]
         branch: Option<String>,
+
+        /// Skip SHA-256 checksum verification of recipe files.
+        /// Required when using custom/forked repositories.
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Update community recipes from the remote repository.
@@ -90,6 +104,11 @@ enum Commands {
         /// Branch to fetch.
         #[arg(long, default_value = None)]
         branch: Option<String>,
+
+        /// Skip SHA-256 checksum verification of recipe files.
+        /// Required when using custom/forked repositories.
+        #[arg(long)]
+        no_verify: bool,
     },
 }
 
@@ -112,13 +131,22 @@ fn main() -> ExitCode {
             recipe,
             monitor,
             strict,
+            allow_degraded,
             command,
-        } => commands::run(&recipe, monitor, strict, command),
+        } => commands::run(&recipe, monitor, strict, allow_degraded, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipes => recipes::list(),
-        Commands::Init { repo, branch } => registry::init(repo.as_deref(), branch.as_deref()),
-        Commands::Update { repo, branch } => registry::update(repo.as_deref(), branch.as_deref()),
+        Commands::Init {
+            repo,
+            branch,
+            no_verify,
+        } => registry::init(repo.as_deref(), branch.as_deref(), no_verify),
+        Commands::Update {
+            repo,
+            branch,
+            no_verify,
+        } => registry::update(repo.as_deref(), branch.as_deref(), no_verify),
     };
 
     match result {
