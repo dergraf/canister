@@ -42,7 +42,7 @@ fn discover() -> Vec<(PathBuf, RecipeFile)> {
     recipes
 }
 
-/// Execute the `can recipes` command.
+/// Execute the `can recipe list` command.
 ///
 /// Lists discovered recipes from the search path, followed by
 /// information about the default seccomp baseline and its source.

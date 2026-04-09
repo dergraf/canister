@@ -176,6 +176,27 @@ fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile
     Ok(matches)
 }
 
+/// Execute the `can recipe show` command.
+///
+/// Loads and merges all recipes (same as `can run`), resolves to a
+/// `SandboxConfig`, then serializes the fully resolved config as TOML
+/// to stdout. The output is valid TOML that can be saved as a standalone
+/// recipe file.
+pub fn show(recipe_args: &[String], command: Vec<String>) -> Result<i32> {
+    let cmd_name = command.first().map(|s| s.as_str());
+    let mut config = load_recipes(recipe_args, cmd_name)?;
+
+    // Resolve Option fields to their effective values so the output is
+    // fully explicit — no hidden defaults.
+    config.network.deny_all = Some(config.network.deny_all());
+    config.syscalls.seccomp_mode = Some(config.syscalls.seccomp_mode());
+
+    let toml_str =
+        toml::to_string_pretty(&config).context("serializing resolved config to TOML")?;
+    print!("{toml_str}");
+    Ok(0)
+}
+
 /// Execute the `can run` command.
 pub fn run(
     recipe_args: &[String],

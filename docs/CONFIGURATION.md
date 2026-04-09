@@ -20,7 +20,9 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 - [resources](#resources)
 - [syscalls](#syscalls)
 - [Strict Mode](#strict-mode)
+- [Allow Degraded Mode](#allow-degraded-mode)
 - [Monitor Mode](#monitor-mode)
+- [Inspecting the Resolved Policy](#inspecting-the-resolved-policy)
 - [Examples](#examples)
 
 ---
@@ -125,7 +127,7 @@ but controls recipe discovery and composition behavior.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | `string` (optional) | — | Human-readable recipe name |
-| `description` | `string` (optional) | — | Short description shown by `can recipes` |
+| `description` | `string` (optional) | — | Short description shown by `can recipe list` |
 | `match_prefix` | `string[]` | `[]` | Path prefixes for auto-detection (env vars expanded) |
 
 ```toml
@@ -318,11 +320,12 @@ path starts with `/nix/store/`. The match requires a `/` boundary —
 content-addressed stores like Nix where binary paths contain unpredictable
 hashes.
 
-**Limitation:** `allow_execve` only validates the *initial* command. Ongoing
-enforcement of child process `execve()` calls inside the sandbox is provided
-by the USER_NOTIF supervisor when enabled (see [SECCOMP.md](SECCOMP.md#user_notif-supervisor)).
-When the notifier is disabled, child processes can exec any binary visible
-in the mount namespace.
+**Ongoing enforcement:** When the USER_NOTIF supervisor is active (kernel
+5.9+, default), every `execve()` and `execveat()` call inside the sandbox is
+intercepted and validated against `allow_execve`. This means child processes
+cannot exec arbitrary binaries. When the notifier is disabled (kernel < 5.9
+or `notifier = false`), only the initial command is validated, and child
+processes can exec any binary visible in the mount namespace.
 
 ```toml
 [process]
@@ -337,6 +340,10 @@ env_passthrough = ["PATH", "HOME", "LANG", "TERM", "VIRTUAL_ENV"]
 
 Resource limits enforced via cgroups v2. Requires systemd with per-user
 cgroup delegation (default on most modern distributions).
+
+**Opt-in:** Resource limits are not included in any of the shipped base
+recipes. They are entirely opt-in — add `memory_mb` and/or `cpu_percent`
+to your own recipe when needed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -355,8 +362,9 @@ moves the sandboxed process into it. No root required.
   period), capping the process to 50% of one CPU core.
 
 **Failure behavior:** If cgroup setup fails (e.g., no cgroup v2, no
-delegation), the limits are skipped with a warning. In strict mode
-(`--strict`), cgroup failure aborts the sandbox.
+delegation), the sandbox aborts by default. Pass `--allow-degraded` to
+skip cgroup setup with a warning. In strict mode (`--strict`), cgroup
+failure always aborts.
 
 ```toml
 [resources]
@@ -504,6 +512,42 @@ contradictory intents.
 
 ---
 
+## Allow Degraded Mode
+
+By default, Canister **fails hard** when isolation cannot be established
+(e.g., AppArmor blocks mount operations, cgroup delegation unavailable).
+The `--allow-degraded` flag opts into reduced isolation instead of aborting.
+
+**Config:**
+
+```toml
+allow_degraded = true
+```
+
+**CLI:**
+
+```bash
+can run --allow-degraded -- echo "hello"
+```
+
+The CLI `--allow-degraded` flag is OR'd with the config value — if either
+is set, degraded mode is permitted.
+
+**Changes with `--allow-degraded`:**
+
+| Enforcement point | Default (fail-hard) | With `--allow-degraded` |
+|-------------------|---------------------|------------------------|
+| Filesystem isolation | **Aborts** if AppArmor blocks mounts | Falls back to host FS with warning |
+| Network setup | **Aborts** on failure | Logs warning, continues |
+| Loopback bring-up | **Aborts** on failure | Skips with warning |
+| Cgroup setup | **Aborts** on failure | Skips with warning |
+
+**Mutual exclusion:** `--allow-degraded` and `--strict` cannot be used
+together. Strict mode demands full enforcement; degraded mode accepts
+partial enforcement. These are contradictory intents.
+
+---
+
 ## Monitor Mode
 
 Monitor mode (`--monitor`) is a CLI flag, not a config field. It relaxes
@@ -533,6 +577,62 @@ can run --monitor --recipe my_policy.toml -- python3 script.py
 
 Monitor mode is a development tool. It provides **no security guarantees**.
 Cannot be combined with `--strict`.
+
+---
+
+## Inspecting the Resolved Policy
+
+Use `can recipe show` to see the fully resolved policy after all recipe
+merging and environment variable expansion:
+
+```bash
+# Show the base policy (no recipes)
+can recipe show
+
+# Show the resolved policy with a recipe
+can recipe show -r elixir
+
+# Show with auto-detection (pass the command to trigger match_prefix)
+can recipe show -r elixir -- mix test
+
+# Compose multiple recipes and see the result
+can recipe show -r nix -r elixir
+
+# Save to a standalone recipe file
+can recipe show -r nix -r elixir > my-custom.toml
+can run -r my-custom.toml -- mix test
+```
+
+The output is valid TOML and includes all resolved fields:
+
+```toml
+strict = false
+allow_degraded = false
+
+[filesystem]
+allow = ["/bin", "/sbin", "/usr/bin", ...]
+deny = ["/etc/shadow", "/etc/gshadow"]
+
+[network]
+allow_domains = ["hex.pm", "repo.hex.pm", "builds.hex.pm"]
+deny_all = true
+
+[process]
+allow_execve = ["/nix/store/*"]
+env_passthrough = ["PATH", "HOME", ...]
+
+[resources]
+
+[syscalls]
+seccomp_mode = "allow-list"
+allow_extra = ["ptrace"]
+```
+
+This serves two purposes:
+
+1. **Auditing** — see exactly what policy will be enforced before running.
+2. **Standalone recipes** — capture the output and use it as a custom
+   recipe that doesn't depend on any other recipe files.
 
 ---
 

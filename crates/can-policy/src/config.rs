@@ -2,14 +2,14 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level sandbox configuration.
 ///
 /// This is the resolved, validated form used by the sandbox runtime.
 /// All `Option` fields are guaranteed to be `Some` after resolution
 /// via `RecipeFile::into_sandbox_config()`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// Strict mode: fail hard instead of degrading gracefully.
@@ -52,7 +52,7 @@ pub struct SandboxConfig {
     pub syscalls: SyscallConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
     /// Paths the sandboxed process is allowed to access.
@@ -64,7 +64,7 @@ pub struct FilesystemConfig {
     pub deny: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Whitelisted domain names (resolved via internal DNS proxy).
@@ -101,7 +101,7 @@ impl NetworkConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Maximum number of child PIDs allowed.
@@ -117,7 +117,7 @@ pub struct ProcessConfig {
     pub env_passthrough: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceConfig {
     /// Memory limit in megabytes.
@@ -134,7 +134,7 @@ pub struct ResourceConfig {
 ///   syscalls are allowed. This is the secure choice for production/CI.
 /// - **DenyList**: default action is ALLOW. Only explicitly listed syscalls
 ///   are blocked. More permissive, useful when compatibility is paramount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeccompMode {
     /// Default deny — only allow-listed syscalls are permitted.
@@ -165,7 +165,7 @@ impl fmt::Display for SeccompMode {
 ///
 /// A recipe MUST NOT mix absolute and relative fields. If both are present,
 /// parsing succeeds but `validate()` returns an error.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SyscallConfig {
     /// Seccomp enforcement mode: "allow-list" (default) or "deny-list".

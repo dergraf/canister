@@ -70,8 +70,11 @@ enum Commands {
         remove: bool,
     },
 
-    /// List available recipes and the default baseline syscall counts.
-    Recipes,
+    /// Manage and inspect recipes.
+    Recipe {
+        #[command(subcommand)]
+        action: RecipeAction,
+    },
 
     /// Download community recipes to the local config directory.
     ///
@@ -112,6 +115,30 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum RecipeAction {
+    /// List available recipes and the default baseline syscall counts.
+    List,
+
+    /// Show the fully resolved recipe as TOML.
+    ///
+    /// Merges base.toml, auto-detected recipes, and explicit --recipe
+    /// arguments, expands environment variables, then prints the final
+    /// effective policy. The output is valid TOML that can be saved as a
+    /// standalone recipe file.
+    Show {
+        /// Recipe name or path. Can be repeated for composition.
+        #[arg(short, long)]
+        recipe: Vec<String>,
+
+        /// Optional command to resolve (enables auto-detection of recipes).
+        ///
+        /// The command is NOT executed — it is only used to determine which
+        /// recipes would be auto-detected based on `match_prefix`.
+        command: Vec<String>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -136,7 +163,10 @@ fn main() -> ExitCode {
         } => commands::run(&recipe, monitor, strict, allow_degraded, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
-        Commands::Recipes => recipes::list(),
+        Commands::Recipe { action } => match action {
+            RecipeAction::List => recipes::list(),
+            RecipeAction::Show { recipe, command } => commands::show(&recipe, command),
+        },
         Commands::Init {
             repo,
             branch,

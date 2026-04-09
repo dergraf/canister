@@ -3,8 +3,8 @@
 # t_recipes.sh — Recipe system integration tests
 #
 # Tests:
-#   1. can recipes lists discovered recipes
-#   2. can recipes shows default baseline info
+#   1. can recipe list lists discovered recipes
+#   2. can recipe list shows default baseline info
 #   3. --recipe flag works (loads a recipe TOML)
 #   4. Recipe with [syscalls] allow_extra works
 #   5. Recipe with unknown fields is rejected (deny_unknown_fields)
@@ -15,15 +15,15 @@ source "$(dirname "$0")/lib.sh"
 require_user_namespaces
 header "Recipe system"
 
-# ---- Test 1: can recipes lists discovered recipes ----
-begin_test "can recipes lists discovered recipes"
-run_can recipes
+# ---- Test 1: can recipe list lists discovered recipes ----
+begin_test "can recipe list lists discovered recipes"
+run_can recipe list
 assert_exit_code 0 "$RUN_EXIT"
 # Should find the example recipes in ./recipes/
 assert_contains "$RUN_STDOUT" "Discovered recipes"
 
-# ---- Test 2: can recipes shows default baseline ----
-begin_test "can recipes shows default baseline info"
+# ---- Test 2: can recipe list shows default baseline ----
+begin_test "can recipe list shows default baseline info"
 assert_contains "$RUN_STDOUT" "Default baseline"
 assert_contains "$RUN_STDOUT" "allowed"
 assert_contains "$RUN_STDOUT" "denied"

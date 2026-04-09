@@ -8,7 +8,7 @@
 #   3. Python script runs inside the sandbox
 #   4. Nonexistent command fails with appropriate error
 #   5. can check runs successfully
-#   6. can recipes shows default baseline info
+#   6. can recipe list shows default baseline info
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -56,9 +56,9 @@ run_can check
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "User namespaces"
 
-# ---- Test 8: can recipes ----
-begin_test "can recipes shows default baseline"
-run_can recipes
+# ---- Test 8: can recipe list ----
+begin_test "can recipe list shows default baseline"
+run_can recipe list
 assert_exit_code 0 "$RUN_EXIT"
 assert_contains "$RUN_STDOUT" "Discovered recipes"
 assert_contains "$RUN_STDOUT" "Default baseline"

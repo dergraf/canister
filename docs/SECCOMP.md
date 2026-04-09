@@ -330,11 +330,13 @@ sockets are always permitted.
 
 ### DNS proxy integration
 
-When the notifier is active, a DNS proxy is started inside the sandbox (listening
-on `10.0.2.3:53`). DNS queries from the sandboxed process are intercepted by the
-proxy, which only resolves domains in the `allow_domains` list. This prevents
-DNS-based information exfiltration and ensures the sandbox can only resolve
-whitelisted domains.
+When the notifier is active, a DNS proxy runs in the **parent process** on
+an ephemeral port. The sandbox's `/etc/resolv.conf` points to slirp4netns's
+DNS forwarding address (`10.0.2.3:53`), which is configured via
+`slirp4netns --dns` to forward queries to the parent's DNS proxy. The proxy
+only resolves domains in the `allow_domains` list — all other queries receive
+an NXDOMAIN response. This prevents DNS-based information exfiltration and
+ensures the sandbox can only resolve whitelisted domains.
 
 ### Configuration
 
@@ -374,7 +376,7 @@ major.minor version.
 List discovered recipes and the default baseline:
 
 ```
-$ can recipes
+$ can recipe list
 Discovered recipes:
 
   elixir               Elixir/Erlang (BEAM VM) — mix, iex, Phoenix
@@ -394,3 +396,22 @@ be overridden by placing a `default.toml` in the recipe search path
 
 `SeccompProfile::apply_overrides()` merges per-recipe `allow_extra` /
 `deny_extra` customizations on top of this baseline.
+
+To see the fully resolved policy (after all recipe merging and env var
+expansion), use `can recipe show`:
+
+```
+$ can recipe show -r elixir
+strict = false
+allow_degraded = false
+
+[filesystem]
+allow = ["/bin", "/sbin", ...]
+
+[syscalls]
+seccomp_mode = "allow-list"
+allow_extra = ["ptrace"]
+...
+```
+
+The output is valid TOML that can be saved as a standalone recipe file.

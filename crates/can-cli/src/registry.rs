@@ -298,7 +298,7 @@ pub fn init(repo: Option<&str>, branch: Option<&str>, no_verify: bool) -> Result
             println!("  {name}");
         }
         println!();
-        println!("Use `can recipes` to see all available recipes.");
+        println!("Use `can recipe list` to see all available recipes.");
         println!("Use `can update` to refresh from the repository.");
     }
 

@@ -34,9 +34,9 @@ of a sandboxed process, and the security properties of each isolation layer.
    layer does not compromise the others.
 
 3. **Fail closed.** When a feature cannot be set up (e.g., AppArmor blocks
-   mounts), Canister either falls back to reduced isolation with clear
-   warnings or fails entirely. In strict mode (`--strict`), all degradation
-   is fatal — the sandbox runs at full strength or not at all.
+   mounts), Canister aborts by default. The `--allow-degraded` flag opts into
+   reduced isolation with clear warnings. In strict mode (`--strict`), all
+   degradation is fatal — the sandbox runs at full strength or not at all.
 
 4. **Single binary.** No runtime dependencies beyond the Linux kernel (and
    optionally slirp4netns for filtered networking). No dynamic linking to
@@ -55,6 +55,7 @@ canister/
 ├── can-cli        CLI binary. Argument parsing (clap), recipe
 │                  resolution (name-based lookup, auto-detection
 │                  via match_prefix), composition chain assembly,
+│                  `can recipe show` (emit resolved policy as TOML),
 │                  can init / can update lifecycle commands.
 │
 ├── can-sandbox    Core runtime. Orchestrates the fork/unshare/exec
@@ -147,6 +148,18 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │    setsid() │
     │             │                        │    (PID 1)  │
     │             │                        │             │
+    │             │                        │ 6b. CGROUP  │
+    │             │                        │    Create   │
+    │             │                        │    child    │
+    │             │                        │    cgroup,  │
+    │             │                        │    write    │
+    │             │                        │    memory   │
+    │             │                        │    .max +   │
+    │             │                        │    cpu.max  │
+    │             │                        │    (before  │
+    │             │                        │    pivot_   │
+    │             │                        │    root)    │
+    │             │                        │             │
     │             │                        │ 7. OVERLAY  │
     │             │                        │    tmpfs    │
     │             │                        │    root,    │
@@ -154,9 +167,13 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │    mounts   │
     │             │                        │    (from    │
     │             │                        │    merged   │
-    │             │                        │    config)  │
+    │             │                        │    config), │
+    │             │                        │    CWD bind │
+    │             │                        │    mount    │
+    │             │                        │    (RW),    │
     │             │                        │    pivot_   │
-    │             │                        │    root     │
+    │             │                        │    root,    │
+    │             │                        │    chdir()  │
     │             │                        │             │
     │             │                        │ 7b. PROC    │
     │             │                        │    HARDEN   │
@@ -172,11 +189,6 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │ 9. PROCESS  │
     │             │                        │    RLIMIT   │
     │             │                        │    NPROC    │
-    │             │                        │             │
-    │             │                        │ 9b. CGROUP  │
-    │             │                        │    memory   │
-    │             │                        │    .max +   │
-    │             │                        │    cpu.max  │
     │             │                        │             │
     │             │                        │ 10. NOTIF   │
     │             │                        │    FILTER   │
@@ -249,8 +261,13 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
   returns the parent-namespace group).
 - /proc hardening must happen after overlay + /proc mount but before seccomp.
 - `RLIMIT_NPROC` must be set before seccomp (which blocks `prctl`).
-- Cgroups v2 setup must happen after RLIMIT but before seccomp, because
-  creating cgroups requires write access to the cgroup filesystem.
+- Cgroups v2 setup must happen **before** `pivot_root`, because the cgroup
+  filesystem (`/sys/fs/cgroup`) is on the host and becomes inaccessible after
+  the root is swapped. This is step 6b in the execution flow.
+- The CWD bind-mount must happen during overlay setup (step 7), before
+  `pivot_root`. The host's current working directory is captured before
+  `unshare()` and bind-mounted writable into the new root. After
+  `pivot_root`, the child calls `chdir()` to the mounted CWD path.
 - The notifier filter must be installed **before** the main seccomp filter.
   The `seccomp()` syscall with `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns
   the notification fd. The child sends this fd to the parent via SCM_RIGHTS,
@@ -298,11 +315,13 @@ The child gets its own mount table. The setup sequence:
 3.  mkdir skeleton dirs                     # /bin, /lib, /usr, /proc, /dev, /tmp, ...
 4.  bind-mount essentials (read-only)       # from base.toml: /bin, /sbin, /usr/bin, ...
 5.  bind-mount whitelisted paths (RO)       # from merged [filesystem].allow (all recipes)
+5b. bind-mount CWD (read-write)            # host working directory, always mounted
 6.  mount /tmp (read-write)                 # ephemeral writable space
 7.  mount /proc                             # needed by many programs
 8.  set up /dev                             # null, zero, urandom, tty, fd symlinks
 9.  pivot_root(new_root, old_root)          # swap filesystem root
 10. umount(old_root, MNT_DETACH)           # detach host filesystem entirely
+11. chdir(cwd_path)                         # restore working directory inside new root
 ```
 
 **Recipe-based mount resolution:**
@@ -348,12 +367,15 @@ USER_NOTIF supervisor's `execve()`/`execveat()` filtering control what can
 actually be *executed*.
 
 **Security property:** The process cannot see or access any host path that
-was not explicitly included in the merged recipe chain. All writes go to
-tmpfs and are discarded when the process exits.
+was not explicitly included in the merged recipe chain. The host's current
+working directory is always bind-mounted writable so the sandboxed process
+can read/write files in its working directory. All other writes go to tmpfs
+and are discarded when the process exits.
 
 **Degraded mode:** When AppArmor blocks mount operations (Ubuntu 24.04+),
 all mount steps are skipped. The process runs with the full host filesystem.
-A clear warning is logged.
+The sandbox aborts by default; pass `--allow-degraded` to permit running
+with reduced isolation. A clear warning is logged.
 
 ### 3. Network Namespace
 
@@ -393,9 +415,11 @@ child's network namespace and provides user-mode TCP/IP:
 Whitelisted domains are pre-resolved to IP addresses at startup (from the
 parent, which still has host DNS access). These resolved IPs are passed to
 the USER_NOTIF supervisor, which intercepts `connect()` syscalls and validates
-the destination IP against the allowlist. A DNS proxy running inside the
-sandbox (on `10.0.2.3:53`) restricts name resolution to whitelisted domains,
-preventing DNS-based information exfiltration.
+the destination IP against the allowlist. A DNS proxy runs in the **parent
+process** on an ephemeral port, filtering DNS queries to only resolve
+whitelisted domains. The sandbox's `/etc/resolv.conf` is configured to use
+slirp4netns's `--dns` forwarding (on `10.0.2.3:53`), which routes queries
+to the parent's DNS proxy. This prevents DNS-based information exfiltration.
 
 **Full mode:** No `CLONE_NEWNET`. The sandbox shares the host network.
 
@@ -659,7 +683,12 @@ Cgroups v2 enforces resource limits (memory and CPU) without requiring root.
 It leverages systemd's per-user cgroup delegation, which is available on any
 modern system running systemd (Ubuntu 22.04+, Fedora 36+, etc.).
 
-**Setup sequence:**
+Resource limits are **opt-in** — none of the shipped base recipes include
+`[resources]`. Users add `memory_mb` and/or `cpu_percent` in their own
+recipes when needed.
+
+**Setup sequence** (happens before `pivot_root`, while `/sys/fs/cgroup` is
+still accessible):
 
 1. **Detect** the current cgroup by reading `/proc/self/cgroup`.
 2. **Create** a child cgroup at `<parent>/canister-<pid>`.
@@ -678,8 +707,9 @@ one CPU core.
 **Cleanup:** Child cgroups are removed when the sandboxed process exits (the
 kernel removes empty cgroups automatically).
 
-**Failure handling:** In normal mode, cgroup setup failure is non-fatal (a
-warning is logged). In strict mode, cgroup failure aborts the sandbox.
+**Failure handling:** Cgroup setup failure aborts the sandbox by default.
+Pass `--allow-degraded` to skip cgroup setup with a warning. In strict
+mode, cgroup failure always aborts.
 
 **Security property:** The sandboxed process cannot consume unbounded memory
 or CPU. The limits are enforced by the kernel's cgroup controller and cannot

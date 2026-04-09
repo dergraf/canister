@@ -36,15 +36,18 @@ discarded.
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via slirp4netns), or full
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~170 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
+- **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw/netlink), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
 - **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
 - **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS, all degradation is fatal
+- **Fail-by-default** -- sandbox aborts when isolation cannot be established; `--allow-degraded` flag opts into reduced isolation
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
+- **Recipe inspection** -- `can recipe show` emits the fully resolved policy as valid TOML for auditing or creating standalone recipes
 - **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
-- **Graceful degradation** -- detects AppArmor restrictions and falls back to reduced isolation with clear warnings
+- **Graceful degradation** -- detects AppArmor restrictions; aborts by default (`--allow-degraded` permits reduced isolation with clear warnings)
 - **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata, `[syscalls]` section for per-recipe baseline customization
 - **TTY-aware logging** -- colored human output on terminals, JSON lines when piped
 
@@ -110,6 +113,9 @@ can run -- rg --help                         # Cargo-installed ripgrep
 # Strict mode for CI -- all degradation is fatal, seccomp kills on violation
 can run --strict -r elixir -- mix test
 
+# Allow degraded mode -- permit reduced isolation when full isolation unavailable
+can run --allow-degraded -- echo "hello"
+
 # Monitor mode -- observe what would be blocked without enforcing
 can run --monitor -r elixir -- mix test
 
@@ -133,7 +139,7 @@ can init --repo myorg/canister-recipes --branch main
 ### Inspect seccomp baseline
 
 ```
-$ can recipes
+$ can recipe list
 Discovered recipes:
 
   elixir               Elixir/Erlang (BEAM VM) -- mix, iex, Phoenix
@@ -146,9 +152,20 @@ Default baseline: ~170 allowed, ~16 denied syscalls
   Customize per-recipe with [syscalls] allow_extra / deny_extra
 ```
 
+### Inspect resolved policy
+
+```bash
+# See the fully resolved policy after recipe merging
+can recipe show -r elixir
+
+# Save as a standalone recipe
+can recipe show -r nix -r elixir > my-custom.toml
+can run -r my-custom.toml -- mix test
+```
+
 ## How It Works
 
-Canister combines seven Linux isolation mechanisms:
+Canister combines eight Linux isolation mechanisms:
 
 ```
                           can run -- python3 script.py
@@ -177,7 +194,8 @@ Canister combines seven Linux isolation mechanisms:
 
 2. **Mount namespace + pivot_root** -- an ephemeral tmpfs becomes the new root.
    Essential system paths are defined in `recipes/base.toml` (embedded, overridable)
-   and bind-mounted read-only. For commands installed via Nix, Homebrew, Cargo, or
+   and bind-mounted read-only. The host's current working directory is always
+   bind-mounted writable. For commands installed via Nix, Homebrew, Cargo, or
    other package managers, the install prefix is auto-detected via `match_prefix`
    rules in recipe files and mounted automatically. The host filesystem is unmounted.
 
@@ -194,11 +212,19 @@ Canister combines seven Linux isolation mechanisms:
    The filter validates the CPU architecture (prevents x32 ABI bypass) and
    returns `EPERM` for unlisted syscalls (or `KILL_PROCESS` in strict mode).
 
-6. **Cgroups v2** -- memory and CPU limits are enforced via the cgroup
+6. **Seccomp USER_NOTIF supervisor** -- a parent-process supervisor thread
+   intercepts `connect()`, `clone()`/`clone3()`, `socket()`, `execve()`, and
+   `execveat()` syscalls via `SECCOMP_RET_USER_NOTIF`. It reads the actual
+   arguments from `/proc/<pid>/mem` and enforces IP allowlists, namespace
+   creation blocks, raw socket denial, and `allow_execve` path validation.
+   Auto-detected on Linux 5.9+.
+
+7. **Cgroups v2** -- memory and CPU limits are enforced via the cgroup
    filesystem. Canister creates a child cgroup under the user's systemd
    delegation and writes `memory.max` and `cpu.max`. No root required.
+   Resource limits are opt-in (not in shipped base recipes).
 
-7. **/proc hardening** -- sensitive paths under `/proc` are masked (bind-mount
+8. **/proc hardening** -- sensitive paths under `/proc` are masked (bind-mount
    `/dev/null` over files, empty tmpfs over directories) and `/proc/sys` is
    remounted read-only, matching Docker's default behavior.
 
@@ -320,6 +346,7 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 | Mount namespace | Filesystem view | Mount escape (blocked by seccomp) |
 | Network namespace | Network access | Namespace escape (blocked by seccomp) |
 | Seccomp BPF (allow-list) | Syscall access (default deny) | Filter bypass (architecture-validated) |
+| USER_NOTIF supervisor | connect() IPs, clone() flags, socket() types, execve() paths | Kernel exploit or TOCTOU race |
 | PID namespace | Process visibility | Namespace escape (blocked by seccomp) |
 | Cgroups v2 | Memory and CPU usage | Cgroup escape (requires root) |
 | /proc hardening | Sensitive kernel info | Remount (blocked by seccomp) |
@@ -343,12 +370,15 @@ not expected to carry kernel exploits.
 
 - Untrusted code reading/writing files outside the sandbox
 - Untrusted code accessing the network without authorization
+- Untrusted code connecting to unauthorized IPs (USER_NOTIF supervisor intercepts `connect()`)
 - Untrusted code calling dangerous syscalls (module loading, rebooting, etc.)
 - Untrusted code seeing or signaling host processes
 - Untrusted code consuming unbounded memory or CPU
 - Untrusted code leaking host environment variables (API keys, tokens)
+- Untrusted code executing unauthorized binaries (USER_NOTIF intercepts `execve()`/`execveat()`)
 - Fork bombs and resource exhaustion within the sandbox
 - x32 ABI syscall bypass attempts
+- Namespace escape via clone/clone3 flags (USER_NOTIF blocks namespace creation)
 
 **Out of scope (Canister does NOT defend against):**
 
@@ -356,14 +386,6 @@ not expected to carry kernel exploits.
   sandbox helps. Seccomp reduces attack surface but cannot eliminate it.
 - **Side-channel attacks.** Timing, cache, and speculative execution attacks
   are fundamentally out of scope for process-level sandboxing.
-- **IP-level network filtering.** Whitelisted domains are DNS-resolved at
-  startup, but connect() calls are not yet filtered by IP. A sandboxed
-  process in "filtered" network mode can connect to any IP reachable via
-  slirp4netns. IP-level enforcement requires `SECCOMP_RET_USER_NOTIF`
-  (planned).
-- **Ongoing execve enforcement.** `allow_execve` validates the initial
-  command, but child processes inside the sandbox can exec arbitrary visible
-  binaries. Full enforcement requires `SECCOMP_RET_USER_NOTIF` (planned).
 - **Monitor mode poisoning.** Monitor mode (`--monitor`) provides no security.
   A malicious process aware it's being monitored can behave differently.
   Always validate policies with enforcement enabled before trusting them.
