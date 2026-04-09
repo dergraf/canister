@@ -77,9 +77,3 @@ env_passthrough = [
     "PHX_SERVER",
     "PORT",
 ]
-
-[resources]
-# Memory limit in MB (enforced via cgroups v2).
-memory_mb = 1024
-# CPU limit as percentage of one core (enforced via cgroups v2).
-cpu_percent = 100

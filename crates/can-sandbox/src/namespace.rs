@@ -191,6 +191,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                             allowed_ips = policy.allowed_ips.len(),
                             allowed_cidrs = policy.allowed_cidrs.len(),
                             allowed_exec_paths = policy.allowed_exec_paths.len(),
+                            allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
                             "starting seccomp supervisor"
                         );
                         match notifier::start_supervisor(notifier_fd, policy) {
@@ -440,6 +441,52 @@ fn child_entry(
 
     // From here on, we are PID 1 in the new PID namespace.
 
+    // Capture the host CWD before pivot_root changes the root filesystem.
+    // After pivot_root the original CWD path becomes inaccessible.
+    let host_cwd = std::env::current_dir().ok();
+    if let Some(ref cwd) = host_cwd {
+        tracing::debug!(cwd = %cwd.display(), "captured host CWD for sandbox mount");
+    }
+
+    // Apply cgroup v2 resource limits (memory, CPU).
+    // Must happen BEFORE pivot_root — after pivot_root, /sys/fs/cgroup is
+    // no longer the host's cgroupfs and cgroup.controllers won't be found.
+    let has_cgroup_limits =
+        config.resources.memory_mb.is_some() || config.resources.cpu_percent.is_some();
+    if has_cgroup_limits {
+        if monitor {
+            tracing::warn!(
+                memory_mb = ?config.resources.memory_mb,
+                cpu_percent = ?config.resources.cpu_percent,
+                "MONITOR: would enforce cgroup resource limits, skipping"
+            );
+        } else {
+            match cgroups::apply_limits(config.resources.memory_mb, config.resources.cpu_percent) {
+                Ok(Some(path)) => {
+                    tracing::info!(path = %path.display(), "cgroup resource limits applied");
+                }
+                Ok(None) => {} // no limits configured
+                Err(e) if strict => {
+                    tracing::error!(error = %e, "STRICT: cgroup resource limits failed");
+                    return Err(NamespaceError::Cgroup(e));
+                }
+                Err(e) if allow_degraded => {
+                    tracing::warn!(
+                        error = %e,
+                        "cgroup resource limits unavailable — running without memory/CPU limits (--allow-degraded)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "cgroup resource limits failed (use --allow-degraded to continue without them)"
+                    );
+                    return Err(NamespaceError::Cgroup(e));
+                }
+            }
+        }
+    }
+
     // Set up isolated filesystem with bind mounts and pivot_root.
     // All necessary paths (essential OS mounts, auto-detected package manager
     // prefixes, and user-specified paths) are pre-merged into config.filesystem
@@ -447,7 +494,7 @@ fn child_entry(
     // By default, failures are fatal. Only with --allow-degraded does the sandbox
     // fall back to degraded mode (host filesystem) if AppArmor blocks mount ops.
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
-    let fs_isolated = overlay::try_setup_filesystem(&config.filesystem)?;
+    let fs_isolated = overlay::try_setup_filesystem(&config.filesystem, host_cwd.as_deref())?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
     } else if allow_degraded {
@@ -517,43 +564,6 @@ fn child_entry(
             );
         } else {
             process::set_max_pids(max_pids)?;
-        }
-    }
-
-    // Apply cgroup v2 resource limits (memory, CPU).
-    let has_cgroup_limits =
-        config.resources.memory_mb.is_some() || config.resources.cpu_percent.is_some();
-    if has_cgroup_limits {
-        if monitor {
-            tracing::warn!(
-                memory_mb = ?config.resources.memory_mb,
-                cpu_percent = ?config.resources.cpu_percent,
-                "MONITOR: would enforce cgroup resource limits, skipping"
-            );
-        } else {
-            match cgroups::apply_limits(config.resources.memory_mb, config.resources.cpu_percent) {
-                Ok(Some(path)) => {
-                    tracing::info!(path = %path.display(), "cgroup resource limits applied");
-                }
-                Ok(None) => {} // no limits configured
-                Err(e) if strict => {
-                    tracing::error!(error = %e, "STRICT: cgroup resource limits failed");
-                    return Err(NamespaceError::Cgroup(e));
-                }
-                Err(e) if allow_degraded => {
-                    tracing::warn!(
-                        error = %e,
-                        "cgroup resource limits unavailable — running without memory/CPU limits (--allow-degraded)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "cgroup resource limits failed (use --allow-degraded to continue without them)"
-                    );
-                    return Err(NamespaceError::Cgroup(e));
-                }
-            }
         }
     }
 

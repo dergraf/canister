@@ -41,7 +41,3 @@ deny_all = true
 [process]
 max_pids = 64
 env_passthrough = ["PATH", "LANG", "TERM"]
-
-[resources]
-memory_mb = 512
-cpu_percent = 50

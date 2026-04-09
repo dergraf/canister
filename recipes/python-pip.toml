@@ -47,7 +47,3 @@ env_passthrough = [
     "PIP_TRUSTED_HOST",
     "VIRTUAL_ENV",
 ]
-
-[resources]
-memory_mb = 512
-cpu_percent = 50

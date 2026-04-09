@@ -80,9 +80,17 @@ const SKELETON_DIRS: &[&str] = &[
 /// prefixes, and user-specified paths) are expected to be already merged
 /// into `config.allow` via recipe composition.
 ///
+/// If `host_cwd` is `Some`, the host's current working directory is
+/// bind-mounted writable into the sandbox at the same path, and after
+/// pivot_root the process chdir's into it. This allows sandboxed commands
+/// to read/write the project directory.
+///
 /// Returns `true` if full isolation was applied, `false` if running in degraded mode.
-pub fn try_setup_filesystem(config: &FilesystemConfig) -> Result<bool, OverlayError> {
-    match setup_filesystem(config) {
+pub fn try_setup_filesystem(
+    config: &FilesystemConfig,
+    host_cwd: Option<&Path>,
+) -> Result<bool, OverlayError> {
+    match setup_filesystem(config, host_cwd) {
         Ok(()) => Ok(true),
         Err(OverlayError::Mount { ref path, source }) if is_permission_error(source) => {
             tracing::error!(
@@ -109,9 +117,14 @@ fn is_permission_error(err: nix::Error) -> bool {
 ///
 /// Creates a tmpfs root, bind-mounts whitelisted paths (which now include
 /// essential OS paths from base.toml), mounts /proc, and does pivot_root.
+/// If `host_cwd` is provided, it is bind-mounted writable into the sandbox
+/// and the process chdir's there after pivot_root.
 ///
 /// Returns `Err` if mount operations are blocked (e.g., by AppArmor).
-pub fn setup_filesystem(config: &FilesystemConfig) -> Result<(), OverlayError> {
+pub fn setup_filesystem(
+    config: &FilesystemConfig,
+    host_cwd: Option<&Path>,
+) -> Result<(), OverlayError> {
     let sandbox_root = PathBuf::from("/tmp/canister-root");
 
     // 0. Break mount propagation. First make slave (allowed from shared),
@@ -148,6 +161,23 @@ pub fn setup_filesystem(config: &FilesystemConfig) -> Result<(), OverlayError> {
     let sandbox_tmp = sandbox_root.join("tmp");
     mount_tmpfs(&sandbox_tmp)?;
 
+    // 5b. Bind-mount the host CWD writable so the sandboxed process
+    //     can read and write project files (e.g., `mix new`, `cargo build`).
+    if let Some(cwd) = host_cwd {
+        let rel = cwd.strip_prefix("/").unwrap_or(cwd);
+        let target = sandbox_root.join(rel);
+        if let Some(parent) = target.parent() {
+            mkdir_p(parent)?;
+        }
+        mkdir_p(&target)?;
+        bind_mount_rw(cwd, &target)?;
+        tracing::info!(
+            source = %cwd.display(),
+            target = %target.display(),
+            "CWD bind-mounted writable"
+        );
+    }
+
     // 6. Mount a fresh /proc for PID namespace.
     mount_proc(&sandbox_root)?;
 
@@ -156,6 +186,12 @@ pub fn setup_filesystem(config: &FilesystemConfig) -> Result<(), OverlayError> {
 
     // 8. Pivot root: make sandbox_root the new /.
     do_pivot_root(&sandbox_root)?;
+
+    // 9. chdir to the CWD inside the sandbox (or / if no CWD).
+    if let Some(cwd) = host_cwd {
+        nix::unistd::chdir(cwd).map_err(OverlayError::Chdir)?;
+        tracing::debug!(cwd = %cwd.display(), "chdir to CWD in sandbox");
+    }
 
     tracing::debug!("filesystem isolation complete");
     Ok(())
@@ -452,6 +488,41 @@ fn bind_mount_ro(source: &Path, target: &Path) -> Result<(), OverlayError> {
     )
     .map_err(|source_err| OverlayError::Mount {
         path: format!("{} (remount ro)", target.display()),
+        source: source_err,
+    })?;
+
+    Ok(())
+}
+
+/// Create a writable bind mount.
+///
+/// Like `bind_mount_ro`, but does not remount as read-only.
+/// Used for the CWD so the sandboxed process can write project files.
+/// Still applies MS_NOSUID and MS_NODEV for safety.
+fn bind_mount_rw(source: &Path, target: &Path) -> Result<(), OverlayError> {
+    mount(
+        Some(source),
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|source_err| OverlayError::Mount {
+        path: format!("{} -> {} (rw)", source.display(), target.display()),
+        source: source_err,
+    })?;
+
+    // Remount with nosuid/nodev but keep writable.
+    let source_flags = read_mount_flags(target);
+    mount(
+        None::<&str>,
+        target,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | source_flags,
+        None::<&str>,
+    )
+    .map_err(|source_err| OverlayError::Mount {
+        path: format!("{} (remount rw+nosuid+nodev)", target.display()),
         source: source_err,
     })?;
 

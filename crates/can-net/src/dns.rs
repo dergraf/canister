@@ -1,9 +1,10 @@
 //! Minimal DNS proxy with domain-based filtering.
 //!
-//! Runs inside the sandbox's network namespace, listening on 127.0.0.1:53.
-//! Queries for whitelisted domains are forwarded to the upstream DNS server
-//! (via slirp4netns gateway). Queries for non-whitelisted domains get a
-//! REFUSED response.
+//! Runs in the parent process on the host, listening on an ephemeral port
+//! on 127.0.0.1. slirp4netns forwards DNS queries from the sandbox
+//! (10.0.2.3:53) to this proxy via its `--dns` flag. Queries for
+//! whitelisted domains are forwarded to the upstream DNS server.
+//! Queries for non-whitelisted domains get a REFUSED response.
 //!
 //! # DNS packet format (simplified)
 //!
@@ -20,7 +21,7 @@
 //! +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
 //! ```
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -38,6 +39,30 @@ const DNS_MAX_SIZE: usize = 512;
 
 /// DNS RCODE: REFUSED (5).
 const RCODE_REFUSED: u8 = 5;
+
+/// Read the first `nameserver` entry from `/etc/resolv.conf`.
+///
+/// Returns `Some(addr:53)` on success, `None` if the file is missing,
+/// unreadable, or contains no `nameserver` lines. Only plain IP
+/// addresses are accepted (no scoped IPv6, no hostnames).
+fn read_host_nameserver() -> Option<SocketAddr> {
+    let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("nameserver") {
+            if let Some(addr_str) = parts.next() {
+                if let Ok(ip) = addr_str.parse::<IpAddr>() {
+                    return Some(SocketAddr::new(ip, 53));
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Handle to control the DNS proxy from the parent.
 pub struct DnsProxyHandle {
@@ -63,10 +88,12 @@ impl DnsProxyHandle {
 
 /// Configuration for the DNS proxy.
 pub struct DnsProxyConfig {
-    /// Address to bind the proxy to (inside the sandbox).
+    /// Address to bind the proxy to (on the host's loopback).
     pub listen_addr: SocketAddr,
 
     /// Upstream DNS server to forward allowed queries to.
+    /// In the parent process context, this is a real host DNS server
+    /// (e.g., from /etc/resolv.conf or a well-known resolver).
     pub upstream_addr: SocketAddr,
 
     /// Network policy for filtering.
@@ -74,12 +101,19 @@ pub struct DnsProxyConfig {
 }
 
 impl DnsProxyConfig {
-    /// Default config: listen on 127.0.0.1:53, upstream at 10.0.2.3:53
-    /// (slirp4netns default gateway DNS).
+    /// Default config: listen on 127.0.0.1:0 (OS-assigned ephemeral port),
+    /// upstream is the host's DNS resolver (from /etc/resolv.conf, or
+    /// 8.8.8.8 as fallback).
+    ///
+    /// The DNS proxy runs in the parent process. slirp4netns's `--dns`
+    /// flag forwards sandbox DNS queries (10.0.2.3:53) to this port on
+    /// the host's loopback. Port 0 lets the OS pick an available port
+    /// (port 53 is privileged and would require root).
     pub fn default_with_policy(policy: NetworkConfig) -> Self {
+        let upstream = read_host_nameserver().unwrap_or_else(|| "8.8.8.8:53".parse().unwrap());
         Self {
-            listen_addr: "127.0.0.1:53".parse().unwrap(),
-            upstream_addr: "10.0.2.3:53".parse().unwrap(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            upstream_addr: upstream,
             policy,
         }
     }

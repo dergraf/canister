@@ -86,14 +86,24 @@ fn bring_up_loopback_ioctl() -> Result<(), NetError> {
     Ok(())
 }
 
-/// Write the sandbox's resolv.conf to point at our DNS proxy.
+/// Write the sandbox's resolv.conf to point at our DNS server.
 ///
 /// When using slirp4netns, the sandbox gets its own /etc/resolv.conf
-/// pointing to the DNS proxy address (typically 10.0.2.3 or 127.0.0.1
-/// depending on setup).
+/// pointing to the DNS proxy address (typically 10.0.2.3).
+///
+/// After pivot_root, /etc/resolv.conf is a read-only bind mount from
+/// the host. We unmount it first (safe — we're in our own mount
+/// namespace), then write a fresh file on the underlying tmpfs.
 pub fn write_resolv_conf(dns_addr: &str) -> Result<(), NetError> {
+    let path = "/etc/resolv.conf";
+
+    // Remove the read-only bind mount from the host.
+    // MNT_DETACH handles the case where the file is in use.
+    // Ignore errors — the mount may not exist (e.g., degraded mode).
+    let _ = nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH);
+
     let content = format!("nameserver {dns_addr}\n");
-    let mut f = std::fs::File::create("/etc/resolv.conf").map_err(NetError::Io)?;
+    let mut f = std::fs::File::create(path).map_err(NetError::Io)?;
     f.write_all(content.as_bytes()).map_err(NetError::Io)?;
     tracing::debug!(dns = dns_addr, "wrote sandbox resolv.conf");
     Ok(())

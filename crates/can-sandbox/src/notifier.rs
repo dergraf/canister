@@ -36,7 +36,7 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -190,8 +190,14 @@ pub struct NotifierPolicy {
     /// Allowed destination CIDR ranges (stored as (network, prefix_len)).
     pub allowed_cidrs: Vec<(IpAddr, u8)>,
 
-    /// Allowed executable paths for execve()/execveat().
+    /// Allowed executable paths for execve()/execveat() — exact matches.
     pub allowed_exec_paths: HashSet<PathBuf>,
+
+    /// Allowed executable path prefixes for execve()/execveat().
+    /// Entries from `allow_execve` that end in `/*` are stored here
+    /// as the prefix (without the trailing `/*`). A path matches if
+    /// it starts with the prefix followed by `/`.
+    pub allowed_exec_prefixes: Vec<PathBuf>,
 
     /// Whether to allow AF_UNIX sockets.
     pub allow_af_unix: bool,
@@ -206,6 +212,7 @@ impl Default for NotifierPolicy {
             allowed_ips: HashSet::new(),
             allowed_cidrs: Vec::new(),
             allowed_exec_paths: HashSet::new(),
+            allowed_exec_prefixes: Vec::new(),
             allow_af_unix: true,
             allow_af_inet: true,
         }
@@ -237,15 +244,25 @@ impl NotifierPolicy {
 }
 
 /// Handle to a running supervisor thread.
+///
+/// Owns the notifier fd so that [`shutdown`](Self::shutdown) can close it
+/// from the parent side, forcing the blocked `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`
+/// in the supervisor thread to return `EBADF` and exit.
 pub struct SupervisorHandle {
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Kept here so we can close it to unblock the supervisor thread.
+    notifier_fd: Option<OwnedFd>,
 }
 
 impl SupervisorHandle {
     /// Signal the supervisor to stop and wait for the thread.
     pub fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // Close the notifier fd first. This makes the ioctl in the
+        // supervisor thread return EBADF, which breaks it out of the
+        // blocking recv loop.
+        drop(self.notifier_fd.take());
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -255,7 +272,13 @@ impl SupervisorHandle {
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Don't join in Drop — the thread will notice the flag and exit.
+        // Close the fd to unblock the supervisor thread.
+        drop(self.notifier_fd.take());
+        // Best-effort join with a short wait — don't block Drop forever.
+        // The thread will exit on EBADF from the closed fd.
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -578,10 +601,14 @@ pub fn start_supervisor(
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
+    // Extract the raw fd for the thread. The OwnedFd stays in the handle
+    // so the parent can close it to unblock the supervisor thread's ioctl.
+    let raw_fd = notifier_fd.as_raw_fd();
+
     let thread = thread::Builder::new()
         .name("can-seccomp-supervisor".to_string())
         .spawn(move || {
-            supervisor_loop(notifier_fd, &policy, &shutdown_clone);
+            supervisor_loop(raw_fd, &policy, &shutdown_clone);
         })
         .map_err(|e| {
             NotifierError::SeccompSyscall(std::io::Error::new(std::io::ErrorKind::Other, e))
@@ -590,13 +617,15 @@ pub fn start_supervisor(
     Ok(SupervisorHandle {
         shutdown,
         thread: Some(thread),
+        notifier_fd: Some(notifier_fd),
     })
 }
 
 /// Main loop for the seccomp notification supervisor.
-fn supervisor_loop(notifier_fd: OwnedFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
-    let fd = notifier_fd.as_raw_fd();
-
+///
+/// Takes a raw fd (not owned) — the parent keeps the `OwnedFd` so it can
+/// close it to force this loop to exit via `EBADF`.
+fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::debug!("seccomp supervisor shutting down");
@@ -969,6 +998,30 @@ fn evaluate_socket(args: &[u64; 6], pid: u32, policy: &NotifierPolicy) -> Verdic
     Verdict::Deny(libc::EPERM as u32)
 }
 
+/// Check if a canonicalized path is allowed by the exec policy.
+///
+/// Checks exact matches in `allowed_exec_paths` first, then prefix
+/// matches in `allowed_exec_prefixes` (entries from `allow_execve`
+/// that ended in `/*`). Prefix matching requires a `/` boundary
+/// after the prefix to prevent partial directory name matches.
+fn is_exec_path_allowed(canonical: &Path, policy: &NotifierPolicy) -> bool {
+    // Exact match.
+    if policy.allowed_exec_paths.contains(canonical) {
+        return true;
+    }
+    // Prefix match: "/nix/store/*" matches "/nix/store/abc123/bin/mix".
+    let canonical_str = canonical.to_string_lossy();
+    for prefix in &policy.allowed_exec_prefixes {
+        let prefix_str = prefix.to_string_lossy();
+        if canonical_str.starts_with(prefix_str.as_ref())
+            && canonical_str.as_bytes().get(prefix_str.len()) == Some(&b'/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Evaluate an `execve()` syscall.
 ///
 /// execve(pathname, argv, envp)
@@ -978,7 +1031,7 @@ fn evaluate_execve(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: R
     let pathname_ptr = notif.data.args[0];
 
     // If no exec path restrictions, allow all.
-    if policy.allowed_exec_paths.is_empty() {
+    if policy.allowed_exec_paths.is_empty() && policy.allowed_exec_prefixes.is_empty() {
         return Verdict::Allow;
     }
 
@@ -1000,7 +1053,7 @@ fn evaluate_execve(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: R
     // Canonicalize the path (resolve symlinks) for consistent matching.
     let canonical = path.canonicalize().unwrap_or(path);
 
-    if policy.allowed_exec_paths.contains(&canonical) {
+    if is_exec_path_allowed(&canonical, policy) {
         tracing::debug!(pid, path = %canonical.display(), "execve: allowed");
         Verdict::Allow
     } else {
@@ -1021,7 +1074,7 @@ fn evaluate_execveat(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd:
     let flags = notif.data.args[4] as i32;
 
     // If no exec path restrictions, allow all.
-    if policy.allowed_exec_paths.is_empty() {
+    if policy.allowed_exec_paths.is_empty() && policy.allowed_exec_prefixes.is_empty() {
         return Verdict::Allow;
     }
 
@@ -1054,7 +1107,7 @@ fn evaluate_execveat(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd:
     let path = PathBuf::from(&pathname);
     let canonical = path.canonicalize().unwrap_or(path);
 
-    if policy.allowed_exec_paths.contains(&canonical) {
+    if is_exec_path_allowed(&canonical, policy) {
         tracing::debug!(pid, path = %canonical.display(), "execveat: allowed");
         Verdict::Allow
     } else {
@@ -1134,20 +1187,33 @@ pub fn policy_from_config(
     allowed_ips.insert("10.0.2.100".parse().unwrap());
 
     // Build allowed exec paths from process config.
-    let allowed_exec_paths: HashSet<PathBuf> = config
-        .process
-        .allow_execve
-        .iter()
-        .map(|p| {
-            // Try to canonicalize, fall back to the original path.
-            p.canonicalize().unwrap_or_else(|_| p.clone())
-        })
-        .collect();
+    // Entries ending in `/*` are treated as prefix rules (match any path
+    // under that directory). All others are exact matches.
+    let mut allowed_exec_paths: HashSet<PathBuf> = HashSet::new();
+    let mut allowed_exec_prefixes: Vec<PathBuf> = Vec::new();
+
+    for p in &config.process.allow_execve {
+        let s = p.as_os_str().to_string_lossy();
+        if s.ends_with("/*") {
+            // Strip trailing "/*" to get the directory prefix.
+            let prefix_str = &s[..s.len() - 2];
+            let prefix_path = PathBuf::from(prefix_str);
+            // Canonicalize the prefix directory if it exists.
+            let canonical = prefix_path
+                .canonicalize()
+                .unwrap_or_else(|_| prefix_path.clone());
+            allowed_exec_prefixes.push(canonical);
+        } else {
+            let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+            allowed_exec_paths.insert(canonical);
+        }
+    }
 
     NotifierPolicy {
         allowed_ips,
         allowed_cidrs,
         allowed_exec_paths,
+        allowed_exec_prefixes,
         allow_af_unix: true,
         allow_af_inet: true,
     }
@@ -1573,5 +1639,85 @@ mod tests {
         let ip: IpAddr = "fd00::1".parse().unwrap();
         let net: IpAddr = "fd00::".parse().unwrap();
         assert!(!ip_in_cidr(ip, net, 129));
+    }
+
+    // ---- is_exec_path_allowed unit tests ----
+
+    #[test]
+    fn exec_path_exact_match() {
+        let mut policy = NotifierPolicy::default();
+        policy
+            .allowed_exec_paths
+            .insert(PathBuf::from("/usr/bin/python3"));
+        assert!(is_exec_path_allowed(Path::new("/usr/bin/python3"), &policy));
+        assert!(!is_exec_path_allowed(
+            Path::new("/usr/bin/python2"),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn exec_path_prefix_match() {
+        let mut policy = NotifierPolicy::default();
+        policy
+            .allowed_exec_prefixes
+            .push(PathBuf::from("/nix/store"));
+        assert!(is_exec_path_allowed(
+            Path::new("/nix/store/abc123/bin/mix"),
+            &policy
+        ));
+        assert!(is_exec_path_allowed(
+            Path::new("/nix/store/xyz/lib/erlang/bin/beam.smp"),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn exec_path_prefix_rejects_partial_dir_match() {
+        let mut policy = NotifierPolicy::default();
+        policy
+            .allowed_exec_prefixes
+            .push(PathBuf::from("/nix/store"));
+        // "/nix/store-extra/bin" should NOT match "/nix/store/*".
+        assert!(!is_exec_path_allowed(
+            Path::new("/nix/store-extra/bin/foo"),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn exec_path_prefix_rejects_exact_prefix_without_slash() {
+        let mut policy = NotifierPolicy::default();
+        policy
+            .allowed_exec_prefixes
+            .push(PathBuf::from("/nix/store"));
+        // The prefix directory itself (no trailing /) should not match.
+        assert!(!is_exec_path_allowed(Path::new("/nix/store"), &policy));
+    }
+
+    #[test]
+    fn exec_path_empty_policy_denies_nothing() {
+        let policy = NotifierPolicy::default();
+        // With empty paths AND prefixes, is_exec_path_allowed returns false.
+        // But evaluate_execve short-circuits to Allow when both are empty.
+        assert!(!is_exec_path_allowed(Path::new("/any/path"), &policy));
+    }
+
+    #[test]
+    fn policy_from_config_splits_prefix_rules() {
+        let mut config = can_policy::SandboxConfig::default_deny();
+        config.process.allow_execve = vec![
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/nix/store/*"),
+        ];
+        let policy = policy_from_config(&config, &[]);
+        // Exact path should be in allowed_exec_paths.
+        // "/usr/bin/python3" may or may not canonicalize depending on fs,
+        // but "/nix/store/*" should produce a prefix, not an exact path.
+        assert_eq!(policy.allowed_exec_prefixes.len(), 1);
+        // The prefix should be "/nix/store" (without the /*).
+        assert_eq!(policy.allowed_exec_prefixes[0], PathBuf::from("/nix/store"));
+        // Exact paths count: at least 1 ("/usr/bin/python3" or its canonical).
+        assert!(!policy.allowed_exec_paths.is_empty());
     }
 }

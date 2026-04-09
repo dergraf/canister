@@ -33,11 +33,11 @@ allow_execve = ["/usr/bin/python3"]
 # Environment variables passed through from host.
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
-[resources]
-# Memory limit in MB (enforced via cgroups v2).
-memory_mb = 512
-# CPU limit as percentage of one core (enforced via cgroups v2).
-cpu_percent = 50
+# [resources] section — cgroup v2 resource limits (optional).
+# Requires cgroups v2 on the host. Uncomment to enable:
+# [resources]
+# memory_mb = 512
+# cpu_percent = 50
 
 # [syscalls] section — customize the default seccomp baseline.
 # Uncomment to add or remove specific syscalls:
