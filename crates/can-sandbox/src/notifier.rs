@@ -623,12 +623,45 @@ pub fn start_supervisor(
 
 /// Main loop for the seccomp notification supervisor.
 ///
-/// Takes a raw fd (not owned) — the parent keeps the `OwnedFd` so it can
-/// close it to force this loop to exit via `EBADF`.
+/// Uses `poll()` with a short timeout before each blocking `ioctl()` so
+/// the thread can check the shutdown flag periodically. Closing the
+/// notifier fd alone does NOT reliably wake a blocked `ioctl()` on
+/// Linux — the kernel holds an internal reference, so the thread would
+/// hang indefinitely without the poll-based approach.
 fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::debug!("seccomp supervisor shutting down");
+            break;
+        }
+
+        // Wait for the notifier fd to become readable (i.e., a notification
+        // is pending) with a 200ms timeout. This lets us check the shutdown
+        // flag periodically without busy-spinning.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if poll_ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            tracing::error!(error = %err, "poll on notifier fd failed");
+            break;
+        }
+        if poll_ret == 0 {
+            // Timeout — loop back and check shutdown flag.
+            continue;
+        }
+        // POLLHUP/POLLERR/POLLNVAL means the fd is gone.
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            tracing::debug!(
+                revents = pfd.revents,
+                "notifier fd closed/error, stopping supervisor"
+            );
             break;
         }
 
