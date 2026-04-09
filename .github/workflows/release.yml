@@ -13,20 +13,8 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
+    name: Build
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            cross: false
-          - target: x86_64-unknown-linux-musl
-            cross: true
-          - target: aarch64-unknown-linux-gnu
-            cross: true
-          - target: aarch64-unknown-linux-musl
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -35,9 +23,7 @@ jobs:
         run: curl https://mise.run | sh
 
       - name: Setup toolchain
-        run: |
-          mise install
-          rustup target add ${{ matrix.target }}
+        run: mise install
 
       - uses: actions/cache@v4
         with:
@@ -45,35 +31,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-${{ matrix.target }}-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+          key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-
 
       - name: Build
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} --package can-cli
-          else
-            cargo build --release --target ${{ matrix.target }} --package can-cli
-          fi
+        run: cargo build --release --package can-cli
 
       - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../canister-${{ matrix.target }}.tar.gz can
-          cd ../../..
-          sha256sum canister-${{ matrix.target }}.tar.gz > canister-${{ matrix.target }}.tar.gz.sha256
+          cd target/release
+          tar czf ../../canister-x86_64-unknown-linux-gnu.tar.gz can
+          cd ../..
+          sha256sum canister-x86_64-unknown-linux-gnu.tar.gz > canister-x86_64-unknown-linux-gnu.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: canister-${{ matrix.target }}
+          name: canister-x86_64-unknown-linux-gnu
           path: |
-            canister-${{ matrix.target }}.tar.gz
-            canister-${{ matrix.target }}.tar.gz.sha256
+            canister-x86_64-unknown-linux-gnu.tar.gz
+            canister-x86_64-unknown-linux-gnu.tar.gz.sha256
 
   release:
     name: Create Release
