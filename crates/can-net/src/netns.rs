@@ -99,7 +99,7 @@ pub fn write_resolv_conf(dns_addr: &str) -> Result<(), NetError> {
 
     // Remove the read-only bind mount from the host.
     // MNT_DETACH handles the case where the file is in use.
-    // Ignore errors — the mount may not exist (e.g., degraded mode).
+    // Ignore errors — the mount may not exist (e.g., minimal namespace setup).
     let _ = nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH);
 
     let content = format!("nameserver {dns_addr}\n");

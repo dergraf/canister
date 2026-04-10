@@ -247,7 +247,7 @@ only sees the raw pointer value, not the data it points to.
 Canister uses `SECCOMP_RET_USER_NOTIF` (Linux 5.9+) to bridge this gap. When the
 child invokes a syscall that requires argument inspection, the kernel suspends the
 calling thread and delivers a notification to a supervisor thread running in the
-parent process. The supervisor reads the actual argument data (from `/proc/<pid>/mem`),
+parent process. The supervisor reads the actual argument data (via `/proc/<pid>/mem`),
 makes a policy decision, and sends an ALLOW or DENY verdict back to the kernel.
 
 ### How it works
@@ -255,23 +255,32 @@ makes a policy decision, and sends an ALLOW or DENY verdict back to the kernel.
 ```
   Child (sandboxed)                    Parent (supervisor)
   ──────────────────                   ────────────────────
-  1. seccomp(SET_MODE_FILTER,          4. Receive notifier fd via
-     NEW_LISTENER, &bpf_prog)             Unix socket (SCM_RIGHTS)
-     → returns notifier fd
-  2. Send notifier fd to parent        5. Spawn supervisor thread
-     via Unix socket (SCM_RIGHTS)
-  3. Install main BPF filter           6. Loop:
-     (prctl PR_SET_SECCOMP)               a. ioctl(NOTIF_RECV) → read notification
-  ... execve() target command ...         b. Read /proc/<pid>/mem for arguments
-                                          c. Evaluate against policy
+  1. PR_SET_PTRACER(parent_pid)        5. Receive notifier fd
+  2. seccomp(SET_MODE_FILTER,              via Unix socket (SCM_RIGHTS)
+     NEW_LISTENER, &bpf_prog)
+     → returns notifier fd             6. Spawn supervisor thread
+  3. Send notifier fd to parent
+     via SCM_RIGHTS                    7. Loop:
+  4. Install main BPF filter              a. ioctl(NOTIF_RECV) → read notification
+     (prctl PR_SET_SECCOMP)               b. open(/proc/<pid>/mem) + read
+  ... execve() target command ...         c. Evaluate against policy
                                           d. ioctl(NOTIF_ID_VALID) → TOCTOU check
                                           e. ioctl(NOTIF_SEND) → verdict
 ```
 
-The notifier filter is installed **before** the main seccomp filter. The child
-sends the notification fd to the parent via an anonymous Unix socket pair created
-before `fork()`, using `SCM_RIGHTS` ancillary data. After the parent receives the
-fd, it spawns a dedicated supervisor thread that blocks on `ioctl(NOTIF_RECV)`.
+The child calls `prctl(PR_SET_PTRACER, parent_pid)` **before** installing the
+notifier filter. This grants the parent (supervisor) Yama ptrace access, allowing
+it to open `/proc/<pid>/mem` for any process that inherits the seccomp filter —
+including forked children (e.g., BEAM VM spawning child processes). The
+`PR_SET_PTRACER` setting is inherited across `fork()`.
+
+Without `PR_SET_PTRACER`, the kernel's `ptrace_may_access()` check blocks
+`/proc/<pid>/mem` opens across the user namespace boundary when `PR_SET_NO_NEW_PRIVS`
+and `yama.ptrace_scope=1` are in effect.
+
+After the notifier filter is installed, the child sends the notifier fd to the parent
+via `SCM_RIGHTS` over an anonymous Unix socket pair created before `fork()`. The
+parent spawns a dedicated supervisor thread that blocks on `ioctl(NOTIF_RECV)`.
 
 ### Two-filter architecture
 
@@ -308,7 +317,7 @@ could modify the memory that the supervisor reads between the read and the
 verdict. Canister mitigates this with `SECCOMP_IOCTL_NOTIF_ID_VALID`:
 
 1. Read notification (gets syscall args and a unique notification ID).
-2. Read memory from `/proc/<pid>/mem` for pointer-based arguments.
+2. Read memory via `/proc/<pid>/mem` for pointer-based arguments.
 3. Evaluate policy.
 4. Call `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID, &id)` — if the kernel returns
    an error (`ENOENT`), the syscall was interrupted (the thread exited or
@@ -366,8 +375,10 @@ major.minor version.
   and `SECCOMP_IOCTL_NOTIF_ID_VALID`.
 - **`PR_SET_NO_NEW_PRIVS`** must be set before installing the filter (already done
   by both the notifier and main filter installation paths).
-- **`/proc/<pid>/mem`** must be readable by the parent (always true since the parent
-  has the same UID as the child).
+- **`PR_SET_PTRACER`** — the child calls `prctl(PR_SET_PTRACER, parent_pid)` before
+  seccomp installation to grant the supervisor Yama ptrace access for
+  `/proc/<pid>/mem` reads. This is inherited across `fork()`, so forked children
+  are also covered.
 
 ---
 
@@ -403,7 +414,6 @@ expansion), use `can recipe show`:
 ```
 $ can recipe show -r elixir
 strict = false
-allow_degraded = false
 
 [filesystem]
 allow = ["/bin", "/sbin", ...]

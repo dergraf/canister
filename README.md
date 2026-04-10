@@ -42,13 +42,13 @@ discarded.
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
 - **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
-- **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS, all degradation is fatal
-- **Fail-by-default** -- sandbox aborts when isolation cannot be established; `--allow-degraded` flag opts into reduced isolation
+- **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS instead of EPERM
+- **Fail-by-default** -- sandbox aborts when isolation cannot be established; all setup failures are fatal
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
 - **Recipe inspection** -- `can recipe show` emits the fully resolved policy as valid TOML for auditing or creating standalone recipes
 - **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
-- **Graceful degradation** -- detects AppArmor restrictions; aborts by default (`--allow-degraded` permits reduced isolation with clear warnings)
+- **AppArmor detection** -- detects AppArmor restrictions on mount operations and aborts with a clear error message and instructions
 - **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata, `[syscalls]` section for per-recipe baseline customization
 - **TTY-aware logging** -- colored human output on terminals, JSON lines when piped
 
@@ -128,11 +128,8 @@ can run -r cargo -r generic-strict -- cargo build
 can run -- iex -e 'IO.puts("hello")'        # Nix-installed Elixir
 can run -- rg --help                         # Cargo-installed ripgrep
 
-# Strict mode for CI -- all degradation is fatal, seccomp kills on violation
+# Strict mode for CI -- seccomp kills on violation instead of EPERM
 can run --strict -r elixir -- mix test
-
-# Allow degraded mode -- permit reduced isolation when full isolation unavailable
-can run --allow-degraded -- echo "hello"
 
 # Monitor mode -- observe what would be blocked without enforcing
 can run --monitor -r elixir -- mix test
@@ -408,16 +405,15 @@ not expected to carry kernel exploits.
   A malicious process aware it's being monitored can behave differently.
   Always validate policies with enforcement enabled before trusting them.
 
-**Strict mode** (`--strict`) is recommended for CI and production. It
-converts all graceful degradation into hard failures and uses
-`SECCOMP_RET_KILL_PROCESS` instead of `SECCOMP_RET_ERRNO`, ensuring the
-sandbox either runs at full strength or doesn't run at all.
+**Strict mode** (`--strict`) is recommended for CI and production. It uses
+`SECCOMP_RET_KILL_PROCESS` instead of `SECCOMP_RET_ERRNO`, ensuring
+immediate process termination on any denied syscall rather than returning
+an error code the process could handle.
 
 ## AppArmor (Ubuntu 24.04+)
 
 Ubuntu 24.04+ restricts mount operations inside unprivileged user namespaces
-via AppArmor. Canister detects this and falls back to degraded mode (no
-filesystem isolation, with clear warnings).
+via AppArmor. Canister detects this and aborts with a clear error message.
 
 To enable full isolation, install the override profile:
 

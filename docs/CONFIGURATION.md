@@ -20,7 +20,6 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 - [resources](#resources)
 - [syscalls](#syscalls)
 - [Strict Mode](#strict-mode)
-- [Allow Degraded Mode](#allow-degraded-mode)
 - [Monitor Mode](#monitor-mode)
 - [Inspecting the Resolved Policy](#inspecting-the-resolved-policy)
 - [Examples](#examples)
@@ -164,8 +163,8 @@ paths and essential system paths are bind-mounted read-only.
   appropriate package manager recipe via `match_prefix` and merges it into the
   recipe chain, bringing the necessary mount paths automatically. See
   [Auto-Detection via match_prefix](#auto-detection-via-match_prefix).
-- When filesystem isolation is degraded (AppArmor blocks mounts), these
-  settings have no effect -- the process sees the full host filesystem.
+- When filesystem isolation is blocked (AppArmor blocks mounts), the
+  sandbox aborts. Run `sudo can setup` to install the AppArmor profile.
 
 ```toml
 [filesystem]
@@ -362,9 +361,8 @@ moves the sandboxed process into it. No root required.
   period), capping the process to 50% of one CPU core.
 
 **Failure behavior:** If cgroup setup fails (e.g., no cgroup v2, no
-delegation), the sandbox aborts by default. Pass `--allow-degraded` to
-skip cgroup setup with a warning. In strict mode (`--strict`), cgroup
-failure always aborts.
+delegation), the sandbox aborts. In strict mode (`--strict`), seccomp
+uses KILL_PROCESS for immediate termination on any denied syscall.
 
 ```toml
 [resources]
@@ -478,8 +476,7 @@ description.
 ## Strict Mode
 
 Strict mode (`--strict` or `strict = true` in config) tightens all enforcement
-for CI and production use. Every point where normal mode gracefully degrades
-becomes a hard failure.
+for CI and production use.
 
 **Config:**
 
@@ -500,51 +497,19 @@ the CLI cannot override it to false.
 
 | Enforcement point | Normal mode | Strict mode |
 |-------------------|-------------|-------------|
-| Filesystem isolation | Falls back with warning | **Aborts** |
-| Network setup | Logs warning | **Aborts** |
-| Loopback bring-up | Skips with warning | **Aborts** |
+| Filesystem isolation | **Aborts** on failure | **Aborts** on failure |
+| Network setup | **Aborts** on failure | **Aborts** on failure |
+| Loopback bring-up | **Aborts** on failure | **Aborts** on failure |
 | Seccomp deny action | `EPERM` (process survives) | `KILL_PROCESS` (immediate termination) |
-| Cgroup setup | Logs warning | **Aborts** |
+| Cgroup setup | **Aborts** on failure | **Aborts** on failure |
+
+The key difference is the seccomp deny action: normal mode returns EPERM
+so the process can handle denials gracefully; strict mode kills the process
+immediately on any denied syscall.
 
 **Mutual exclusion:** `--strict` and `--monitor` cannot be used together.
 Strict mode ensures full enforcement; monitor mode relaxes it. These are
 contradictory intents.
-
----
-
-## Allow Degraded Mode
-
-By default, Canister **fails hard** when isolation cannot be established
-(e.g., AppArmor blocks mount operations, cgroup delegation unavailable).
-The `--allow-degraded` flag opts into reduced isolation instead of aborting.
-
-**Config:**
-
-```toml
-allow_degraded = true
-```
-
-**CLI:**
-
-```bash
-can run --allow-degraded -- echo "hello"
-```
-
-The CLI `--allow-degraded` flag is OR'd with the config value — if either
-is set, degraded mode is permitted.
-
-**Changes with `--allow-degraded`:**
-
-| Enforcement point | Default (fail-hard) | With `--allow-degraded` |
-|-------------------|---------------------|------------------------|
-| Filesystem isolation | **Aborts** if AppArmor blocks mounts | Falls back to host FS with warning |
-| Network setup | **Aborts** on failure | Logs warning, continues |
-| Loopback bring-up | **Aborts** on failure | Skips with warning |
-| Cgroup setup | **Aborts** on failure | Skips with warning |
-
-**Mutual exclusion:** `--allow-degraded` and `--strict` cannot be used
-together. Strict mode demands full enforcement; degraded mode accepts
-partial enforcement. These are contradictory intents.
 
 ---
 
@@ -607,7 +572,6 @@ The output is valid TOML and includes all resolved fields:
 
 ```toml
 strict = false
-allow_degraded = false
 
 [filesystem]
 allow = ["/bin", "/sbin", "/usr/bin", ...]

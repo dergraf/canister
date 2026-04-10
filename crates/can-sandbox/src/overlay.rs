@@ -85,7 +85,8 @@ const SKELETON_DIRS: &[&str] = &[
 /// pivot_root the process chdir's into it. This allows sandboxed commands
 /// to read/write the project directory.
 ///
-/// Returns `true` if full isolation was applied, `false` if running in degraded mode.
+/// Returns `true` if full isolation was applied, `false` if mount operations
+/// were blocked (e.g., by AppArmor). The caller must treat `false` as a fatal error.
 pub fn try_setup_filesystem(
     config: &FilesystemConfig,
     host_cwd: Option<&Path>,

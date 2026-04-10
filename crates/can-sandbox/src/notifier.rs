@@ -11,13 +11,25 @@
 //! ```text
 //!   Child (sandboxed)                    Parent (supervisor)
 //!   ──────────────────                   ────────────────────
-//!   1. Install USER_NOTIF filter         4. Receive notifier fd via SCM_RIGHTS
-//!      via seccomp() syscall             5. Spawn supervisor thread
-//!   2. Get notifier fd back              6. Loop: read notification
-//!   3. Send fd to parent via                    inspect arguments
-//!      Unix socket (SCM_RIGHTS)                 send ALLOW or DENY verdict
-//!   ... exec target command ...
+//!   1. PR_SET_PTRACER(parent_pid)        4. Receive notifier fd via SCM_RIGHTS
+//!   2. Install USER_NOTIF filter         5. Spawn supervisor thread
+//!      via seccomp() syscall             6. Loop: read notification
+//!   3. Send notifier fd to parent                inspect arguments via
+//!      via SCM_RIGHTS                            /proc/<pid>/mem (ptracer OK)
+//!   ... exec target command ...                  send ALLOW or DENY verdict
 //! ```
+//!
+//! # Memory access
+//!
+//! The supervisor reads the child's memory by opening `/proc/<pid>/mem` for
+//! the specific PID in each seccomp notification. This requires the child to
+//! call `prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp filters,
+//! which grants the parent Yama ptrace access. Without this, the kernel's
+//! `ptrace_may_access()` check would block `/proc/<pid>/mem` opens across the
+//! user namespace boundary when `PR_SET_NO_NEW_PRIVS` and `yama.ptrace_scope=1`
+//! are in effect. The `PR_SET_PTRACER` setting is inherited by forked children,
+//! so the supervisor can read memory from any process that inherits the seccomp
+//! filter.
 //!
 //! # Requirements
 //!
@@ -576,7 +588,7 @@ pub fn recv_fd(socket: &OwnedFd) -> Result<OwnedFd, NotifierError> {
         }
         let fd_ptr = libc::CMSG_DATA(cmsg) as *const i32;
         let fd = *fd_ptr;
-        tracing::debug!(fd, "received notifier fd via SCM_RIGHTS");
+        tracing::debug!(notifier_fd = fd, "received notifier fd via SCM_RIGHTS");
         Ok(OwnedFd::from_raw_fd(fd))
     }
 }
@@ -587,8 +599,13 @@ pub fn recv_fd(socket: &OwnedFd) -> Result<OwnedFd, NotifierError> {
 
 /// Start the supervisor thread that processes seccomp notifications.
 ///
-/// `notifier_fd` is the fd received from the child via SCM_RIGHTS.
+/// `notifier_fd` is the seccomp notification fd received from the child.
 /// `policy` defines what the supervisor should allow/deny.
+///
+/// The supervisor reads child memory by opening `/proc/<pid>/mem` for each
+/// notification. This requires the child to have called
+/// `prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp, which
+/// grants the parent Yama ptrace access across the user namespace boundary.
 ///
 /// Returns a handle that can be used to shut down the supervisor.
 pub fn start_supervisor(
@@ -624,6 +641,23 @@ pub fn start_supervisor(
 /// Linux — the kernel holds an internal reference, so the thread would
 /// hang indefinitely without the poll-based approach.
 fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
+    // --- Harden the supervisor thread (TCB) ---
+    //
+    // NOTE: We intentionally do NOT apply a seccomp filter to the supervisor
+    // thread. Installing seccomp requires PR_SET_NO_NEW_PRIVS, which changes
+    // the kernel's ptrace_may_access() check. The supervisor needs to open
+    // /proc/<pid>/mem at runtime for each notification (to read memory from
+    // any process that inherits the seccomp filter, including forked children).
+    // Applying PR_SET_NO_NEW_PRIVS to the supervisor would break this.
+    //
+    // The supervisor also needs broad syscall access: poll, ioctl, open, read,
+    // and potentially other calls for policy evaluation (canonicalize, etc.).
+    // A seccomp allowlist would be fragile and tightly coupled to libc internals.
+    //
+    // NOTE: PR_CAPBSET_DROP requires CAP_SETPCAP in the current effective set,
+    // which an unprivileged process does not have. The bounding set is already
+    // empty for unprivileged processes, so explicit dropping is a no-op.
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             tracing::debug!("seccomp supervisor shutting down");
@@ -758,8 +792,8 @@ fn evaluate_syscall(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
     } else if nr == libc::SYS_execveat {
         evaluate_execveat(notif, policy, notifier_fd)
     } else {
-        tracing::warn!(nr, pid, "unexpected syscall in notifier, allowing");
-        Verdict::Allow
+        tracing::warn!(nr, pid, "unexpected syscall in notifier, denying");
+        Verdict::Deny(libc::EPERM as u32)
     }
 }
 
@@ -787,14 +821,65 @@ fn is_notif_id_valid(notifier_fd: RawFd, id: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// /proc/<pid>/mem reading
+// Child memory reading (via /proc/<pid>/mem)
 // ---------------------------------------------------------------------------
 
-/// Read `len` bytes from `offset` in the target process's memory.
-fn read_proc_mem(pid: u32, offset: u64, len: usize) -> Result<Vec<u8>, NotifierError> {
-    let path = format!("/proc/{pid}/mem");
-    let mut file = std::fs::File::open(&path).map_err(NotifierError::ProcMem)?;
+/// Maximum bytes we'll read from a target process's memory in a single call.
+/// Largest legitimate read is a pathname (PATH_MAX = 4096).
+const MAX_PROC_MEM_READ: usize = 4096;
 
+/// Boundary above which userspace addresses are invalid on x86_64.
+/// Kernel virtual addresses start at 0xffff_8000_0000_0000.
+const KERNEL_ADDR_BOUNDARY: u64 = 0xffff_8000_0000_0000;
+
+/// Read `len` bytes from `offset` in a child process's memory.
+///
+/// Opens `/proc/<pid>/mem` for the specific PID on each call. This requires
+/// the child to have called `prctl(PR_SET_PTRACER, parent_pid)` before
+/// installing seccomp filters, granting the supervisor Yama ptrace access.
+/// The `PR_SET_PTRACER` setting is inherited by forked children, so this
+/// works for any process that inherits the seccomp filter.
+fn read_proc_mem(pid: u32, offset: u64, len: usize) -> Result<Vec<u8>, NotifierError> {
+    // Reject invalid PID.
+    if pid == 0 {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pid is 0",
+        )));
+    }
+
+    // Reject zero-length or oversized reads.
+    if len == 0 || len > MAX_PROC_MEM_READ {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("read length {len} out of bounds (max {MAX_PROC_MEM_READ})"),
+        )));
+    }
+
+    // Reject kernel-space addresses.
+    if offset >= KERNEL_ADDR_BOUNDARY {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("address {offset:#x} is in kernel space"),
+        )));
+    }
+
+    // Also reject if offset + len would wrap or cross into kernel space.
+    if offset
+        .checked_add(len as u64)
+        .is_none_or(|end| end > KERNEL_ADDR_BOUNDARY)
+    {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("read at {offset:#x}+{len} would cross kernel boundary"),
+        )));
+    }
+
+    // Open /proc/<pid>/mem for this specific process.
+    let mem_path = format!("/proc/{pid}/mem");
+    let mut file = std::fs::File::open(&mem_path).map_err(NotifierError::ProcMem)?;
+
+    // Seek to the target offset and read.
     use std::io::Seek;
     file.seek(std::io::SeekFrom::Start(offset))
         .map_err(NotifierError::ProcMem)?;
@@ -805,7 +890,7 @@ fn read_proc_mem(pid: u32, offset: u64, len: usize) -> Result<Vec<u8>, NotifierE
     Ok(buf)
 }
 
-/// Read a NUL-terminated string from the target process's memory.
+/// Read a NUL-terminated string from a child process's memory.
 fn read_proc_string(pid: u32, addr: u64, max_len: usize) -> Result<String, NotifierError> {
     let buf = read_proc_mem(pid, addr, max_len)?;
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -849,7 +934,10 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
             id = notif.id,
             "connect: notification invalidated (TOCTOU)"
         );
-        return Verdict::Allow; // Process died or was preempted — let kernel handle it.
+        // Fail closed: the process may have been rescheduled and memory
+        // contents could have changed. Deny rather than risk acting on
+        // stale data.
+        return Verdict::Deny(libc::EPERM as u32);
     }
 
     // Parse the address family (first 2 bytes of sockaddr, native endian).
@@ -871,6 +959,30 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
             let ip = Ipv4Addr::new(addr_bytes[4], addr_bytes[5], addr_bytes[6], addr_bytes[7]);
             let ip_addr = IpAddr::V4(ip);
 
+            // Block unspecified address (0.0.0.0) — commonly used for bind, not connect.
+            if ip.is_unspecified() {
+                tracing::warn!(pid, port, "connect: IPv4 unspecified (0.0.0.0), denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
+            // Block multicast (224.0.0.0/4).
+            if ip.is_multicast() {
+                tracing::warn!(pid, %ip_addr, port, "connect: IPv4 multicast, denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
+            // Block link-local (169.254.0.0/16) — often used for cloud metadata services.
+            if ip.is_link_local() {
+                tracing::warn!(pid, %ip_addr, port, "connect: IPv4 link-local, denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
+            // Block broadcast (255.255.255.255).
+            if ip.is_broadcast() {
+                tracing::warn!(pid, port, "connect: IPv4 broadcast, denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
             if policy.is_ip_allowed(ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv4 allowed");
                 Verdict::Allow
@@ -890,6 +1002,27 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
             addr_buf.copy_from_slice(&addr_bytes[8..24]);
             let ip = Ipv6Addr::from(addr_buf);
             let ip_addr = IpAddr::V6(ip);
+
+            // Block unspecified address (::).
+            if ip.is_unspecified() {
+                tracing::warn!(pid, port, "connect: IPv6 unspecified (::), denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
+            // Block multicast (ff00::/8).
+            if ip.is_multicast() {
+                tracing::warn!(pid, %ip_addr, port, "connect: IPv6 multicast, denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
+
+            // Block link-local unicast (fe80::/10).
+            // Ipv6Addr doesn't have is_unicast_link_local() on stable,
+            // so check the first two bytes directly.
+            let segments = ip.segments();
+            if segments[0] & 0xffc0 == 0xfe80 {
+                tracing::warn!(pid, %ip_addr, port, "connect: IPv6 link-local, denying");
+                return Verdict::Deny(libc::EACCES as u32);
+            }
 
             if policy.is_ip_allowed(ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv6 allowed");
@@ -961,7 +1094,7 @@ fn evaluate_clone3(notif: &SeccompNotif, notifier_fd: RawFd) -> Verdict {
     // TOCTOU check.
     if !is_notif_id_valid(notifier_fd, notif.id) {
         tracing::debug!(pid, "clone3: notification invalidated (TOCTOU)");
-        return Verdict::Allow;
+        return Verdict::Deny(libc::EPERM as u32);
     }
 
     let flags = u64::from_ne_bytes(flags_bytes.try_into().unwrap());
@@ -1074,7 +1207,7 @@ fn evaluate_execve(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: R
     // TOCTOU check.
     if !is_notif_id_valid(notifier_fd, notif.id) {
         tracing::debug!(pid, "execve: notification invalidated (TOCTOU)");
-        return Verdict::Allow;
+        return Verdict::Deny(libc::EPERM as u32);
     }
 
     let path = PathBuf::from(&pathname);
@@ -1129,7 +1262,7 @@ fn evaluate_execveat(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd:
     // TOCTOU check.
     if !is_notif_id_valid(notifier_fd, notif.id) {
         tracing::debug!(pid, "execveat: notification invalidated (TOCTOU)");
-        return Verdict::Allow;
+        return Verdict::Deny(libc::EPERM as u32);
     }
 
     let path = PathBuf::from(&pathname);

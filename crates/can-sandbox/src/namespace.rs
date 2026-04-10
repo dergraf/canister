@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::io::{Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use nix::sched::{CloneFlags, unshare};
@@ -107,8 +108,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 Some((parent_fd, child_fd))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to create notifier fd channel, continuing without notifier");
-                None
+                tracing::error!(error = %e, "failed to create notifier fd channel");
+                return Err(NamespaceError::Notifier(e));
             }
         }
     } else {
@@ -119,9 +120,10 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let child_ready = pipe().map_err(NamespaceError::Fork)?;
     let parent_done = pipe().map_err(NamespaceError::Fork)?;
 
-    // Capture UID/GID before fork.
+    // Capture UID/GID and parent PID before fork.
     let uid = nix::unistd::getuid();
     let gid = nix::unistd::getgid();
+    let parent_pid = std::process::id();
 
     tracing::debug!(%uid, %gid, "forking for sandbox");
 
@@ -161,16 +163,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             if net_mode == NetworkMode::Filtered {
                 match setup_parent_network(child, &opts.config, &mut net_state, &mut resolved_ips) {
                     Ok(()) => tracing::debug!("parent network setup complete"),
-                    Err(e) if opts.strict => {
-                        tracing::error!(error = %e, "STRICT: parent network setup failed");
-                        return Err(NamespaceError::Network(e));
-                    }
-                    Err(e) if opts.allow_degraded => {
-                        tracing::warn!(error = %e, "parent network setup failed, child will run without filtered network (--allow-degraded)");
-                        // Don't fail hard — child will detect missing network
-                    }
                     Err(e) => {
-                        tracing::error!(error = %e, "parent network setup failed (use --allow-degraded to continue without it)");
+                        tracing::error!(error = %e, "parent network setup failed");
                         return Err(NamespaceError::Network(e));
                     }
                 }
@@ -181,7 +175,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             done_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
             drop(done_w);
 
-            // Receive the notifier fd from the child and start the supervisor.
+            // Receive the notifier fd from the child, then start the supervisor.
             let mut supervisor_handle = None;
             if let Some(parent_fd) = parent_notifier_fd {
                 match notifier::recv_fd(&parent_fd) {
@@ -200,12 +194,14 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                                 tracing::debug!("seccomp supervisor started");
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "failed to start seccomp supervisor");
+                                tracing::error!(error = %e, "failed to start seccomp supervisor");
+                                return Err(NamespaceError::Notifier(e));
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to receive notifier fd from child");
+                        tracing::error!(error = %e, "failed to receive notifier fd from child");
+                        return Err(NamespaceError::Notifier(e));
                     }
                 }
             }
@@ -240,8 +236,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 net_mode,
                 opts.monitor,
                 opts.strict,
-                opts.allow_degraded,
                 child_notifier_fd,
+                parent_pid,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -341,21 +337,20 @@ fn setup_parent_network(
 /// Security hardening:
 /// - `strict` flag: when true, any setup failure is fatal and seccomp uses
 ///   KILL_PROCESS instead of ERRNO. Intended for CI / production.
-/// - `allow_degraded` flag: when true, sandbox may continue with reduced
-///   isolation if setup fails. When false (default), setup failures are fatal.
+/// - Default (non-strict): setup failures are fatal, seccomp uses ERRNO.
 #[allow(clippy::too_many_arguments)]
 fn child_entry(
     cmd: &CString,
     argv: &[CString],
     command_path: &Path,
-    ready_write: std::os::fd::OwnedFd,
-    done_read: std::os::fd::OwnedFd,
+    ready_write: OwnedFd,
+    done_read: OwnedFd,
     config: &SandboxConfig,
     net_mode: NetworkMode,
     monitor: bool,
     strict: bool,
-    allow_degraded: bool,
-    notifier_channel: Option<std::os::fd::OwnedFd>,
+    notifier_channel: Option<OwnedFd>,
+    parent_real_pid: u32,
 ) -> Result<(), NamespaceError> {
     // Build clone flags: always user + mount + PID namespaces.
     let mut clone_flags =
@@ -424,21 +419,8 @@ fn child_entry(
                     tracing::info!(path = %path.display(), "cgroup resource limits applied");
                 }
                 Ok(None) => {} // no limits configured
-                Err(e) if strict => {
-                    tracing::error!(error = %e, "STRICT: cgroup resource limits failed");
-                    return Err(NamespaceError::Cgroup(e));
-                }
-                Err(e) if allow_degraded => {
-                    tracing::warn!(
-                        error = %e,
-                        "cgroup resource limits unavailable — running without memory/CPU limits (--allow-degraded)"
-                    );
-                }
                 Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "cgroup resource limits failed (use --allow-degraded to continue without them)"
-                    );
+                    tracing::error!(error = %e, "cgroup resource limits failed");
                     return Err(NamespaceError::Cgroup(e));
                 }
             }
@@ -449,29 +431,16 @@ fn child_entry(
     // All necessary paths (essential OS mounts, auto-detected package manager
     // prefixes, and user-specified paths) are pre-merged into config.filesystem
     // via recipe composition in the CLI layer.
-    // By default, failures are fatal. Only with --allow-degraded does the sandbox
-    // fall back to degraded mode (host filesystem) if AppArmor blocks mount ops.
+    // Failures are always fatal — the sandbox aborts if filesystem isolation
+    // cannot be established (e.g., AppArmor blocks mount operations).
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
     let fs_isolated = overlay::try_setup_filesystem(&config.filesystem, host_cwd.as_deref())?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
-    } else if allow_degraded {
-        tracing::warn!(
-            "filesystem isolation DISABLED — running with host filesystem (--allow-degraded)"
-        );
-    } else if strict {
-        tracing::error!("STRICT: filesystem isolation failed — aborting");
-        return Err(NamespaceError::Overlay(overlay::OverlayError::Mount {
-            path: "/ (strict mode requires full isolation)".to_string(),
-            source: nix::Error::EPERM,
-        }));
     } else {
-        tracing::error!(
-            "filesystem isolation failed — aborting (use --allow-degraded to permit degraded mode)"
-        );
+        tracing::error!("filesystem isolation failed — aborting");
         return Err(NamespaceError::Overlay(overlay::OverlayError::Mount {
-            path: "/ (filesystem isolation required; use --allow-degraded to run without it)"
-                .to_string(),
+            path: "/ (filesystem isolation required)".to_string(),
             source: nix::Error::EPERM,
         }));
     }
@@ -482,15 +451,8 @@ fn child_entry(
             // Bring up loopback so localhost works (e.g., for inter-process comms).
             match can_net::netns::bring_up_loopback() {
                 Ok(()) => tracing::debug!("loopback up (network fully isolated)"),
-                Err(e) if strict => {
-                    tracing::error!(error = %e, "STRICT: failed to bring up loopback");
-                    return Err(NamespaceError::Network(e));
-                }
-                Err(e) if allow_degraded => {
-                    tracing::warn!(error = %e, "failed to bring up loopback (--allow-degraded)");
-                }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to bring up loopback (use --allow-degraded to continue)");
+                    tracing::error!(error = %e, "failed to bring up loopback");
                     return Err(NamespaceError::Network(e));
                 }
             }
@@ -548,26 +510,49 @@ fn child_entry(
     // multiple filters match, but USER_NOTIF is special — it suspends the
     // syscall for supervisor decision, which takes precedence.
     if let Some(channel_fd) = notifier_channel {
+        // Grant the supervisor (parent) Yama ptrace access so it can open
+        // /proc/<pid>/mem for any process that inherits this seccomp filter.
+        // PR_SET_PTRACER is inherited across fork(), so forked children
+        // (e.g., BEAM VM spawning child processes) are also covered.
+        //
+        // This must happen BEFORE seccomp installation. The parent PID from
+        // the child's perspective inside the PID namespace is 0 (init has no
+        // parent in a PID ns), so we use the real parent PID that was captured
+        // before entering the PID namespace and passed via the environment.
+        //
+        // Note: We use the parent's PID as seen from the initial PID namespace.
+        // prctl(PR_SET_PTRACER) takes a real (init-ns) PID, not a namespace-
+        // relative PID, so this is correct even though we're inside a PID ns.
+        const PR_SET_PTRACER: libc::c_int = 0x59616d61;
+        let parent_pid = parent_real_pid;
+        let ret = unsafe { libc::prctl(PR_SET_PTRACER, parent_pid as libc::c_ulong, 0, 0, 0) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                parent_pid,
+                error = %err,
+                "PR_SET_PTRACER failed (supervisor /proc/<pid>/mem reads may fail)"
+            );
+            // Non-fatal: on kernels without Yama or with ptrace_scope=0
+            // this is unnecessary and may fail. The supervisor will still
+            // try to open /proc/<pid>/mem and report errors per-syscall.
+        } else {
+            tracing::debug!(parent_pid, "PR_SET_PTRACER granted to supervisor");
+        }
+
         match notifier::install_notifier_filter() {
             Ok(notifier_fd) => {
                 tracing::debug!("installed USER_NOTIF seccomp filter in child");
                 if let Err(e) = notifier::send_fd(&channel_fd, &notifier_fd) {
-                    tracing::warn!(error = %e, "failed to send notifier fd to parent");
+                    tracing::error!(error = %e, "failed to send notifier fd to parent");
+                    return Err(NamespaceError::Notifier(e));
                 }
-                // Close both fds — the parent now has the notifier fd.
+                // Close fds — the parent now has the notifier fd.
                 drop(notifier_fd);
                 drop(channel_fd);
             }
-            Err(e) if allow_degraded => {
-                tracing::warn!(error = %e, "notifier filter install failed (--allow-degraded), continuing without it");
-                drop(channel_fd);
-            }
-            Err(e) if strict => {
-                tracing::error!(error = %e, "STRICT: notifier filter install failed");
-                return Err(NamespaceError::Notifier(e));
-            }
             Err(e) => {
-                tracing::error!(error = %e, "notifier filter install failed (use --allow-degraded to skip)");
+                tracing::error!(error = %e, "notifier filter install failed");
                 return Err(NamespaceError::Notifier(e));
             }
         }

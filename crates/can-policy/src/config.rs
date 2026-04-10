@@ -20,17 +20,6 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub strict: bool,
 
-    /// Allow degraded mode: permit sandbox to continue when isolation
-    /// features are unavailable.
-    ///
-    /// By default (`false`), canister fails hard when isolation cannot be
-    /// established (e.g., filesystem overlay fails). Set to `true` to
-    /// allow running with reduced isolation.
-    ///
-    /// Mutually exclusive with `strict`.
-    #[serde(default)]
-    pub allow_degraded: bool,
-
     /// Filesystem access policy.
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -240,7 +229,6 @@ impl SandboxConfig {
     pub fn default_deny() -> Self {
         Self {
             strict: false,
-            allow_degraded: false,
             filesystem: FilesystemConfig::default(),
             network: NetworkConfig::default(),
             process: ProcessConfig::default(),
@@ -320,19 +308,6 @@ pub struct RecipeFile {
     #[serde(default)]
     pub strict: Option<bool>,
 
-    /// Allow degraded mode: permit sandbox to continue when isolation
-    /// features are unavailable (e.g., AppArmor blocks mount operations).
-    ///
-    /// By default, canister fails hard when isolation cannot be established.
-    /// Set this to `true` to allow running with reduced isolation (e.g.,
-    /// host filesystem fallback when overlay setup fails).
-    ///
-    /// `None` means "not specified" — merge preserves earlier value.
-    /// Uses OR semantics: any `Some(true)` wins. Resolved to `false`
-    /// via `into_sandbox_config()`.
-    #[serde(default)]
-    pub allow_degraded: Option<bool>,
-
     /// Filesystem access policy.
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -372,7 +347,6 @@ impl RecipeFile {
     ///
     /// Fills in defaults for all `Option` fields:
     /// - `strict` → `false`
-    /// - `allow_degraded` → `false`
     /// - `deny_all` → `true`
     /// - `seccomp_mode` → `AllowList`
     ///
@@ -382,7 +356,6 @@ impl RecipeFile {
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
-            allow_degraded: self.allow_degraded.unwrap_or(false),
             filesystem: FilesystemConfig {
                 allow: self
                     .filesystem
@@ -427,13 +400,6 @@ impl RecipeFile {
 
             // Strict: OR — any Some(true) wins.
             strict: match (self.strict, overlay.strict) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (_, s @ Some(_)) => s,
-                (s, None) => s,
-            },
-
-            // Allow degraded: OR — any Some(true) wins.
-            allow_degraded: match (self.allow_degraded, overlay.allow_degraded) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (_, s @ Some(_)) => s,
                 (s, None) => s,

@@ -40,20 +40,11 @@ enum Commands {
         #[arg(short, long)]
         monitor: bool,
 
-        /// Strict mode: fail hard instead of degrading gracefully.
+        /// Strict mode: fail hard on all setup failures.
         /// Seccomp uses KILL_PROCESS, filesystem isolation failures are fatal.
         /// Intended for CI / production use.
         #[arg(short, long)]
         strict: bool,
-
-        /// Allow degraded mode: permit sandbox to continue when isolation
-        /// features are unavailable.
-        ///
-        /// By default, canister fails hard when isolation cannot be
-        /// established (e.g., AppArmor blocks mount operations). This flag
-        /// opts into reduced isolation instead of aborting.
-        #[arg(long)]
-        allow_degraded: bool,
 
         /// The command to execute.
         #[arg(required = true)]
@@ -158,9 +149,8 @@ fn main() -> ExitCode {
             recipe,
             monitor,
             strict,
-            allow_degraded,
             command,
-        } => commands::run(&recipe, monitor, strict, allow_degraded, command),
+        } => commands::run(&recipe, monitor, strict, command),
         Commands::Check => commands::check(),
         Commands::Setup { remove } => commands::setup(remove),
         Commands::Recipe { action } => match action {

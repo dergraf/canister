@@ -52,23 +52,13 @@ pub struct SandboxOpts {
     /// Run in monitor mode (log but don't enforce).
     pub monitor: bool,
 
-    /// Strict mode: fail hard instead of degrading.
+    /// Strict mode: fail hard on all setup failures.
     ///
     /// When true:
     /// - Seccomp uses KILL_PROCESS instead of ERRNO
-    /// - Filesystem isolation failures are fatal (no degraded mode)
+    /// - Filesystem isolation failures are fatal
     /// - All setup failures abort instead of warning
     pub strict: bool,
-
-    /// Allow degraded mode: permit sandbox to continue when isolation
-    /// features are unavailable.
-    ///
-    /// By default (`false`), canister fails hard when isolation cannot
-    /// be established. Set to `true` to allow running with reduced
-    /// isolation (e.g., host filesystem fallback).
-    ///
-    /// Mutually exclusive with `strict`.
-    pub allow_degraded: bool,
 }
 
 /// Run a command inside the sandbox.
@@ -85,7 +75,6 @@ pub fn run(opts: &SandboxOpts) -> Result<i32, SandboxError> {
         args = ?opts.args,
         monitor = opts.monitor,
         strict = opts.strict,
-        allow_degraded = opts.allow_degraded,
         "starting sandbox"
     );
 

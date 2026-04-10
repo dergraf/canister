@@ -34,9 +34,8 @@ of a sandboxed process, and the security properties of each isolation layer.
    layer does not compromise the others.
 
 3. **Fail closed.** When a feature cannot be set up (e.g., AppArmor blocks
-   mounts), Canister aborts by default. The `--allow-degraded` flag opts into
-   reduced isolation with clear warnings. In strict mode (`--strict`), all
-   degradation is fatal — the sandbox runs at full strength or not at all.
+   mounts), Canister aborts. All setup failures are fatal in both normal and
+   strict mode — the sandbox runs at full strength or not at all.
 
 4. **Single binary.** No runtime dependencies beyond the Linux kernel (and
    optionally slirp4netns for filtered networking). No dynamic linking to
@@ -372,10 +371,9 @@ working directory is always bind-mounted writable so the sandboxed process
 can read/write files in its working directory. All other writes go to tmpfs
 and are discarded when the process exits.
 
-**Degraded mode:** When AppArmor blocks mount operations (Ubuntu 24.04+),
-all mount steps are skipped. The process runs with the full host filesystem.
-The sandbox aborts by default; pass `--allow-degraded` to permit running
-with reduced isolation. A clear warning is logged.
+**AppArmor:** When AppArmor blocks mount operations (Ubuntu 24.04+),
+filesystem isolation cannot be established and the sandbox aborts. Install
+the AppArmor override profile to enable full isolation (see README).
 
 ### 3. Network Namespace
 
@@ -542,14 +540,16 @@ syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
 ```
   Child process                          Parent process
   ─────────────                          ──────────────
-  seccomp() → notifier fd               recv_fd() via SCM_RIGHTS
+  PR_SET_PTRACER(parent_pid)             recv_fd() via SCM_RIGHTS
+  seccomp() → notifier fd                 → notifier_fd
   send_fd() via SCM_RIGHTS              spawn supervisor thread
   install main BPF filter                 │
   execve()                                ▼
        │                               ┌─────────────────────┐
        │    connect(AF_INET, ...)      │  Supervisor thread   │
        │ ──── SUSPENDED ────────────►  │  1. NOTIF_RECV       │
-       │                               │  2. Read /proc/mem   │
+       │                               │  2. open+read        │
+       │                               │     /proc/<pid>/mem  │
        │                               │  3. Check policy     │
        │                               │  4. NOTIF_ID_VALID   │
        │    ALLOW / ERRNO(EPERM)       │  5. NOTIF_SEND       │
@@ -564,22 +564,33 @@ syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
 |---------|------------------|--------------------|
 | `connect()` | `sockaddr` struct (IP + port) | Must match resolved `allow_domains` IPs, `allow_ips` CIDRs, or loopback |
 | `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWUSER`, etc.) denied |
-| `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/mem` |
+| `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/<pid>/mem` |
 | `socket()` | `domain` + `type` registers | `AF_NETLINK` and `SOCK_RAW` denied |
 | `execve()` | Pathname string in userspace memory | Must match `allow_execve` paths (empty = allow all) |
 | `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
 
-**TOCTOU mitigation:** Between reading `/proc/<pid>/mem` and sending the
-verdict, a multi-threaded sandbox process could modify the inspected memory.
-The supervisor calls `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` after the policy
-check — if the notification ID is no longer valid (thread exited or memory
-was remapped), the verdict is skipped.
+**TOCTOU mitigation:** Between reading the child's memory and sending the verdict,
+a multi-threaded sandbox process could modify the inspected memory. The supervisor
+calls `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` after the policy check — if the
+notification ID is no longer valid (thread exited or memory was remapped), the
+verdict is skipped.
+
+**Memory access via `PR_SET_PTRACER`:** The child calls
+`prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp filters. This
+grants the supervisor (parent process) Yama ptrace access, allowing it to open
+`/proc/<pid>/mem` for any process that inherits the seccomp filter. The setting
+is inherited across `fork()`, so forked children (e.g., BEAM VM spawning child
+processes) are also covered. Without `PR_SET_PTRACER`, the kernel's
+`ptrace_may_access()` check blocks `/proc/<pid>/mem` opens across the user
+namespace boundary when `PR_SET_NO_NEW_PRIVS` and `yama.ptrace_scope=1` are
+in effect.
 
 **Fd passing protocol:** Before `fork()`, the parent creates an anonymous
-Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). After install, the
-child sends the notifier fd to the parent as `SCM_RIGHTS` ancillary data.
-The parent receives it and spawns a supervisor thread that blocks on
-`ioctl(SECCOMP_IOCTL_NOTIF_RECV)`.
+Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). After the notifier
+filter is installed, the child sends the notifier fd to the parent as
+`SCM_RIGHTS` ancillary data. The parent receives it and spawns a supervisor
+thread that opens `/proc/<pid>/mem` on each notification to read the child's
+memory.
 
 **Requirements:** Linux 5.9+ (auto-detected from `/proc/sys/kernel/osrelease`).
 Disabled in monitor mode (incompatible with `SECCOMP_RET_LOG`). Configurable
@@ -707,9 +718,8 @@ one CPU core.
 **Cleanup:** Child cgroups are removed when the sandboxed process exits (the
 kernel removes empty cgroups automatically).
 
-**Failure handling:** Cgroup setup failure aborts the sandbox by default.
-Pass `--allow-degraded` to skip cgroup setup with a warning. In strict
-mode, cgroup failure always aborts.
+**Failure handling:** Cgroup setup failure aborts the sandbox. All setup
+failures are fatal regardless of mode.
 
 **Security property:** The sandboxed process cannot consume unbounded memory
 or CPU. The limits are enforced by the kernel's cgroup controller and cannot
@@ -814,18 +824,18 @@ differently. Always validate policies with enforcement enabled.
 **Flag:** `--strict` (or `strict = true` in config)
 
 Strict mode is the inverse of monitor mode: instead of relaxing
-enforcement, it tightens it. Every point where normal mode gracefully
-degrades becomes a hard failure in strict mode.
+enforcement, it tightens it. Both normal and strict mode treat all setup
+failures as fatal. The key difference is the seccomp deny action.
 
 **Changes in strict mode:**
 
 | Enforcement point | Normal mode | Strict mode |
 |-------------------|-------------|-------------|
-| Filesystem isolation | Falls back if AppArmor blocks mounts | **Aborts** |
-| Network setup | Logs warning on failure | **Aborts** |
-| Loopback bring-up | Skips with warning | **Aborts** |
+| Filesystem isolation | **Aborts** on failure | **Aborts** on failure |
+| Network setup | **Aborts** on failure | **Aborts** on failure |
+| Loopback bring-up | **Aborts** on failure | **Aborts** on failure |
 | Seccomp deny action | `SECCOMP_RET_ERRNO` (EPERM) | `SECCOMP_RET_KILL_PROCESS` |
-| Cgroup setup | Logs warning on failure | **Aborts** |
+| Cgroup setup | **Aborts** on failure | **Aborts** on failure |
 
 **Mutual exclusion:** `--strict` and `--monitor` cannot be used together.
 This is enforced at the CLI level.
