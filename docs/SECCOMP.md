@@ -245,46 +245,51 @@ arguments like `connect()`'s `sockaddr` or `execve()`'s pathname, the BPF filter
 only sees the raw pointer value, not the data it points to.
 
 Canister uses `SECCOMP_RET_USER_NOTIF` (Linux 5.9+) to bridge this gap. When the
-child invokes a syscall that requires argument inspection, the kernel suspends the
-calling thread and delivers a notification to a supervisor thread running in the
-parent process. The supervisor reads the actual argument data (via `/proc/<pid>/mem`),
-makes a policy decision, and sends an ALLOW or DENY verdict back to the kernel.
+sandboxed process invokes a syscall that requires argument inspection, the kernel
+suspends the calling thread and delivers a notification to a supervisor process.
+The supervisor reads the actual argument data (via `/proc/<pid>/mem`), makes a
+policy decision, and sends an ALLOW or DENY verdict back to the kernel.
 
 ### How it works
 
+The supervisor runs as **PID 1 inside the sandbox's PID namespace**, not as a
+thread in the parent. This architecture is required because of three cascading
+kernel restrictions:
+
+1. After `unshare(CLONE_NEWPID)`, `clone(CLONE_THREAD)` returns `EINVAL`
+   (pid_ns_for_children != task_active_pid_ns), so a supervisor thread cannot
+   be spawned.
+2. The host's procfs (`s_user_ns = init_user_ns`) denies `/proc/<pid>/mem`
+   opens from a child user namespace, so the supervisor must mount its own
+   procfs.
+3. PID 1 is an ancestor of all sandboxed processes, satisfying Yama
+   `ptrace_scope=1` without `PR_SET_PTRACER`.
+
 ```
-  Child (sandboxed)                    Parent (supervisor)
-  ──────────────────                   ────────────────────
-  1. PR_SET_PTRACER(parent_pid)        5. Receive notifier fd
-  2. seccomp(SET_MODE_FILTER,              via Unix socket (SCM_RIGHTS)
-     NEW_LISTENER, &bpf_prog)
-     → returns notifier fd             6. Spawn supervisor thread
-  3. Send notifier fd to parent
-     via SCM_RIGHTS                    7. Loop:
-  4. Install main BPF filter              a. ioctl(NOTIF_RECV) → read notification
-     (prctl PR_SET_SECCOMP)               b. open(/proc/<pid>/mem) + read
-  ... execve() target command ...         c. Evaluate against policy
-                                          d. ioctl(NOTIF_ID_VALID) → TOCTOU check
-                                          e. ioctl(NOTIF_SEND) → verdict
+  PID 1 (supervisor, same user ns + PID ns)    PID 2+ (worker / sandboxed)
+  ─────────────────────────────────────────    ────────────────────────────
+  1. unshare(CLONE_NEWNS)                      1. Sandbox setup
+  2. mount /proc (owned by user ns)               (overlay, pivot_root, etc.)
+  3. recv_fd() via SCM_RIGHTS                  2. seccomp() → notifier fd
+     → notifier_fd                             3. send_fd() via SCM_RIGHTS
+  4. Loop:                                     4. Install main BPF filter
+     a. poll(notifier_fd, 200ms)               5. execve()
+     b. ioctl(NOTIF_RECV) → read notification
+     c. open+read /proc/<pid>/mem
+     d. Evaluate against policy
+     e. ioctl(NOTIF_ID_VALID) → TOCTOU check
+     f. ioctl(NOTIF_SEND) → verdict
+     g. waitpid(WNOHANG) → check child status
 ```
 
-The child calls `prctl(PR_SET_PTRACER, parent_pid)` **before** installing the
-notifier filter. This grants the parent (supervisor) Yama ptrace access, allowing
-it to open `/proc/<pid>/mem` for any process that inherits the seccomp filter —
-including forked children (e.g., BEAM VM spawning child processes). The
-`PR_SET_PTRACER` setting is inherited across `fork()`.
-
-Without `PR_SET_PTRACER`, the kernel's `ptrace_may_access()` check blocks
-`/proc/<pid>/mem` opens across the user namespace boundary when `PR_SET_NO_NEW_PRIVS`
-and `yama.ptrace_scope=1` are in effect.
-
-After the notifier filter is installed, the child sends the notifier fd to the parent
-via `SCM_RIGHTS` over an anonymous Unix socket pair created before `fork()`. The
-parent spawns a dedicated supervisor thread that blocks on `ioctl(NOTIF_RECV)`.
+The supervisor runs inline (single-threaded) using `poll()` with a 200ms timeout,
+interleaved with non-blocking `waitpid` to detect when the worker exits. After the
+worker exits, remaining in-flight notifications are drained before the supervisor
+terminates.
 
 ### Two-filter architecture
 
-The child installs two seccomp filters:
+The worker installs two seccomp filters:
 
 1. **Notifier filter** (installed first via `seccomp()` syscall with
    `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for the
@@ -373,12 +378,13 @@ major.minor version.
 
 - **Linux 5.9+** — for `SECCOMP_IOCTL_NOTIF_RECV`, `SECCOMP_IOCTL_NOTIF_SEND`,
   and `SECCOMP_IOCTL_NOTIF_ID_VALID`.
-- **`PR_SET_NO_NEW_PRIVS`** must be set before installing the filter (already done
-  by both the notifier and main filter installation paths).
-- **`PR_SET_PTRACER`** — the child calls `prctl(PR_SET_PTRACER, parent_pid)` before
-  seccomp installation to grant the supervisor Yama ptrace access for
-  `/proc/<pid>/mem` reads. This is inherited across `fork()`, so forked children
-  are also covered.
+- **`PR_SET_NO_NEW_PRIVS`** must be set on the worker before installing the
+  filter (already done by both the notifier and main filter installation paths).
+  The supervisor (PID 1) must NOT have `PR_SET_NO_NEW_PRIVS` set, as it would
+  break `/proc/<pid>/mem` access.
+- **AppArmor** — the `canister_sandboxed` profile must allow `ptrace (readby
+  tracedby)` from the `canister` peer profile. This is configured in the
+  shipped `canister.apparmor` profile.
 
 ---
 

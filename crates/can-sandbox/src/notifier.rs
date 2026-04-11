@@ -8,34 +8,48 @@
 //!
 //! # Architecture
 //!
+//! The supervisor runs as PID 1 inside the sandbox's PID namespace, not as
+//! a thread in the parent. This is necessary because:
+//!
+//! 1. After `unshare(CLONE_NEWPID)`, `clone(CLONE_THREAD)` returns EINVAL
+//!    (pid_ns_for_children != task_active_pid_ns), so we cannot spawn a
+//!    supervisor thread.
+//! 2. The host's procfs (`s_user_ns = init_user_ns`) denies `/proc/<pid>/mem`
+//!    opens from a child user namespace, so the supervisor must mount its own
+//!    procfs in the sandbox's user/PID namespace.
+//! 3. PID 1 is an ancestor of all sandboxed processes, satisfying Yama
+//!    `ptrace_scope=1` without `PR_SET_PTRACER`.
+//!
 //! ```text
-//!   Child (sandboxed)                    Parent (supervisor)
-//!   ──────────────────                   ────────────────────
-//!   1. PR_SET_PTRACER(parent_pid)        4. Receive notifier fd via SCM_RIGHTS
-//!   2. Install USER_NOTIF filter         5. Spawn supervisor thread
-//!      via seccomp() syscall             6. Loop: read notification
-//!   3. Send notifier fd to parent                inspect arguments via
-//!      via SCM_RIGHTS                            /proc/<pid>/mem (ptracer OK)
-//!   ... exec target command ...                  send ALLOW or DENY verdict
+//!   PID 1 (supervisor)                   PID 2+ (worker / sandboxed)
+//!   ──────────────────                   ────────────────────────────
+//!   1. unshare(CLONE_NEWNS)              1. Sandbox setup (overlay, pivot_root)
+//!   2. mount /proc (owned by user ns)    2. Install USER_NOTIF filter
+//!   3. Receive notifier fd via           3. Send notifier fd to PID 1
+//!      SCM_RIGHTS from worker               via SCM_RIGHTS
+//!   4. Loop: poll(notifier_fd, 200ms)    4. exec target command
+//!            read notification
+//!            inspect via /proc/<pid>/mem
+//!            send ALLOW or DENY verdict
+//!            waitpid(WNOHANG) for child
 //! ```
 //!
 //! # Memory access
 //!
-//! The supervisor reads the child's memory by opening `/proc/<pid>/mem` for
-//! the specific PID in each seccomp notification. This requires the child to
-//! call `prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp filters,
-//! which grants the parent Yama ptrace access. Without this, the kernel's
-//! `ptrace_may_access()` check would block `/proc/<pid>/mem` opens across the
-//! user namespace boundary when `PR_SET_NO_NEW_PRIVS` and `yama.ptrace_scope=1`
-//! are in effect. The `PR_SET_PTRACER` setting is inherited by forked children,
-//! so the supervisor can read memory from any process that inherits the seccomp
-//! filter.
+//! The supervisor reads the worker's memory by opening `/proc/<pid>/mem`.
+//! Because the supervisor (PID 1) runs in the same user namespace and PID
+//! namespace as the sandboxed processes, and mounts its own procfs owned by
+//! that user namespace, the kernel's `ptrace_may_access()` check succeeds.
+//! As PID 1, the supervisor is an ancestor of all sandboxed processes,
+//! satisfying Yama `ptrace_scope=1` automatically.
 //!
 //! # Requirements
 //!
 //! - Linux 5.9+ (for `SECCOMP_IOCTL_NOTIF_RECV`, `SECCOMP_IOCTL_NOTIF_SEND`,
 //!   `SECCOMP_ADDFD_FLAG_SEND`)
-//! - `PR_SET_NO_NEW_PRIVS` must be set (already done by the regular filter)
+//! - `PR_SET_NO_NEW_PRIVS` must be set on the worker (already done by the
+//!   regular filter). The supervisor must NOT have `PR_SET_NO_NEW_PRIVS` set,
+//!   as it would break `/proc/<pid>/mem` access.
 //!
 //! # Filtered syscalls
 //!
@@ -49,9 +63,6 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 
 use crate::seccomp::SeccompError;
 
@@ -252,45 +263,6 @@ impl NotifierPolicy {
         }
 
         false
-    }
-}
-
-/// Handle to a running supervisor thread.
-///
-/// Owns the notifier fd so that [`shutdown`](Self::shutdown) can close it
-/// from the parent side, forcing the blocked `ioctl(SECCOMP_IOCTL_NOTIF_RECV)`
-/// in the supervisor thread to return `EBADF` and exit.
-pub struct SupervisorHandle {
-    shutdown: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-    /// Kept here so we can close it to unblock the supervisor thread.
-    notifier_fd: Option<OwnedFd>,
-}
-
-impl SupervisorHandle {
-    /// Signal the supervisor to stop and wait for the thread.
-    pub fn shutdown(mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Close the notifier fd first. This makes the ioctl in the
-        // supervisor thread return EBADF, which breaks it out of the
-        // blocking recv loop.
-        drop(self.notifier_fd.take());
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for SupervisorHandle {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Close the fd to unblock the supervisor thread.
-        drop(self.notifier_fd.take());
-        // Best-effort join with a short wait — don't block Drop forever.
-        // The thread will exit on EBADF from the closed fd.
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -594,79 +566,67 @@ pub fn recv_fd(socket: &OwnedFd) -> Result<OwnedFd, NotifierError> {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor thread
+// Inline supervisor (single-threaded, runs as PID 1)
 // ---------------------------------------------------------------------------
 
-/// Start the supervisor thread that processes seccomp notifications.
+/// Run the seccomp supervisor inline (single-threaded) while monitoring
+/// the child process.
 ///
-/// `notifier_fd` is the seccomp notification fd received from the child.
-/// `policy` defines what the supervisor should allow/deny.
+/// After `unshare(CLONE_NEWPID)`, the intermediate process cannot spawn
+/// threads (`clone(CLONE_THREAD)` returns `EINVAL` when
+/// `pid_ns_for_children != task_active_pid_ns`). This function runs the
+/// supervisor loop directly in the calling process, interleaving seccomp
+/// notification handling with non-blocking `waitpid` checks on the child.
 ///
-/// The supervisor reads child memory by opening `/proc/<pid>/mem` for each
-/// notification. This requires the child to have called
-/// `prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp, which
-/// grants the parent Yama ptrace access across the user namespace boundary.
-///
-/// Returns a handle that can be used to shut down the supervisor.
-pub fn start_supervisor(
+/// Returns the exit code to use for `process::exit()`.
+pub fn run_supervisor_with_child(
     notifier_fd: OwnedFd,
-    policy: NotifierPolicy,
-) -> Result<SupervisorHandle, NotifierError> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = Arc::clone(&shutdown);
+    policy: &NotifierPolicy,
+    child: nix::unistd::Pid,
+) -> i32 {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
-    // Extract the raw fd for the thread. The OwnedFd stays in the handle
-    // so the parent can close it to unblock the supervisor thread's ioctl.
-    let raw_fd = notifier_fd.as_raw_fd();
-
-    let thread = thread::Builder::new()
-        .name("can-seccomp-supervisor".to_string())
-        .spawn(move || {
-            supervisor_loop(raw_fd, &policy, &shutdown_clone);
-        })
-        .map_err(|e| NotifierError::SeccompSyscall(std::io::Error::other(e)))?;
-
-    Ok(SupervisorHandle {
-        shutdown,
-        thread: Some(thread),
-        notifier_fd: Some(notifier_fd),
-    })
-}
-
-/// Main loop for the seccomp notification supervisor.
-///
-/// Uses `poll()` with a short timeout before each blocking `ioctl()` so
-/// the thread can check the shutdown flag periodically. Closing the
-/// notifier fd alone does NOT reliably wake a blocked `ioctl()` on
-/// Linux — the kernel holds an internal reference, so the thread would
-/// hang indefinitely without the poll-based approach.
-fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
-    // --- Harden the supervisor thread (TCB) ---
-    //
-    // NOTE: We intentionally do NOT apply a seccomp filter to the supervisor
-    // thread. Installing seccomp requires PR_SET_NO_NEW_PRIVS, which changes
-    // the kernel's ptrace_may_access() check. The supervisor needs to open
-    // /proc/<pid>/mem at runtime for each notification (to read memory from
-    // any process that inherits the seccomp filter, including forked children).
-    // Applying PR_SET_NO_NEW_PRIVS to the supervisor would break this.
-    //
-    // The supervisor also needs broad syscall access: poll, ioctl, open, read,
-    // and potentially other calls for policy evaluation (canonicalize, etc.).
-    // A seccomp allowlist would be fragile and tightly coupled to libc internals.
-    //
-    // NOTE: PR_CAPBSET_DROP requires CAP_SETPCAP in the current effective set,
-    // which an unprivileged process does not have. The bounding set is already
-    // empty for unprivileged processes, so explicit dropping is a no-op.
+    let fd = notifier_fd.as_raw_fd();
+    let mut child_exit_code: Option<i32> = None;
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            tracing::debug!("seccomp supervisor shutting down");
-            break;
+        // Check if the child has exited (non-blocking).
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => {
+                tracing::debug!(code, "inner child exited");
+                child_exit_code = Some(code);
+                // Drain remaining notifications before exiting.
+                drain_notifications(fd, policy);
+                break;
+            }
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
+                let code = 128 + signal as i32;
+                tracing::debug!(signal = %signal, code, "inner child killed by signal");
+                child_exit_code = Some(code);
+                drain_notifications(fd, policy);
+                break;
+            }
+            Ok(WaitStatus::StillAlive) => {
+                // Child still running — process notifications.
+            }
+            Ok(_) => {
+                // Other status (stopped, continued) — keep going.
+            }
+            Err(nix::Error::ECHILD) => {
+                // No child — it already exited and was reaped.
+                tracing::debug!("inner child already reaped");
+                child_exit_code = Some(1);
+                break;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "waitpid failed");
+                child_exit_code = Some(1);
+                break;
+            }
         }
 
-        // Wait for the notifier fd to become readable (i.e., a notification
-        // is pending) with a 200ms timeout. This lets us check the shutdown
-        // flag periodically without busy-spinning.
+        // Wait for the notifier fd to become readable with a 200ms timeout.
+        // This gives us periodic opportunities to check child status.
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -682,10 +642,9 @@ fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
             break;
         }
         if poll_ret == 0 {
-            // Timeout — loop back and check shutdown flag.
+            // Timeout — loop back and check child status.
             continue;
         }
-        // POLLHUP/POLLERR/POLLNVAL means the fd is gone.
         if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             tracing::debug!(
                 revents = pfd.revents,
@@ -694,74 +653,95 @@ fn supervisor_loop(fd: RawFd, policy: &NotifierPolicy, shutdown: &AtomicBool) {
             break;
         }
 
-        // Receive a notification.
-        let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif as *mut _) };
+        // Process one notification.
+        process_one_notification(fd, policy);
+    }
 
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                // ENOENT: notification was already handled (race condition).
-                Some(libc::ENOENT) => continue,
-                // EBADF / EINTR: fd closed or signal — check shutdown.
-                Some(libc::EBADF) | Some(libc::EINTR) => {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    // EBADF without shutdown means the child exited.
-                    if err.raw_os_error() == Some(libc::EBADF) {
-                        tracing::debug!("notifier fd closed (child exited), stopping supervisor");
-                        break;
-                    }
-                    continue;
-                }
-                _ => {
-                    tracing::error!(error = %err, "SECCOMP_IOCTL_NOTIF_RECV failed");
-                    break;
-                }
-            }
-        }
+    // If we broke out without getting a child status, block-wait for the child.
+    let code = child_exit_code.unwrap_or_else(|| match waitpid(child, None) {
+        Ok(WaitStatus::Exited(_, code)) => code,
+        Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
+        _ => 1,
+    });
 
-        // Determine the verdict.
-        let verdict = evaluate_syscall(&notif, policy, fd);
+    // Close the notifier fd explicitly (drop handles it, but be clear).
+    drop(notifier_fd);
+    tracing::debug!(code, "seccomp supervisor exiting");
+    code
+}
 
-        // Send the verdict.
-        let resp = match verdict {
-            Verdict::Allow => SeccompNotifResp {
-                id: notif.id,
-                val: 0,
-                error: 0,
-                flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
-            },
-            Verdict::Deny(errno) => SeccompNotifResp {
-                id: notif.id,
-                val: 0,
-                error: -(errno as i32),
-                flags: 0,
-            },
+/// Drain any pending notifications after the child has exited.
+///
+/// There may be notifications in flight from child processes that are
+/// still being torn down. Process them briefly to avoid blocking those
+/// teardown paths.
+fn drain_notifications(fd: RawFd, policy: &NotifierPolicy) {
+    for _ in 0..64 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
         };
+        let poll_ret = unsafe { libc::poll(&mut pfd, 1, 10) };
+        if poll_ret <= 0 {
+            break;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            break;
+        }
+        process_one_notification(fd, policy);
+    }
+}
 
-        let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as _, &resp as *const _) };
+/// Process a single seccomp notification (receive, evaluate, respond).
+fn process_one_notification(fd: RawFd, policy: &NotifierPolicy) {
+    let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif as *mut _) };
 
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::ENOENT) => {
-                    // Process died or syscall was interrupted — no big deal.
-                    tracing::debug!(id = notif.id, "notification target gone (ENOENT on send)");
-                }
-                Some(libc::EBADF) => {
-                    tracing::debug!("notifier fd closed during send, stopping supervisor");
-                    break;
-                }
-                _ => {
-                    tracing::error!(error = %err, "SECCOMP_IOCTL_NOTIF_SEND failed");
-                }
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOENT) => return,
+            Some(libc::EBADF) | Some(libc::EINTR) => return,
+            _ => {
+                tracing::error!(error = %err, "SECCOMP_IOCTL_NOTIF_RECV failed");
+                return;
             }
         }
     }
 
-    tracing::debug!("seccomp supervisor thread exiting");
+    let verdict = evaluate_syscall(&notif, policy, fd);
+
+    let resp = match verdict {
+        Verdict::Allow => SeccompNotifResp {
+            id: notif.id,
+            val: 0,
+            error: 0,
+            flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        },
+        Verdict::Deny(errno) => SeccompNotifResp {
+            id: notif.id,
+            val: 0,
+            error: -(errno as i32),
+            flags: 0,
+        },
+    };
+
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as _, &resp as *const _) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOENT) => {
+                tracing::debug!(id = notif.id, "notification target gone (ENOENT on send)");
+            }
+            Some(libc::EBADF) => {
+                tracing::debug!("notifier fd closed during send");
+            }
+            _ => {
+                tracing::error!(error = %err, "SECCOMP_IOCTL_NOTIF_SEND failed");
+            }
+        }
+    }
 }
 
 /// Verdict from evaluating a syscall notification.
@@ -834,11 +814,10 @@ const KERNEL_ADDR_BOUNDARY: u64 = 0xffff_8000_0000_0000;
 
 /// Read `len` bytes from `offset` in a child process's memory.
 ///
-/// Opens `/proc/<pid>/mem` for the specific PID on each call. This requires
-/// the child to have called `prctl(PR_SET_PTRACER, parent_pid)` before
-/// installing seccomp filters, granting the supervisor Yama ptrace access.
-/// The `PR_SET_PTRACER` setting is inherited by forked children, so this
-/// works for any process that inherits the seccomp filter.
+/// Opens `/proc/<pid>/mem` for the specific PID on each call. This works
+/// because the supervisor runs as PID 1 in the same user namespace and PID
+/// namespace as the sandboxed processes, with its own procfs mount. As an
+/// ancestor process, Yama `ptrace_scope=1` is satisfied automatically.
 fn read_proc_mem(pid: u32, offset: u64, len: usize) -> Result<Vec<u8>, NotifierError> {
     // Reject invalid PID.
     if pid == 0 {
@@ -877,7 +856,13 @@ fn read_proc_mem(pid: u32, offset: u64, len: usize) -> Result<Vec<u8>, NotifierE
 
     // Open /proc/<pid>/mem for this specific process.
     let mem_path = format!("/proc/{pid}/mem");
-    let mut file = std::fs::File::open(&mem_path).map_err(NotifierError::ProcMem)?;
+    let mut file = match std::fs::File::open(&mem_path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(pid, path = %mem_path, error = %e, "failed to open proc mem");
+            return Err(NotifierError::ProcMem(e));
+        }
+    };
 
     // Seek to the target offset and read.
     use std::io::Seek;

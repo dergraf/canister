@@ -73,12 +73,18 @@ profile canister_sandboxed flags=(attach_disconnected) {
 
   allow pix /** -> &canister_sandboxed,
 
+  # Allow the seccomp supervisor (running under the canister profile as PID 1)
+  # to read sandboxed process memory via /proc/<pid>/mem. This is required for
+  # the USER_NOTIF supervisor to inspect syscall arguments (connect addresses,
+  # execve paths, etc.).
+  allow ptrace (readby tracedby) peer=canister,
+  audit deny ptrace (read trace),
+
   audit deny capability,
   audit deny mount,
   audit deny umount,
   audit deny pivot_root,
   audit deny userns,
-  audit deny ptrace,
   deny dbus,
 
   include if exists <local/canister_sandboxed>
@@ -376,7 +382,8 @@ mod tests {
         assert!(profile.contains("audit deny umount,"));
         assert!(profile.contains("audit deny pivot_root,"));
         assert!(profile.contains("audit deny userns,"));
-        assert!(profile.contains("audit deny ptrace,"));
+        assert!(profile.contains("allow ptrace (readby tracedby) peer=canister,"));
+        assert!(profile.contains("audit deny ptrace (read trace),"));
         assert!(profile.contains("deny dbus,"));
     }
 

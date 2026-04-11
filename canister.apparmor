@@ -106,9 +106,12 @@ profile canister_sandboxed flags=(attach_disconnected) {
   audit deny userns,
 
   # Deny ptrace — prevents process inspection/manipulation escapes.
-  # Recipes that need ptrace (e.g., BEAM :observer) should use a
-  # site-specific local override.
-  audit deny ptrace,
+  # The seccomp USER_NOTIF supervisor (running under the canister profile
+  # as PID 1 in the sandbox's PID namespace) is allowed to read process
+  # memory via /proc/<pid>/mem for inspecting syscall arguments (connect
+  # addresses, execve paths, etc.).
+  allow ptrace (readby tracedby) peer=canister,
+  audit deny ptrace (read trace),
 
   # Deny DBus — not needed in sandbox, reduces attack surface.
   deny dbus,

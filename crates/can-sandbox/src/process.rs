@@ -169,46 +169,6 @@ pub fn set_max_pids(max: u32) -> Result<(), ProcessError> {
     Ok(())
 }
 
-/// Enter a new PID namespace by forking.
-///
-/// `CLONE_NEWPID` affects children of the calling process, not the caller itself.
-/// So after `unshare(CLONE_NEWPID)`, we must fork once more. The child of this
-/// fork becomes PID 1 in the new PID namespace.
-///
-/// The parent (intermediate process) waits for the child and propagates its
-/// exit status. This function only returns in the child (PID 1) — the parent
-/// calls `std::process::exit()`.
-///
-/// Must be called AFTER `unshare(CLONE_NEWPID)` and BEFORE filesystem setup
-/// (so /proc mount reflects the new PID namespace).
-pub fn enter_pid_namespace() -> Result<(), ProcessError> {
-    // SAFETY: fork is safe here because we're in the child process after the
-    // initial fork, before spawning any threads.
-    match unsafe { nix::unistd::fork() }.map_err(ProcessError::PidFork)? {
-        nix::unistd::ForkResult::Parent { child } => {
-            // Intermediate process: wait for PID-1 child and exit with its status.
-            let status = nix::sys::wait::waitpid(child, None).map_err(ProcessError::PidWait)?;
-            let code = match status {
-                nix::sys::wait::WaitStatus::Exited(_, code) => code,
-                nix::sys::wait::WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
-                _ => 1,
-            };
-            std::process::exit(code);
-        }
-        nix::unistd::ForkResult::Child => {
-            // We are now PID 1 in the new PID namespace.
-            // Create a new session so that getpgrp() works correctly.
-            // Without this, bash (and other shells) fail with
-            // "initialize_job_control: getpgrp failed" because the inherited
-            // session/process-group leader lives in the parent PID namespace
-            // and is invisible from within this one.
-            nix::unistd::setsid().map_err(ProcessError::PidFork)?;
-            tracing::debug!(pid = std::process::id(), "entered PID namespace as PID 1");
-            Ok(())
-        }
-    }
-}
-
 /// Build the list of extra syscalls to deny based on process config.
 ///
 /// When `allow_execve` is non-empty, we want to prevent the sandboxed process's

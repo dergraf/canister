@@ -53,17 +53,23 @@ pub enum NamespaceError {
 
 /// Spawn a process inside new namespaces.
 ///
-/// The protocol between parent and child:
+/// The protocol between parent, child, and grandchild:
+///
 /// 1. Parent validates command against `allow_execve` whitelist
-/// 2. Parent forks
-/// 3. Child calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID [| CLONE_NEWNET])` atomically
-/// 4. Child signals parent via pipe that namespaces are created
-/// 5. Parent writes UID/GID maps for the child
-/// 6. Parent optionally starts slirp4netns for filtered network mode
+/// 2. Parent pre-resolves DNS for whitelisted domains (if filtered network)
+/// 3. Parent forks → child
+/// 4. Child calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID [| CLONE_NEWNET])` atomically
+/// 5. Child signals parent via pipe that namespaces are created
+/// 6. Parent writes UID/GID maps, starts slirp4netns + DNS proxy
 /// 7. Parent signals child via pipe that maps (and network) are ready
-/// 8. Child forks again for PID namespace (inner child becomes PID 1)
-/// 9. PID-1 child sets up filesystem, network, RLIMIT_NPROC, seccomp, env filtering
-/// 10. PID-1 child execs the target command with filtered environment
+/// 8. Child forks again for PID namespace:
+///    - **Intermediate process**: receives seccomp notifier fd from inner child,
+///      runs the supervisor thread (inside the user namespace so `/proc/<pid>/mem`
+///      access works), waits for inner child, shuts down supervisor, exits.
+///    - **Inner child (PID 1)**: sets up filesystem, network, RLIMIT_NPROC,
+///      seccomp, env filtering, installs notifier filter, sends fd to
+///      intermediate, then execs the target command.
+/// 9. Parent waits for child and cleans up network.
 pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let command_path =
         resolve_command(&opts.command).map_err(|_| NamespaceError::Exec(nix::Error::ENOENT))?;
@@ -99,31 +105,36 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     // Determine whether to enable the seccomp notifier.
     let notifier_enabled = resolve_notifier_enabled(&opts.config.syscalls, opts.monitor);
 
-    // Create the fd channel for passing the notifier fd from child to parent.
-    // Created before fork so both sides inherit their end.
-    let notifier_channel = if notifier_enabled {
-        match notifier::create_fd_channel() {
-            Ok((parent_fd, child_fd)) => {
-                tracing::debug!("created notifier fd channel");
-                Some((parent_fd, child_fd))
+    // Pre-resolve whitelisted domains to IPs BEFORE forking.
+    // Both parent and child need the resolved IPs: the parent for reference,
+    // the child to build the NotifierPolicy for the supervisor.
+    // Done here (before fork) so the child inherits the results.
+    let resolved_ips =
+        if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
+            let resolved = can_net::resolve_allowed_domains(&opts.config.network);
+            if resolved.is_empty() {
+                tracing::warn!("could not resolve any whitelisted domains to IPs");
+            } else {
+                tracing::info!(
+                    count = resolved.len(),
+                    "pre-resolved whitelisted domains to IPs"
+                );
+                for (domain, ips) in &resolved {
+                    tracing::debug!(domain, ips = ?ips, "resolved");
+                }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create notifier fd channel");
-                return Err(NamespaceError::Notifier(e));
-            }
-        }
-    } else {
-        None
-    };
+            resolved
+        } else {
+            Vec::new()
+        };
 
     // Create two pipes for parent-child synchronization.
     let child_ready = pipe().map_err(NamespaceError::Fork)?;
     let parent_done = pipe().map_err(NamespaceError::Fork)?;
 
-    // Capture UID/GID and parent PID before fork.
+    // Capture UID/GID before fork.
     let uid = nix::unistd::getuid();
     let gid = nix::unistd::getgid();
-    let parent_pid = std::process::id();
 
     tracing::debug!(%uid, %gid, "forking for sandbox");
 
@@ -135,12 +146,6 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         ForkResult::Parent { child } => {
             drop(child_ready.1);
             drop(parent_done.0);
-
-            // Drop the child end of the notifier channel in the parent.
-            let parent_notifier_fd = notifier_channel.map(|(parent_fd, child_fd)| {
-                drop(child_fd);
-                parent_fd
-            });
 
             // Wait for child to signal that namespaces are created.
             let mut buf = [0u8; 1];
@@ -158,10 +163,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             write_uid_gid_maps(child, uid, gid)?;
 
             // Set up network infrastructure from the parent side.
+            // DNS resolution was already done before fork; only start
+            // slirp4netns and the DNS proxy here.
             let mut net_state = NetworkState::new();
-            let mut resolved_ips: Vec<(String, Vec<std::net::IpAddr>)> = Vec::new();
             if net_mode == NetworkMode::Filtered {
-                match setup_parent_network(child, &opts.config, &mut net_state, &mut resolved_ips) {
+                match setup_parent_network(child, &opts.config, &mut net_state) {
                     Ok(()) => tracing::debug!("parent network setup complete"),
                     Err(e) => {
                         tracing::error!(error = %e, "parent network setup failed");
@@ -175,43 +181,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             done_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
             drop(done_w);
 
-            // Receive the notifier fd from the child, then start the supervisor.
-            let mut supervisor_handle = None;
-            if let Some(parent_fd) = parent_notifier_fd {
-                match notifier::recv_fd(&parent_fd) {
-                    Ok(notifier_fd) => {
-                        let policy = notifier::policy_from_config(&opts.config, &resolved_ips);
-                        tracing::info!(
-                            allowed_ips = policy.allowed_ips.len(),
-                            allowed_cidrs = policy.allowed_cidrs.len(),
-                            allowed_exec_paths = policy.allowed_exec_paths.len(),
-                            allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
-                            "starting seccomp supervisor"
-                        );
-                        match notifier::start_supervisor(notifier_fd, policy) {
-                            Ok(handle) => {
-                                supervisor_handle = Some(handle);
-                                tracing::debug!("seccomp supervisor started");
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "failed to start seccomp supervisor");
-                                return Err(NamespaceError::Notifier(e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to receive notifier fd from child");
-                        return Err(NamespaceError::Notifier(e));
-                    }
-                }
-            }
-
+            // The seccomp supervisor now runs inside the child's user namespace
+            // (in the intermediate process after enter_pid_namespace). The parent
+            // just waits for the child to exit and cleans up network state.
             let result = wait_for_child(child);
 
-            // Clean up: supervisor first (closes ioctl fd), then network.
-            if let Some(handle) = supervisor_handle {
-                handle.shutdown();
-            }
             net_state.shutdown();
 
             result
@@ -219,12 +193,6 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         ForkResult::Child => {
             drop(child_ready.0);
             drop(parent_done.1);
-
-            // Drop the parent end of the notifier channel in the child.
-            let child_notifier_fd = notifier_channel.map(|(parent_fd, child_fd)| {
-                drop(parent_fd);
-                child_fd
-            });
 
             let result = child_entry(
                 &cmd,
@@ -236,8 +204,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 net_mode,
                 opts.monitor,
                 opts.strict,
-                child_notifier_fd,
-                parent_pid,
+                notifier_enabled,
+                &resolved_ips,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -252,14 +220,12 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 
 /// Set up parent-side network infrastructure (slirp4netns + DNS proxy).
 ///
-/// For filtered mode, we pre-resolve whitelisted domains to build an IP
-/// allow-set for the seccomp notifier's connect() filtering. We also
-/// start the DNS proxy and wire slirp4netns to use it.
+/// DNS resolution is done before fork (in `spawn_sandboxed`). This function
+/// only starts the DNS proxy and slirp4netns.
 fn setup_parent_network(
     child_pid: Pid,
     config: &SandboxConfig,
     state: &mut NetworkState,
-    resolved_ips: &mut Vec<(String, Vec<std::net::IpAddr>)>,
 ) -> Result<(), can_net::NetError> {
     if !can_net::slirp::is_available() {
         tracing::warn!(
@@ -269,23 +235,6 @@ fn setup_parent_network(
         return Err(can_net::NetError::Slirp(
             "slirp4netns not found".to_string(),
         ));
-    }
-
-    // Pre-resolve whitelisted domains to IPs for seccomp connect() filtering.
-    if !config.network.allow_domains.is_empty() {
-        let resolved = can_net::resolve_allowed_domains(&config.network);
-        if resolved.is_empty() {
-            tracing::warn!("could not resolve any whitelisted domains to IPs");
-        } else {
-            tracing::info!(
-                count = resolved.len(),
-                "pre-resolved whitelisted domains to IPs"
-            );
-            for (domain, ips) in &resolved {
-                tracing::debug!(domain, ips = ?ips, "resolved");
-            }
-        }
-        *resolved_ips = resolved;
     }
 
     // Start the DNS proxy if there are domain-based rules.
@@ -324,20 +273,12 @@ fn setup_parent_network(
 /// waits for the parent to write UID/GID maps before proceeding with
 /// mount operations that require mapped UIDs.
 ///
-/// Phase 5 additions:
-/// - `CLONE_NEWPID` + inner fork so the sandboxed process becomes PID 1
-/// - Environment filtering via `env_passthrough`
-/// - `RLIMIT_NPROC` for max_pids
-/// - `allow_execve` pre-exec validation (done in parent, but path kept for logging)
-///
-/// Phase 6 additions:
-/// - `monitor` flag: when true, enforcement points log violations but don't block.
-///   Namespace isolation is still active for accurate observation.
-///
-/// Security hardening:
-/// - `strict` flag: when true, any setup failure is fatal and seccomp uses
-///   KILL_PROCESS instead of ERRNO. Intended for CI / production.
-/// - Default (non-strict): setup failures are fatal, seccomp uses ERRNO.
+/// The seccomp USER_NOTIF supervisor runs in the intermediate process
+/// (after `enter_pid_namespace`'s inner fork) rather than in the original
+/// parent. This is required because `/proc/<pid>/mem` reads fail across
+/// user namespace boundaries for unprivileged processes. By running the
+/// supervisor inside the same user namespace as the sandboxed process,
+/// it has the necessary access to read child process memory.
 #[allow(clippy::too_many_arguments)]
 fn child_entry(
     cmd: &CString,
@@ -349,8 +290,8 @@ fn child_entry(
     net_mode: NetworkMode,
     monitor: bool,
     strict: bool,
-    notifier_channel: Option<OwnedFd>,
-    parent_real_pid: u32,
+    notifier_enabled: bool,
+    resolved_ips: &[(String, Vec<std::net::IpAddr>)],
 ) -> Result<(), NamespaceError> {
     // Build clone flags: always user + mount + PID namespaces.
     let mut clone_flags =
@@ -386,13 +327,58 @@ fn child_entry(
         tracing::warn!("MONITOR MODE: namespace isolation active, policy enforcement relaxed");
     }
 
-    // Enter PID namespace via inner fork.
-    // CLONE_NEWPID affects children, not the caller. So we fork once more:
-    // the child becomes PID 1 in the new PID namespace. The intermediate
-    // parent waits and propagates the exit code (never returns here).
-    process::enter_pid_namespace()?;
+    // Build the notifier policy and create the fd channel for passing the
+    // notifier fd from the worker child to the PID-1 supervisor.
+    // The supervisor runs as PID 1 inside the same user + PID namespace
+    // as the sandboxed processes, so /proc/<pid>/mem access works.
+    let supervisor_context = if notifier_enabled {
+        let policy = notifier::policy_from_config(config, resolved_ips);
+        tracing::info!(
+            allowed_ips = policy.allowed_ips.len(),
+            allowed_cidrs = policy.allowed_cidrs.len(),
+            allowed_exec_paths = policy.allowed_exec_paths.len(),
+            allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
+            "notifier policy built for supervisor"
+        );
+        match notifier::create_fd_channel() {
+            Ok((recv_fd, send_fd)) => {
+                tracing::debug!("created notifier fd channel (worker → PID-1 supervisor)");
+                Some((policy, recv_fd, send_fd))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create notifier fd channel");
+                return Err(NamespaceError::Notifier(e));
+            }
+        }
+    } else {
+        None
+    };
 
-    // From here on, we are PID 1 in the new PID namespace.
+    // Enter PID namespace via fork(s).
+    //
+    // CLONE_NEWPID affects children, not the caller. So we fork:
+    // the child becomes PID 1 in the new PID namespace.
+    //
+    // When the notifier is enabled, a second fork occurs inside the new
+    // PID namespace: PID 1 becomes the seccomp supervisor, and the worker
+    // child (PID 2+) returns here to continue sandbox setup.
+    //
+    // The supervisor as PID 1:
+    //   1. Mounts /proc owned by the user namespace (for /proc/<pid>/mem)
+    //   2. Receives the notifier fd from the worker via SCM_RIGHTS
+    //   3. Runs the supervisor loop inline (single-threaded)
+    //   4. Monitors the worker via non-blocking waitpid
+    //   5. Exits when the worker exits (killing all PID ns processes)
+    //
+    // The supervisor runs inside the same user + PID namespace as the
+    // sandboxed processes, so /proc/<pid>/mem access works without
+    // cross-namespace permission issues.
+    enter_pid_namespace_supervised(supervisor_context)?;
+
+    // --- From here on, we are the worker process in the new PID namespace. ---
+    // When the notifier is enabled, we are PID 2+ (PID 1 is the supervisor).
+    // When disabled, we are PID 1. The intermediate process and PID-1
+    // supervisor never reach this point (they exit in enter_pid_namespace_supervised).
 
     // Capture the host CWD before pivot_root changes the root filesystem.
     // After pivot_root the original CWD path becomes inaccessible.
@@ -466,7 +452,7 @@ fn child_entry(
                 tracing::warn!(error = %e, "failed to write sandbox resolv.conf, DNS may not work");
             }
             tracing::info!(
-                notifier = notifier_channel.is_some(),
+                notifier = notifier_enabled,
                 "network: filtered mode via slirp4netns + seccomp notifier"
             );
         }
@@ -490,66 +476,33 @@ fn child_entry(
     // Install the seccomp notifier filter BEFORE the main filter.
     //
     // The kernel evaluates seccomp filters in reverse install order, so the
-    // last-installed filter runs first. By installing the notifier filter
-    // first and the main filter second, the main filter runs first for most
-    // syscalls. BUT: for syscalls that match USER_NOTIF, the notifier filter
-    // (installed first, evaluated second) would normally be shadowed. That's
-    // actually wrong — we need the notifier filter to run first.
+    // last-installed filter runs first. We install the notifier filter first
+    // (evaluated second by kernel) and the main filter second (evaluated first).
+    // For USER_NOTIF syscalls, the notifier filter suspends the syscall for
+    // supervisor decision. The main filter handles everything else.
     //
-    // Correction: we install the notifier filter SECOND (after the main filter),
-    // so it runs FIRST in the kernel's reverse-order evaluation. But we need
-    // the notifier fd before the main filter is installed. So the actual order
-    // must be:
-    //   1. Install notifier filter (returns fd) — this runs first in kernel
-    //   2. Send fd to parent
-    //   3. Install main filter — this runs second in kernel
-    //
-    // This is correct: the notifier filter catches connect/clone/socket/execve
-    // with USER_NOTIF (supervisor decides), and the main filter handles
-    // everything else. The kernel takes the most restrictive result when
-    // multiple filters match, but USER_NOTIF is special — it suspends the
-    // syscall for supervisor decision, which takes precedence.
-    if let Some(channel_fd) = notifier_channel {
-        // Grant the supervisor (parent) Yama ptrace access so it can open
-        // /proc/<pid>/mem for any process that inherits this seccomp filter.
-        // PR_SET_PTRACER is inherited across fork(), so forked children
-        // (e.g., BEAM VM spawning child processes) are also covered.
-        //
-        // This must happen BEFORE seccomp installation. The parent PID from
-        // the child's perspective inside the PID namespace is 0 (init has no
-        // parent in a PID ns), so we use the real parent PID that was captured
-        // before entering the PID namespace and passed via the environment.
-        //
-        // Note: We use the parent's PID as seen from the initial PID namespace.
-        // prctl(PR_SET_PTRACER) takes a real (init-ns) PID, not a namespace-
-        // relative PID, so this is correct even though we're inside a PID ns.
-        const PR_SET_PTRACER: libc::c_int = 0x59616d61;
-        let parent_pid = parent_real_pid;
-        let ret = unsafe { libc::prctl(PR_SET_PTRACER, parent_pid as libc::c_ulong, 0, 0, 0) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!(
-                parent_pid,
-                error = %err,
-                "PR_SET_PTRACER failed (supervisor /proc/<pid>/mem reads may fail)"
-            );
-            // Non-fatal: on kernels without Yama or with ptrace_scope=0
-            // this is unnecessary and may fail. The supervisor will still
-            // try to open /proc/<pid>/mem and report errors per-syscall.
-        } else {
-            tracing::debug!(parent_pid, "PR_SET_PTRACER granted to supervisor");
-        }
+    // The notifier fd is sent to the PID-1 supervisor (running in the
+    // same user + PID namespace) via the fd channel created before
+    // enter_pid_namespace.
+    if notifier_enabled {
+        // Retrieve the send end of the fd channel that was stashed by
+        // enter_pid_namespace_supervised in the worker child.
+        let send_fd = NOTIFIER_SEND_FD
+            .lock()
+            .unwrap()
+            .take()
+            .expect("NOTIFIER_SEND_FD must be set when notifier is enabled");
 
         match notifier::install_notifier_filter() {
             Ok(notifier_fd) => {
-                tracing::debug!("installed USER_NOTIF seccomp filter in child");
-                if let Err(e) = notifier::send_fd(&channel_fd, &notifier_fd) {
-                    tracing::error!(error = %e, "failed to send notifier fd to parent");
+                tracing::debug!("installed USER_NOTIF seccomp filter in worker");
+                if let Err(e) = notifier::send_fd(&send_fd, &notifier_fd) {
+                    tracing::error!(error = %e, "failed to send notifier fd to supervisor");
                     return Err(NamespaceError::Notifier(e));
                 }
-                // Close fds — the parent now has the notifier fd.
+                // Close fds — the PID-1 supervisor now has the notifier fd.
                 drop(notifier_fd);
-                drop(channel_fd);
+                drop(send_fd);
             }
             Err(e) => {
                 tracing::error!(error = %e, "notifier filter install failed");
@@ -663,6 +616,209 @@ fn wait_for_child(child: Pid) -> Result<i32, NamespaceError> {
         }
     }
 }
+
+/// Enter a new PID namespace, optionally with a seccomp supervisor.
+///
+/// Forks once: the inner child becomes PID 1 in the new PID namespace and
+/// returns `Ok(())` to the caller. The intermediate (parent of the fork)
+/// never returns — it runs the supervisor (if enabled), waits for the inner
+/// child, and exits with the child's exit code.
+///
+/// # Supervisor architecture
+///
+/// When `supervisor_context` is `Some((policy, recv_fd, send_fd))`:
+/// - The intermediate process closes `send_fd`, receives the notifier fd
+///   from the inner child via `recv_fd`, starts the supervisor thread,
+///   waits for the inner child, then shuts down the supervisor.
+/// - The inner child keeps `send_fd` (for later use to send the notifier
+///   fd after installing the seccomp filter) and closes `recv_fd`.
+///
+/// The supervisor runs inside the same user namespace as the sandboxed
+/// process, which is critical: unprivileged processes cannot open
+/// `/proc/<pid>/mem` across user namespace boundaries. By running the
+/// Enter a new PID namespace with optional seccomp supervisor.
+///
+/// This function forks to create a new PID namespace. The behavior depends
+/// on whether the supervisor is enabled:
+///
+/// ## Without supervisor (supervisor_context is None):
+///
+/// A single fork creates PID 1 in the new PID namespace. This process
+/// returns to the caller to continue sandbox setup.
+///
+/// ```text
+/// intermediate (parent, old PID ns) → waitpid → exit
+/// inner child (PID 1, new PID ns) → returns to caller
+/// ```
+///
+/// ## With supervisor (supervisor_context is Some):
+///
+/// Two forks create the supervisor as PID 1 and the worker as PID 2+:
+///
+/// ```text
+/// intermediate (parent, old PID ns) → waitpid → exit
+/// PID 1 (new PID ns, supervisor):
+///   - mounts /proc owned by the user namespace
+///   - receives notifier fd from worker
+///   - runs supervisor loop + monitors worker
+///   - exits when worker exits
+/// worker (PID 2+, new PID ns):
+///   - returns to caller for sandbox setup
+///   - installs seccomp filter, sends notifier fd to PID 1
+///   - exec's the sandboxed command
+/// ```
+///
+/// PID 1 is the natural supervisor because:
+/// - It's in the same PID namespace AND user namespace as all sandboxed
+///   processes, so it can mount procfs and read /proc/<pid>/mem
+/// - It's an ancestor of all processes in the PID namespace, satisfying
+///   Yama ptrace_scope=1
+/// - When it exits, the kernel kills all remaining processes in the
+///   PID namespace
+fn enter_pid_namespace_supervised(
+    supervisor_context: Option<(notifier::NotifierPolicy, OwnedFd, OwnedFd)>,
+) -> Result<(), NamespaceError> {
+    // SAFETY: fork is safe here because we're in the child process after the
+    // initial fork, before spawning any threads.
+    match unsafe { nix::unistd::fork() }.map_err(process::ProcessError::PidFork)? {
+        nix::unistd::ForkResult::Parent { child } => {
+            // Intermediate process (old PID namespace): just wait for child.
+            // Drop all supervisor-related fds.
+            drop(supervisor_context);
+
+            let status =
+                nix::sys::wait::waitpid(child, None).unwrap_or(WaitStatus::Exited(child, 1));
+            let code = match status {
+                WaitStatus::Exited(_, code) => code,
+                WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+        nix::unistd::ForkResult::Child => {
+            // We are now PID 1 in the new PID namespace.
+            nix::unistd::setsid().map_err(process::ProcessError::PidFork)?;
+
+            match supervisor_context {
+                None => {
+                    // No supervisor — this process continues as the sandbox worker.
+                    tracing::debug!(
+                        pid = std::process::id(),
+                        "entered PID namespace as PID 1 (no supervisor)"
+                    );
+                    Ok(())
+                }
+                Some((policy, recv_fd, send_fd)) => {
+                    // PID 1 becomes the supervisor. Fork a worker child.
+                    //
+                    // SAFETY: still single-threaded in the forked child.
+                    match unsafe { nix::unistd::fork() }.map_err(process::ProcessError::PidFork)? {
+                        nix::unistd::ForkResult::Parent { child: worker } => {
+                            // PID 1: supervisor process.
+                            drop(send_fd); // Only worker sends.
+
+                            // Mount /proc for our PID namespace.
+                            // This procfs is owned by our user namespace, so
+                            // /proc/<pid>/mem access works without cross-ns issues.
+                            // The PIDs visible here match the seccomp notification's
+                            // pid field (both use this PID namespace).
+                            mount_supervisor_proc();
+
+                            // Receive the notifier fd from the worker.
+                            match notifier::recv_fd(&recv_fd) {
+                                Ok(notifier_fd) => {
+                                    drop(recv_fd);
+                                    tracing::info!(
+                                        worker_pid = worker.as_raw(),
+                                        "seccomp supervisor running as PID 1"
+                                    );
+                                    let code = notifier::run_supervisor_with_child(
+                                        notifier_fd,
+                                        &policy,
+                                        worker,
+                                    );
+                                    std::process::exit(code);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "failed to receive notifier fd from worker"
+                                    );
+                                    let _ =
+                                        nix::sys::signal::kill(worker, nix::sys::signal::SIGKILL);
+                                    let _ = waitpid(worker, None);
+                                    std::process::exit(126);
+                                }
+                            }
+                        }
+                        nix::unistd::ForkResult::Child => {
+                            // Worker child: close recv end (supervisor receives).
+                            drop(recv_fd);
+
+                            // Stash the send fd for later — child_entry will
+                            // retrieve it after installing the seccomp filter.
+                            *NOTIFIER_SEND_FD.lock().unwrap() = Some(send_fd);
+
+                            tracing::debug!(
+                                pid = std::process::id(),
+                                "entered PID namespace as worker"
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mount /proc in the supervisor's mount namespace.
+///
+/// The supervisor needs its own /proc mount owned by the current user
+/// namespace so that /proc/<pid>/mem access works. The host's original
+/// /proc is owned by init_user_ns and the kernel denies mem access from
+/// child user namespaces through that mount.
+///
+/// We unshare the mount namespace first to avoid affecting the worker's
+/// filesystem view (the worker will do its own pivot_root later).
+fn mount_supervisor_proc() {
+    // Isolate mount namespace so our /proc mount doesn't leak to the worker.
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNS) {
+        tracing::warn!(error = %e, "failed to unshare mount ns for supervisor /proc");
+        return;
+    }
+
+    // Mount a fresh procfs over /proc.
+    let proc_cstr = c"/proc";
+    let proc_type = c"proc";
+    let ret = unsafe {
+        libc::mount(
+            proc_type.as_ptr(),
+            proc_cstr.as_ptr(),
+            proc_type.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to mount /proc for supervisor"
+        );
+    } else {
+        tracing::debug!("mounted supervisor /proc (owned by user namespace)");
+    }
+}
+
+/// Storage for the notifier send fd.
+///
+/// Set by `enter_pid_namespace_supervised` in the worker child so that
+/// `child_entry` can retrieve it later to send the notifier fd to the
+/// PID-1 supervisor after installing the seccomp filter.
+///
+/// Using `Mutex<Option<_>>` because the fd is set exactly once (after fork)
+/// and taken exactly once (when installing the notifier filter).
+static NOTIFIER_SEND_FD: std::sync::Mutex<Option<OwnedFd>> = std::sync::Mutex::new(None);
 
 /// Determine whether the seccomp USER_NOTIF supervisor should be enabled.
 ///

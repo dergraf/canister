@@ -141,11 +141,43 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │             │
     │             │ ──────────► "done"     │             │
     │             │                        │             │
-    │             │                        │ 6. PID NS   │
-    │             │                        │    Inner    │
-    │             │                        │    fork()   │
-    │             │                        │    setsid() │
-    │             │                        │    (PID 1)  │
+     │             │                        │ 6. PID NS   │
+     │             │                        │    First    │
+     │             │                        │    fork()   │
+     │             │                        │    (creates │
+     │             │                        │    new PID  │
+     │             │                        │    ns)      │
+     │             │                        │             │
+     │             │                        │    Interme- │
+     │             │                        │    diate:   │
+     │             │                        │    waitpid  │
+     │             │                        │    + exit   │
+     │             │                        │             │
+     │             │                        │ 6a. SECOND  │
+     │             │                        │    FORK     │
+     │             │                        │    (when    │
+     │             │                        │    notifier │
+     │             │                        │    enabled) │
+     │             │                        │             │
+     │             │                        │   ┌─ PID 1: │
+     │             │                        │   │  SUPER- │
+     │             │                        │   │  VISOR  │
+     │             │                        │   │  unshare│
+     │             │                        │   │  NEWNS  │
+     │             │                        │   │  mount  │
+     │             │                        │   │  /proc  │
+     │             │                        │   │  recv   │
+     │             │                        │   │  notif  │
+     │             │                        │   │  fd via │
+     │             │                        │   │  SCM_   │
+     │             │                        │   │  RIGHTS │
+     │             │                        │   │  poll + │
+     │             │                        │   │  waitpid│
+     │             │                        │   │  loop   │
+     │             │                        │   │         │
+     │             │                        │   └─ PID 2: │
+     │             │                        │      WORKER │
+     │             │                        │      setsid │
     │             │                        │             │
     │             │                        │ 6b. CGROUP  │
     │             │                        │    Create   │
@@ -189,30 +221,21 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        │    RLIMIT   │
     │             │                        │    NPROC    │
     │             │                        │             │
-    │             │                        │ 10. NOTIF   │
-    │             │                        │    FILTER   │
-    │             │                        │    Install  │
-    │             │                        │    USER_    │
-    │             │                        │    NOTIF    │
-    │             │                        │    BPF,     │
-    │             │                        │    send fd  │
-    │             │                        │    to parent│
-    │             │                        │    via SCM_ │
-    │             │                        │    RIGHTS   │
-    │             │                        │             │
-    │ 10b.NOTIF   │                        │             │
-    │    RECV     │                        │             │
-    │    Receive  │                        │             │
-    │    notifier │                        │             │
-    │    fd via   │                        │             │
-    │    SCM_     │                        │             │
-    │    RIGHTS,  │                        │             │
-    │    spawn    │                        │             │
-    │    super-   │                        │             │
-    │    visor    │                        │             │
-    │    thread   │                        │             │
-    │             │                        │             │
-    │             │                        │ 11. SECCOMP │
+     │             │                        │ 10. NOTIF   │
+     │             │                        │    FILTER   │
+     │             │                        │    Worker   │
+     │             │                        │    installs │
+     │             │                        │    USER_    │
+     │             │                        │    NOTIF    │
+     │             │                        │    BPF,     │
+     │             │                        │    sends fd │
+     │             │                        │    to PID 1 │
+     │             │                        │    (super-  │
+     │             │                        │    visor)   │
+     │             │                        │    via SCM_ │
+     │             │                        │    RIGHTS   │
+     │             │                        │             │
+     │             │                        │ 11. SECCOMP │
     │             │                        │    Load     │
     │             │                        │    main BPF │
     │             │                        │    filter   │
@@ -228,17 +251,14 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │     waitpid │                        │             │
     │             │                        │ (exits)     │
     │             │                        └─────────────┘
-    │ 15. CLEANUP│
-    │    Stop     │
-    │    notifier │
-    │    thread   │
-    │    Kill     │
-    │    slirp    │
-    │    Stop DNS │
-    │    proxy    │
-    │    Return   │
-    │    exit code│
-    └─────────────┘
+     │ 15. CLEANUP│
+     │    Kill     │
+     │    slirp    │
+     │    Stop DNS │
+     │    proxy    │
+     │    Return   │
+     │    exit code│
+     └─────────────┘
 ```
 
 **Critical ordering constraints:**
@@ -269,10 +289,10 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
   `pivot_root`, the child calls `chdir()` to the mounted CWD path.
 - The notifier filter must be installed **before** the main seccomp filter.
   The `seccomp()` syscall with `SECCOMP_FILTER_FLAG_NEW_LISTENER` returns
-  the notification fd. The child sends this fd to the parent via SCM_RIGHTS,
-  then installs the main filter via `prctl(PR_SET_SECCOMP)`.
-- The parent must receive the notifier fd and spawn the supervisor thread
-  before the child calls `execve()`, so the supervisor is ready to handle
+  the notification fd. The worker (PID 2) sends this fd to PID 1 (supervisor)
+  via SCM_RIGHTS, then installs the main filter via `prctl(PR_SET_SECCOMP)`.
+- PID 1 (the supervisor) must receive the notifier fd and begin its poll loop
+  before the worker calls `execve()`, so the supervisor is ready to handle
   notifications from the target program.
 - Seccomp must be loaded **after** all setup is complete, right before exec.
 - Environment filtering happens at exec time — `execve()` receives the
@@ -537,26 +557,42 @@ syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
 
 **Architecture:**
 
+The supervisor runs as **PID 1** inside the sandbox's PID namespace. This is
+necessary because:
+
+1. After `unshare(CLONE_NEWPID)`, `clone(CLONE_THREAD)` fails with `EINVAL`,
+   so a supervisor thread cannot be spawned.
+2. The host's procfs denies `/proc/<pid>/mem` opens from a child user namespace.
+   PID 1 mounts its own procfs (owned by the sandbox's user namespace).
+3. As PID 1, the supervisor is an ancestor of all sandboxed processes, satisfying
+   Yama `ptrace_scope=1` without `PR_SET_PTRACER`.
+
 ```
-  Child process                          Parent process
-  ─────────────                          ──────────────
-  PR_SET_PTRACER(parent_pid)             recv_fd() via SCM_RIGHTS
-  seccomp() → notifier fd                 → notifier_fd
-  send_fd() via SCM_RIGHTS              spawn supervisor thread
-  install main BPF filter                 │
-  execve()                                ▼
-       │                               ┌─────────────────────┐
-       │    connect(AF_INET, ...)      │  Supervisor thread   │
-       │ ──── SUSPENDED ────────────►  │  1. NOTIF_RECV       │
-       │                               │  2. open+read        │
-       │                               │     /proc/<pid>/mem  │
-       │                               │  3. Check policy     │
-       │                               │  4. NOTIF_ID_VALID   │
-       │    ALLOW / ERRNO(EPERM)       │  5. NOTIF_SEND       │
-       │ ◄──────────────────────────── └─────────────────────┘
+  PID 1 (supervisor)                     PID 2+ (worker / sandboxed)
+  ──────────────────                     ──────────────────────────
+  unshare(CLONE_NEWNS)                   Sandbox setup (overlay, pivot_root)
+  mount /proc                            seccomp() → notifier fd
+  recv_fd() via SCM_RIGHTS               send_fd() via SCM_RIGHTS
+       │                                 install main BPF filter
+       │    connect(AF_INET, ...)        execve()
+       │ ──── SUSPENDED ────────────►         │
+       │                               ┌──────┴──────────────┐
+       │                               │  Supervisor (PID 1) │
+       │                               │  1. NOTIF_RECV      │
+       │                               │  2. open+read       │
+       │                               │     /proc/<pid>/mem │
+       │                               │  3. Check policy    │
+       │                               │  4. NOTIF_ID_VALID  │
+       │    ALLOW / ERRNO(EPERM)       │  5. NOTIF_SEND      │
+       │ ◄──────────────────────────── └──────────────────────┘
        │
        ▼  (continues or gets EPERM)
 ```
+
+The supervisor runs inline (single-threaded) using `poll()` with a 200ms timeout,
+interleaved with non-blocking `waitpid` to detect when the worker exits. After the
+worker exits, remaining in-flight notifications are drained before the supervisor
+terminates.
 
 **Filtered syscalls:**
 
@@ -569,28 +605,25 @@ syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
 | `execve()` | Pathname string in userspace memory | Must match `allow_execve` paths (empty = allow all) |
 | `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
 
-**TOCTOU mitigation:** Between reading the child's memory and sending the verdict,
+**TOCTOU mitigation:** Between reading the worker's memory and sending the verdict,
 a multi-threaded sandbox process could modify the inspected memory. The supervisor
 calls `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` after the policy check — if the
 notification ID is no longer valid (thread exited or memory was remapped), the
 verdict is skipped.
 
-**Memory access via `PR_SET_PTRACER`:** The child calls
-`prctl(PR_SET_PTRACER, parent_pid)` before installing seccomp filters. This
-grants the supervisor (parent process) Yama ptrace access, allowing it to open
-`/proc/<pid>/mem` for any process that inherits the seccomp filter. The setting
-is inherited across `fork()`, so forked children (e.g., BEAM VM spawning child
-processes) are also covered. Without `PR_SET_PTRACER`, the kernel's
-`ptrace_may_access()` check blocks `/proc/<pid>/mem` opens across the user
-namespace boundary when `PR_SET_NO_NEW_PRIVS` and `yama.ptrace_scope=1` are
-in effect.
+**Memory access:** The supervisor (PID 1) runs in the same user namespace and PID
+namespace as all sandboxed processes. It mounts its own procfs (the user namespace
+owns the PID namespace, so the mount succeeds). `notif.pid` in the seccomp
+notification matches PIDs visible in this procfs. As PID 1, the supervisor is an
+ancestor of all sandboxed processes, so Yama `ptrace_scope=1` is satisfied without
+`PR_SET_PTRACER`. The supervisor does NOT have `PR_SET_NO_NEW_PRIVS` set, which
+would otherwise block `/proc/<pid>/mem` access.
 
 **Fd passing protocol:** Before `fork()`, the parent creates an anonymous
-Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). After the notifier
-filter is installed, the child sends the notifier fd to the parent as
-`SCM_RIGHTS` ancillary data. The parent receives it and spawns a supervisor
-thread that opens `/proc/<pid>/mem` on each notification to read the child's
-memory.
+Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). One end is inherited by
+the worker (PID 2+), the other by the supervisor (PID 1). After the notifier
+filter is installed, the worker sends the notifier fd to PID 1 as `SCM_RIGHTS`
+ancillary data.
 
 **Requirements:** Linux 5.9+ (auto-detected from `/proc/sys/kernel/osrelease`).
 Disabled in monitor mode (incompatible with `SECCOMP_RET_LOG`). Configurable
@@ -608,12 +641,24 @@ allow_execve validation)
 
 Process control enforces the `[process]` config section:
 
-**PID Namespace** (`CLONE_NEWPID` + inner fork + `setsid()`):
+**PID Namespace** (`CLONE_NEWPID` + two forks):
 
 The child calls `unshare(CLONE_NEWPID)` atomically with the other namespace
 flags. Since `CLONE_NEWPID` affects children of the calling process (not the
-caller itself), the child forks once more. The inner child becomes PID 1 in
-the new PID namespace.
+caller itself), the child forks to enter the new PID namespace.
+
+When the USER_NOTIF supervisor is enabled, a **second fork** inside the new
+PID namespace creates the supervisor/worker split:
+
+- **PID 1** (supervisor): Mounts its own `/proc` via `unshare(CLONE_NEWNS)`,
+  receives the notifier fd from the worker via SCM_RIGHTS, and runs the
+  supervisor loop inline (single-threaded poll + waitpid).
+- **PID 2+** (worker): Performs sandbox setup (overlay, pivot_root, seccomp),
+  installs the USER_NOTIF filter, sends the notifier fd to PID 1, then execs
+  the target command.
+
+When the notifier is disabled, there is only one fork. The child becomes
+PID 1 and proceeds directly with sandbox setup and exec.
 
 After the inner fork, `setsid()` is called to create a new session and
 process group. This is necessary because PID 1 inherits an invisible
@@ -622,15 +667,29 @@ bash's job control initialization fails because `getpgrp()` returns the
 parent-namespace process group ID, which doesn't exist in the new PID
 namespace — causing "initialize_job_control: getpgrp failed".
 
-The intermediate parent waits and propagates the exit code.
+The intermediate parent (in the old PID namespace) waits and propagates the exit code.
 
 ```
   Outer child (after unshare)
        │
-       ├── fork()
+       ├── fork()  (enters new PID namespace)
        │     │
-       │     ├── Inner child (PID 1 in new ns)
-       │     │     ├── setsid() — new session + process group
+       │     ├── [notifier enabled] fork() again:
+       │     │     │
+       │     │     ├── PID 1: Supervisor
+       │     │     │     ├── unshare(CLONE_NEWNS)
+       │     │     │     ├── mount /proc
+       │     │     │     ├── recv notifier fd
+       │     │     │     └── poll/waitpid supervisor loop
+       │     │     │
+       │     │     └── PID 2: Worker
+       │     │           ├── setsid()
+       │     │           ├── setup overlay, network, seccomp
+       │     │           ├── install notifier filter, send fd to PID 1
+       │     │           └── execve()
+       │     │
+       │     ├── [notifier disabled] PID 1: direct setup + exec
+       │     │     ├── setsid()
        │     │     ├── setup overlay, network, seccomp
        │     │     └── execve()
        │     │
@@ -864,11 +923,11 @@ Timeline:
   Parent: write(parent_done, 0x00)      ← "maps written, network ready"
 
   Child: read(parent_done)              ← unblocks
-  Child: install notifier filter, send fd to parent (if enabled)
+  Child: install notifier filter, send fd to PID 1 supervisor (if enabled)
   Child: setup overlay, network, seccomp
   Child: execve()
 
-  Parent: receive notifier fd, spawn supervisor thread (if enabled)
+  PID 1: receive notifier fd, run inline supervisor loop (if enabled)
 ```
 
 This protocol is necessary because:
@@ -883,10 +942,10 @@ This protocol is necessary because:
 3. **Mount operations need mapped UIDs.** The child cannot mount anything
    until its UID is mapped (otherwise the kernel rejects it).
 
-4. **The notifier fd must be passed from child to parent.** The `seccomp()`
-   syscall returns the notifier fd in the child's process. The fd is sent to
-   the parent via `SCM_RIGHTS` over an anonymous Unix socket pair created
-   before `fork()`.
+4. **The notifier fd must be passed from worker to supervisor.** The `seccomp()`
+   syscall returns the notifier fd in the worker's process. The fd is sent to
+   PID 1 (supervisor) via `SCM_RIGHTS` over an anonymous Unix socket pair
+   created before the supervisor/worker fork.
 
 ---
 
@@ -905,10 +964,10 @@ When a process calls `unshare(CLONE_NEWUSER)`, AppArmor transitions it to the
 | Feature | With AppArmor restriction | Without |
 |---------|--------------------------|---------|
 | User namespace | Works | Works |
-| Mount namespace | Created but mounts fail | Works |
-| Filesystem isolation | **Degraded** (host FS visible) | Full |
+| Mount namespace | Created but mounts fail → **aborts** | Works |
+| Filesystem isolation | **Aborts** (cannot establish) | Full |
 | Network namespace | Works | Works |
-| Loopback bring-up | Fails (no CAP_NET_ADMIN) | Works |
+| Loopback bring-up | Fails → **aborts** | Works |
 | slirp4netns | Works (runs in parent) | Works |
 | Seccomp | Works | Works |
 | USER_NOTIF supervisor | Works | Works |
