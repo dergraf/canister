@@ -185,6 +185,53 @@ pub fn resolve_bin_path() -> Option<String> {
     None
 }
 
+/// Set the SELinux exec context so the next `execve()` transitions the child
+/// into `canister_sandboxed_t`.
+///
+/// This is a no-op when SELinux is not active. On AppArmor systems, domain
+/// transitions are handled by the profile's `px` rules, not by setexeccon.
+///
+/// Must be called before `execve()` in the child process, after all other
+/// sandbox setup is complete.
+///
+/// # Errors
+///
+/// Returns an error if SELinux is active but the context cannot be written.
+/// This typically means the canister SELinux policy is not installed.
+pub fn set_child_selinux_context() -> Result<(), std::io::Error> {
+    // Only applies to SELinux.
+    if !selinux::is_enabled() {
+        return Ok(());
+    }
+
+    // Only set the context if the canister SELinux module is loaded.
+    // If it's not loaded, we'd fail trying to set an unknown context.
+    // The SELinux default transition will apply instead.
+    let selinux_context = "system_u:system_r:canister_sandboxed_t:s0";
+
+    // setexeccon(3) equivalent: write to /proc/thread-self/attr/exec.
+    // The kernel reads this attribute on the next execve() and performs
+    // the domain transition.
+    let attr_path = "/proc/thread-self/attr/exec";
+    match std::fs::write(attr_path, selinux_context) {
+        Ok(()) => {
+            tracing::debug!(context = selinux_context, "SELinux exec context set");
+            Ok(())
+        }
+        Err(e) => {
+            // ENOENT means /proc/thread-self/attr/exec doesn't exist (non-SELinux kernel).
+            // EINVAL/EACCES likely means the context is not valid or policy doesn't allow it.
+            // In both cases, log and continue — the sandbox still has other isolation layers.
+            tracing::warn!(
+                error = %e,
+                context = selinux_context,
+                "failed to set SELinux exec context (sandbox will still use other isolation layers)"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

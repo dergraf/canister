@@ -648,6 +648,12 @@ fn child_entry(
         "executing sandboxed command"
     );
 
+    // Set SELinux exec context so the child transitions to canister_sandboxed_t.
+    // This is a no-op on non-SELinux systems and on AppArmor (which uses profile
+    // rules for domain transitions). Must be called after seccomp setup but
+    // before execve.
+    crate::mac::set_child_selinux_context().ok();
+
     // Exec the target command with the (possibly filtered) environment.
     nix::unistd::execve(cmd, argv, &filtered_env).map_err(NamespaceError::Exec)?;
 

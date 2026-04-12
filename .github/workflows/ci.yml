@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install SELinux tools
-        run: dnf install -y checkpolicy policycoreutils selinux-policy-devel
+        run: dnf install -y checkpolicy policycoreutils selinux-policy-devel make python3
 
       - name: Install Rust toolchain
         run: |
@@ -126,76 +126,50 @@ jobs:
           key: selinux-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: selinux-${{ runner.os }}-
 
-      - name: Build canister
+      - name: Build and run SELinux unit tests
         run: |
           source "$HOME/.cargo/env"
           cargo build --workspace --quiet
+          cargo test -p can-sandbox -- mac::selinux --quiet
 
       - name: Generate and compile SELinux policy
         run: |
           source "$HOME/.cargo/env"
           BIN_PATH=$(realpath target/debug/can)
 
-          # Use cargo test to verify SELinux module unit tests compile.
-          cargo test -p can-sandbox -- mac::selinux --quiet
-
-          # Generate policy files using the binary's built-in templates.
-          # We extract them by running a small Rust snippet.
-          mkdir -p /tmp/selinux-test
-          cat > /tmp/selinux-test/gen.rs << 'GENEOF'
-          fn main() {
-              // Inline the template generation logic to test compilation.
-              let bin_path = "/usr/bin/can";
-              let te = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mac/selinux.rs"));
-              // Just verify the module compiles — the real test is checkmodule below.
-              println!("SELinux module source loaded ({} bytes)", te.len());
-          }
-          GENEOF
-
-          # Write policy files directly from the templates embedded in the source.
-          # Extract TE_TEMPLATE content between the markers.
+          # Extract the policy templates from the Rust source using python.
+          mkdir -p /tmp/selinux-build
           python3 -c "
-          import re, sys
+          import re
           src = open('crates/can-sandbox/src/mac/selinux.rs').read()
-          # Extract TE template
-          te_match = re.search(r'const TE_TEMPLATE:.*?= r#\"(.*?)\"#;', src, re.DOTALL)
-          fc_match = re.search(r'const FC_TEMPLATE:.*?= r#\"(.*?)\"#;', src, re.DOTALL)
+          te_match = re.search(r\"const TE_TEMPLATE:.*?= r#\\\"(.*?)\\\"#;\", src, re.DOTALL)
+          fc_match = re.search(r\"const FC_TEMPLATE:.*?= r#\\\"(.*?)\\\"#;\", src, re.DOTALL)
+          if_match = re.search(r\"const IF_TEMPLATE:.*?= r#\\\"(.*?)\\\"#;\", src, re.DOTALL)
           if te_match:
               te = te_match.group(1).replace('{bin_path}', '$BIN_PATH')
-              open('/tmp/selinux-test/canister.te', 'w').write(te)
+              open('/tmp/selinux-build/canister.te', 'w').write(te)
           if fc_match:
-              fc = fc_match.group(1).replace('{bin_path}', '$BIN_PATH'.replace('.', r'\.'))
-              open('/tmp/selinux-test/canister.fc', 'w').write(fc)
-          " || true
+              fc = fc_match.group(1).replace('{bin_path}', '${BIN_PATH}'.replace('.', r'\.'))
+              open('/tmp/selinux-build/canister.fc', 'w').write(fc)
+          if if_match:
+              open('/tmp/selinux-build/canister.if', 'w').write(if_match.group(1))
+          "
 
-          # If python extraction worked, try to compile.
-          if [ -f /tmp/selinux-test/canister.te ]; then
-            echo "--- Generated TE policy ---"
-            head -20 /tmp/selinux-test/canister.te
-            echo "..."
-            echo "--- Compiling with checkmodule ---"
-            # Note: This may fail because our policy uses reference policy macros
-            # (domain_type, domain_entry_file, etc.) which require the full
-            # selinux-policy-devel build infrastructure. We test what we can.
-            if checkmodule -M -m -o /tmp/selinux-test/canister.mod /tmp/selinux-test/canister.te 2>&1; then
-              echo "checkmodule: SUCCESS"
-              semodule_package -o /tmp/selinux-test/canister.pp -m /tmp/selinux-test/canister.mod 2>&1 || true
-              echo "Policy package created successfully"
-            else
-              echo "::warning::checkmodule failed (expected — policy uses reference policy macros that require make-based build)"
-              echo "Unit tests passed; full policy compilation requires 'make -f /usr/share/selinux/devel/Makefile'"
-              # Try the reference policy build system instead.
-              cp /tmp/selinux-test/canister.te /tmp/selinux-test/canister.fc .
-              touch canister.if
-              if make -f /usr/share/selinux/devel/Makefile canister.pp 2>&1; then
-                echo "Reference policy build: SUCCESS"
-              else
-                echo "::warning::Reference policy build also failed — policy may need adjustments for this Fedora version"
-              fi
-            fi
-          else
-            echo "::warning::Could not extract policy templates — skipping compile test"
+          if [ ! -f /tmp/selinux-build/canister.te ]; then
+            echo "::error::Could not extract TE template from source"
+            exit 1
           fi
+
+          echo "--- Generated TE policy ---"
+          cat /tmp/selinux-build/canister.te
+          echo "--- End TE policy ---"
+
+          # Build using the reference policy Makefile (same as `can setup` uses).
+          echo "--- Building with reference policy Makefile ---"
+          cd /tmp/selinux-build
+          make -f /usr/share/selinux/devel/Makefile canister.pp
+          echo "Reference policy build: SUCCESS"
+          ls -la canister.pp
 
   apparmor-compile-test:
     name: AppArmor Profile Compile Test

@@ -9,8 +9,8 @@
 //! - `canister_sandboxed_t` — domain for sandboxed child processes (restricted)
 //! - `canister_exec_t` — file type for the `can` binary (triggers domain transition)
 //!
-//! Installation requires `checkmodule`, `semodule_package`, and `semodule` tools
-//! (provided by `policycoreutils` and `checkpolicy` packages).
+//! Installation requires the refpolicy development Makefile and `semodule`
+//! (provided by `selinux-policy-devel` and `policycoreutils` packages).
 
 use std::path::Path;
 
@@ -25,6 +25,10 @@ const POLICY_DIR: &str = "/tmp/canister-selinux";
 /// Where the compiled policy module is cached for reference.
 const POLICY_REF_PATH: &str = "/etc/canister/selinux/canister.te";
 
+/// Path to the reference policy Makefile (provided by selinux-policy-devel).
+/// This handles m4 macro expansion, checkmodule compilation, and packaging.
+const REFPOLICY_MAKEFILE: &str = "/usr/share/selinux/devel/Makefile";
+
 /// The SELinux type enforcement policy template.
 /// `{bin_path}` is replaced with the actual binary path.
 const TE_TEMPLATE: &str = r#"# Canister sandbox SELinux policy module
@@ -32,6 +36,17 @@ const TE_TEMPLATE: &str = r#"# Canister sandbox SELinux policy module
 # Binary: {bin_path}
 
 policy_module(canister, 1.0.0)
+
+require {
+    type unconfined_t;
+    role unconfined_r;
+    attribute file_type;
+    attribute exec_type;
+    attribute domain;
+    type proc_t;
+    type fs_t;
+    type tmpfs_t;
+}
 
 ########################################
 # Type declarations
@@ -47,13 +62,26 @@ domain_entry_file(canister_t, canister_exec_t)
 type canister_sandboxed_t;
 domain_type(canister_sandboxed_t)
 
-# Transition: when canister_t executes anything, children enter sandboxed domain.
-# The can binary itself handles re-exec detection to stay in canister_t.
-type_transition canister_t bin_t:process canister_sandboxed_t;
+# Programmatic domain transition: the supervisor uses setexeccon() before exec
+# to place children into canister_sandboxed_t. No automatic type_transition rule
+# is needed — this avoids depending on specific file types like bin_t.
+allow canister_t canister_sandboxed_t:process { transition dyntransition };
+allow canister_t self:process { setexec };
+
+# NNP (No New Privileges) transition — required when the child has
+# PR_SET_NO_NEW_PRIVS set, which is common in sandbox environments.
+allow canister_t canister_sandboxed_t:process2 { nnp_transition nosuid_transition };
+
+# Any executable file type can be an entry point for the sandboxed domain.
+allow canister_sandboxed_t exec_type:file entrypoint;
 
 # Allow users to transition into canister_t by executing the can binary.
 role unconfined_r types canister_t;
 role unconfined_r types canister_sandboxed_t;
+
+# Allow unconfined_t to transition to canister_t.
+allow unconfined_t canister_t:process { transition dyntransition };
+allow unconfined_t canister_t:process2 { nnp_transition nosuid_transition };
 
 ########################################
 # canister_t — full sandbox supervisor permissions
@@ -97,9 +125,9 @@ allow canister_t self:netlink_route_socket { create bind getattr nlmsg_read };
 allow canister_t self:fifo_file { getattr open read write };
 allow canister_t canister_sandboxed_t:fifo_file { getattr open read write };
 
-# Execute pasta unconfined (it has its own policy or runs as pasta_t).
-# pasta needs to join user/network namespaces which requires its own domain.
-allow canister_t bin_t:file { execute execute_no_trans };
+# Execute binaries (pasta, etc.) without automatic domain transition.
+# Uses exec_type attribute to cover all executable file types.
+allow canister_t exec_type:file { execute execute_no_trans };
 
 # Seccomp BPF.
 allow canister_t self:bpf { prog_load prog_run };
@@ -352,13 +380,17 @@ fn extract_bin_path_from_te(content: &str) -> Option<String> {
 
 /// Install the SELinux policy module.
 ///
+/// Uses the reference policy build system (`/usr/share/selinux/devel/Makefile`)
+/// which handles m4 macro expansion, compilation, and packaging. This is the
+/// standard way to build SELinux modules on Fedora/RHEL and requires the
+/// `selinux-policy-devel` package.
+///
 /// Steps:
 /// 1. Write .te, .fc, .if to a temp directory
-/// 2. Compile with checkmodule
-/// 3. Package with semodule_package
-/// 4. Install with semodule -i
-/// 5. Apply file contexts with restorecon
-/// 6. Save reference copy of .te for status detection
+/// 2. Build with the reference policy Makefile (m4 + checkmodule + semodule_package)
+/// 3. Install with semodule -i
+/// 4. Apply file contexts with restorecon
+/// 5. Save reference copy of .te for status detection
 fn install_module(bin_path: &str) -> Result<(), SetupError> {
     let te_content = generate_te(bin_path);
     let fc_content = generate_fc(bin_path);
@@ -373,7 +405,6 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
     let te_path = format!("{POLICY_DIR}/{MODULE_NAME}.te");
     let fc_path = format!("{POLICY_DIR}/{MODULE_NAME}.fc");
     let if_path = format!("{POLICY_DIR}/{MODULE_NAME}.if");
-    let mod_path = format!("{POLICY_DIR}/{MODULE_NAME}.mod");
     let pp_path = format!("{POLICY_DIR}/{MODULE_NAME}.pp");
 
     // Write source files.
@@ -392,41 +423,42 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
 
     tracing::info!(dir = POLICY_DIR, "SELinux policy source files written");
 
-    // Step 1: Compile .te to .mod
-    let output = std::process::Command::new("checkmodule")
-        .args(["-M", "-m", "-o", &mod_path, &te_path])
+    // Build with the reference policy Makefile. This handles:
+    // - m4 macro expansion (domain_type, domain_entry_file, etc.)
+    // - checkmodule compilation
+    // - semodule_package packaging
+    let makefile = REFPOLICY_MAKEFILE;
+    if !Path::new(makefile).exists() {
+        return Err(SetupError::ToolFailed {
+            tool: "selinux-policy-devel".to_string(),
+            stderr: format!(
+                "{makefile} not found.\n\
+                 Install the SELinux development tools:\n  \
+                 sudo dnf install selinux-policy-devel    # Fedora/RHEL\n  \
+                 sudo apt install selinux-policy-dev      # Debian/Ubuntu"
+            ),
+        });
+    }
+
+    let pp_target = format!("{MODULE_NAME}.pp");
+    let output = std::process::Command::new("make")
+        .args(["-f", makefile, &pp_target])
+        .current_dir(POLICY_DIR)
         .output()
         .map_err(|e| SetupError::Command {
-            cmd: "checkmodule".to_string(),
+            cmd: format!("make -f {makefile}"),
             source: e,
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SetupError::ToolFailed {
-            tool: "checkmodule".to_string(),
+            tool: format!("make -f {makefile}"),
             stderr: stderr.to_string(),
         });
     }
 
-    // Step 2: Package .mod + .fc into .pp
-    let output = std::process::Command::new("semodule_package")
-        .args(["-o", &pp_path, "-m", &mod_path, "-f", &fc_path])
-        .output()
-        .map_err(|e| SetupError::Command {
-            cmd: "semodule_package".to_string(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SetupError::ToolFailed {
-            tool: "semodule_package".to_string(),
-            stderr: stderr.to_string(),
-        });
-    }
-
-    // Step 3: Install the module.
+    // Install the compiled module.
     let output = std::process::Command::new("semodule")
         .args(["-i", &pp_path])
         .output()
@@ -436,8 +468,8 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
                     policy_content: te_content.clone(),
                     bin_path: bin_path.to_string(),
                     manual_instructions: format!(
-                        "  sudo checkmodule -M -m -o {mod_path} {te_path}\n  \
-                         sudo semodule_package -o {pp_path} -m {mod_path} -f {fc_path}\n  \
+                        "  cd {POLICY_DIR}\n  \
+                         sudo make -f {makefile} {pp_target}\n  \
                          sudo semodule -i {pp_path}\n  \
                          sudo restorecon -v {bin_path}"
                     ),
@@ -469,7 +501,7 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
         });
     }
 
-    // Step 4: Apply file contexts.
+    // Apply file contexts.
     let output = std::process::Command::new("restorecon")
         .args(["-v", bin_path])
         .output()
@@ -483,7 +515,7 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
         tracing::warn!(%stderr, "restorecon failed (file context may not be applied)");
     }
 
-    // Step 5: Save reference copy for status detection.
+    // Save reference copy for status detection.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     if let Err(e) = std::fs::create_dir_all(ref_dir) {
         tracing::warn!(error = %e, "could not create reference directory (status detection may be limited)");
@@ -552,6 +584,49 @@ mod tests {
         let te = generate_te("/usr/bin/can");
         assert!(te.contains("user_namespace create"));
         assert!(te.contains("cap_userns"));
+    }
+
+    #[test]
+    fn generate_te_has_require_block_for_external_types() {
+        let te = generate_te("/usr/bin/can");
+        assert!(te.contains("require {"));
+        assert!(te.contains("type unconfined_t;"));
+        assert!(te.contains("attribute exec_type;"));
+        assert!(te.contains("attribute file_type;"));
+        assert!(te.contains("type proc_t;"));
+        assert!(te.contains("type tmpfs_t;"));
+    }
+
+    #[test]
+    fn generate_te_uses_programmatic_transition() {
+        let te = generate_te("/usr/bin/can");
+        // setexeccon()-based transition, no type_transition rule needed.
+        assert!(te.contains("setexec"));
+        assert!(
+            te.contains("canister_t canister_sandboxed_t:process { transition dyntransition }")
+        );
+        assert!(te.contains(
+            "canister_t canister_sandboxed_t:process2 { nnp_transition nosuid_transition }"
+        ));
+        assert!(te.contains("canister_sandboxed_t exec_type:file entrypoint"));
+    }
+
+    #[test]
+    fn generate_te_does_not_use_bin_t_in_rules() {
+        let te = generate_te("/usr/bin/can");
+        // bin_t was removed from actual rules — we use exec_type attribute instead.
+        // Comments may still mention bin_t for historical context, so only check
+        // non-comment lines.
+        for line in te.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("bin_t"),
+                "Found bin_t in policy rule: {trimmed}"
+            );
+        }
     }
 
     #[test]
