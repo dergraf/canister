@@ -1,6 +1,9 @@
-# GitHub Actions CI — check, unit tests, MSRV, policy compile tests.
-# Integration tests requiring kernel-level access (user namespaces, MAC
-# enforcement) run on Cirrus CI with real VMs — see .cirrus.yml.
+# GitHub Actions CI — check, unit tests, MSRV, policy compile tests,
+# and integration tests on real VMs (QEMU/KVM) with MAC enforcement.
+#
+# Integration tests boot Fedora (SELinux) and Ubuntu (AppArmor) cloud
+# images in QEMU with KVM acceleration on the GHA runner, SCP the
+# pre-built binary in, and run the full integration suite.
 name: CI
 
 on:
@@ -14,6 +17,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # -----------------------------------------------------------------------
+  # Static analysis and unit tests
+  # -----------------------------------------------------------------------
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -103,6 +109,9 @@ jobs:
       - name: Check MSRV
         run: cargo check --workspace
 
+  # -----------------------------------------------------------------------
+  # MAC policy compile tests (container-based, no kernel needed)
+  # -----------------------------------------------------------------------
   selinux-compile-test:
     name: SELinux Policy Compile Test
     runs-on: ubuntu-latest
@@ -225,3 +234,443 @@ jobs:
             echo "::error::Could not extract profile template"
             exit 1
           fi
+
+  # -----------------------------------------------------------------------
+  # Build binary for VM integration tests
+  # -----------------------------------------------------------------------
+  build:
+    name: Build (integration artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup toolchain
+        run: rustup show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build --release --workspace
+
+      - name: Package artifact
+        run: |
+          mkdir -p artifact
+          cp target/release/can artifact/
+          cp -r tests/integration artifact/
+          tar czf canister-artifact.tar.gz -C artifact .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canister-artifact
+          path: canister-artifact.tar.gz
+          retention-days: 1
+
+  # -----------------------------------------------------------------------
+  # Integration tests on Fedora VM (SELinux enforcing) via QEMU/KVM
+  # -----------------------------------------------------------------------
+  integration-fedora-selinux:
+    name: Integration (Fedora + SELinux)
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 20
+    env:
+      VM_SSH_PORT: 2222
+      VM_USER: canister
+      FEDORA_IMAGE_URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2"
+      FEDORA_IMAGE: "fedora-cloud.qcow2"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Install QEMU and cloud-image-utils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils openssh-client
+          sudo chmod 666 /dev/kvm
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: canister-artifact
+
+      - name: Generate SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/vm_key -N "" -q
+          cat ~/.ssh/vm_key.pub
+
+      - name: Create cloud-init config
+        run: |
+          mkdir -p cloud-init
+          cat > cloud-init/user-data <<'USERDATA'
+          #cloud-config
+          users:
+            - name: canister
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - SSH_PUBKEY_PLACEHOLDER
+          USERDATA
+
+          # Inject the actual SSH public key.
+          sed -i "s|SSH_PUBKEY_PLACEHOLDER|$(cat ~/.ssh/vm_key.pub)|" cloud-init/user-data
+
+          cat > cloud-init/meta-data <<'EOF'
+          instance-id: canister-ci
+          local-hostname: canister-ci
+          EOF
+
+          cloud-localds cloud-init/seed.iso cloud-init/user-data cloud-init/meta-data
+
+      - name: Download Fedora Cloud image
+        run: |
+          curl -fSL -o "$FEDORA_IMAGE" "$FEDORA_IMAGE_URL"
+          # Create a working copy (CoW overlay) so we don't modify the original.
+          qemu-img create -f qcow2 -b "$FEDORA_IMAGE" -F qcow2 fedora-work.qcow2 20G
+
+      - name: Boot Fedora VM
+        run: |
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -m 4096 \
+            -smp 2 \
+            -nographic \
+            -drive file=fedora-work.qcow2,if=virtio \
+            -drive file=cloud-init/seed.iso,if=virtio,format=raw \
+            -netdev user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial mon:stdio \
+            &> /tmp/qemu-fedora.log &
+          QEMU_PID=$!
+          echo "QEMU_PID=$QEMU_PID" >> "$GITHUB_ENV"
+          echo "QEMU started with PID $QEMU_PID"
+
+      - name: Wait for SSH
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i ~/.ssh/vm_key"
+          echo "Waiting for VM SSH to become available..."
+          for i in $(seq 1 60); do
+            if ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost echo "SSH ready" 2>/dev/null; then
+              echo "VM is ready after ~${i}x5 seconds"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::VM did not become SSH-ready within 5 minutes"
+          echo "--- QEMU log (last 100 lines) ---"
+          tail -100 /tmp/qemu-fedora.log
+          exit 1
+
+      - name: Copy artifacts to VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SCP="scp $SSH_OPTS -P $VM_SSH_PORT"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          # Copy the artifact tarball.
+          $SCP canister-artifact.tar.gz $VM_USER@localhost:~/
+
+          # Unpack into the expected directory structure for lib.sh.
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          mkdir -p ~/canister/target/release ~/canister/tests /tmp/canister-unpack
+          tar xzf ~/canister-artifact.tar.gz -C /tmp/canister-unpack
+          cp /tmp/canister-unpack/can ~/canister/target/release/can
+          chmod +x ~/canister/target/release/can
+          cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
+          chmod +x ~/canister/tests/integration/*.sh
+          echo "--- Artifact layout ---"
+          find ~/canister -type f | head -30
+          REMOTE
+
+      - name: Install dependencies in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          sudo dnf install -y passt selinux-policy-devel policycoreutils python3
+          echo "--- Environment ---"
+          uname -a
+          getenforce
+          sestatus
+          pasta --version 2>/dev/null || echo "pasta version check failed"
+          cat /proc/sys/user/max_user_namespaces 2>/dev/null || true
+          unshare --user true && echo "unshare --user works" || echo "unshare --user FAILED"
+          REMOTE
+
+      - name: Install MAC policy in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          # Smoke test the binary first.
+          ~/canister/target/release/can check
+
+          # Install SELinux policy (non-interactive: not a TTY).
+          sudo ~/canister/target/release/can setup --force 2>&1
+          echo "--- SELinux policy installed ---"
+          sudo semodule -l | grep canister || echo "canister module not visible"
+
+          # Verify sandbox works after policy install.
+          ~/canister/target/release/can run -- echo "sandbox works after SELinux policy install"
+          REMOTE
+
+      - name: Run integration tests in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          cd ~/canister
+          ./tests/integration/run.sh
+          REMOTE
+
+      - name: Run SELinux MAC tests explicitly
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          cd ~/canister
+          bash ./tests/integration/t_selinux.sh
+          REMOTE
+
+      - name: Shutdown VM
+        if: always()
+        run: |
+          if [ -n "${QEMU_PID:-}" ]; then
+            kill "$QEMU_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload QEMU log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-fedora-log
+          path: /tmp/qemu-fedora.log
+          retention-days: 3
+
+  # -----------------------------------------------------------------------
+  # Integration tests on Ubuntu VM (AppArmor enforcing) via QEMU/KVM
+  # -----------------------------------------------------------------------
+  integration-ubuntu-apparmor:
+    name: Integration (Ubuntu + AppArmor)
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 20
+    env:
+      VM_SSH_PORT: 2222
+      VM_USER: canister
+      UBUNTU_IMAGE_URL: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+      UBUNTU_IMAGE: "ubuntu-cloud.img"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Install QEMU and cloud-image-utils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils openssh-client
+          sudo chmod 666 /dev/kvm
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: canister-artifact
+
+      - name: Generate SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/vm_key -N "" -q
+          cat ~/.ssh/vm_key.pub
+
+      - name: Create cloud-init config
+        run: |
+          mkdir -p cloud-init
+          cat > cloud-init/user-data <<'USERDATA'
+          #cloud-config
+          users:
+            - name: canister
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - SSH_PUBKEY_PLACEHOLDER
+          USERDATA
+
+          # Inject the actual SSH public key.
+          sed -i "s|SSH_PUBKEY_PLACEHOLDER|$(cat ~/.ssh/vm_key.pub)|" cloud-init/user-data
+
+          cat > cloud-init/meta-data <<'EOF'
+          instance-id: canister-ci
+          local-hostname: canister-ci
+          EOF
+
+          cloud-localds cloud-init/seed.iso cloud-init/user-data cloud-init/meta-data
+
+      - name: Download Ubuntu Cloud image
+        run: |
+          curl -fSL -o "$UBUNTU_IMAGE" "$UBUNTU_IMAGE_URL"
+          # Create a working copy (CoW overlay) so we don't modify the original.
+          qemu-img create -f qcow2 -b "$UBUNTU_IMAGE" -F qcow2 ubuntu-work.qcow2 20G
+
+      - name: Boot Ubuntu VM
+        run: |
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -m 4096 \
+            -smp 2 \
+            -nographic \
+            -drive file=ubuntu-work.qcow2,if=virtio \
+            -drive file=cloud-init/seed.iso,if=virtio,format=raw \
+            -netdev user,id=net0,hostfwd=tcp::${VM_SSH_PORT}-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -serial mon:stdio \
+            &> /tmp/qemu-ubuntu.log &
+          QEMU_PID=$!
+          echo "QEMU_PID=$QEMU_PID" >> "$GITHUB_ENV"
+          echo "QEMU started with PID $QEMU_PID"
+
+      - name: Wait for SSH
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i ~/.ssh/vm_key"
+          echo "Waiting for VM SSH to become available..."
+          for i in $(seq 1 60); do
+            if ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost echo "SSH ready" 2>/dev/null; then
+              echo "VM is ready after ~${i}x5 seconds"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::VM did not become SSH-ready within 5 minutes"
+          echo "--- QEMU log (last 100 lines) ---"
+          tail -100 /tmp/qemu-ubuntu.log
+          exit 1
+
+      - name: Copy artifacts to VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SCP="scp $SSH_OPTS -P $VM_SSH_PORT"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          # Copy the artifact tarball.
+          $SCP canister-artifact.tar.gz $VM_USER@localhost:~/
+
+          # Unpack into the expected directory structure for lib.sh.
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          mkdir -p ~/canister/target/release ~/canister/tests /tmp/canister-unpack
+          tar xzf ~/canister-artifact.tar.gz -C /tmp/canister-unpack
+          cp /tmp/canister-unpack/can ~/canister/target/release/can
+          chmod +x ~/canister/target/release/can
+          cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
+          chmod +x ~/canister/tests/integration/*.sh
+          echo "--- Artifact layout ---"
+          find ~/canister -type f | head -30
+          REMOTE
+
+      - name: Install dependencies in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq passt apparmor-utils python3
+          echo "--- Environment ---"
+          uname -a
+          cat /sys/module/apparmor/parameters/enabled
+          sudo aa-status --verbose 2>/dev/null || true
+          pasta --version 2>/dev/null || echo "pasta version check failed"
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo "userns restriction sysctl not found"
+          unshare --user true && echo "unshare --user works" || echo "unshare --user FAILED"
+          REMOTE
+
+      - name: Relax AppArmor userns restriction
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          # Ubuntu 24.04+ restricts unprivileged user namespaces via AppArmor.
+          # Relax this so the sandbox can create namespaces, then install our
+          # AppArmor profile which explicitly grants the permission.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo "Relaxing AppArmor userns restriction for integration tests..."
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          REMOTE
+
+      - name: Install MAC policy in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          # Smoke test the binary first.
+          ~/canister/target/release/can check
+
+          # Install AppArmor profile (non-interactive: not a TTY).
+          sudo ~/canister/target/release/can setup --force 2>&1
+          echo "--- AppArmor policy installed ---"
+          sudo aa-status 2>/dev/null | grep -i canister || echo "canister profile not visible in aa-status"
+
+          # Verify sandbox works after policy install.
+          ~/canister/target/release/can run -- echo "sandbox works after AppArmor policy install"
+          REMOTE
+
+      - name: Run integration tests in VM
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          cd ~/canister
+          ./tests/integration/run.sh
+          REMOTE
+
+      - name: Run AppArmor MAC tests explicitly
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/vm_key"
+          SSH="ssh $SSH_OPTS -p $VM_SSH_PORT $VM_USER@localhost"
+
+          $SSH <<'REMOTE'
+          set -euo pipefail
+          cd ~/canister
+          bash ./tests/integration/t_apparmor.sh
+          REMOTE
+
+      - name: Shutdown VM
+        if: always()
+        run: |
+          if [ -n "${QEMU_PID:-}" ]; then
+            kill "$QEMU_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload QEMU log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-ubuntu-log
+          path: /tmp/qemu-ubuntu.log
+          retention-days: 3
