@@ -333,9 +333,20 @@ jobs:
 
           cloud-localds cloud-init/seed.iso cloud-init/user-data cloud-init/meta-data
 
+      - name: Cache Fedora Cloud image
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FEDORA_IMAGE }}
+          key: vm-image-fedora-${{ env.FEDORA_IMAGE_URL }}
+
       - name: Download Fedora Cloud image
         run: |
-          curl -fSL --retry 3 --retry-delay 10 -o "$FEDORA_IMAGE" "$FEDORA_IMAGE_URL"
+          if [ -f "$FEDORA_IMAGE" ]; then
+            echo "Using cached image"
+            ls -lh "$FEDORA_IMAGE"
+          else
+            curl -fSL --retry 3 --retry-delay 10 -o "$FEDORA_IMAGE" "$FEDORA_IMAGE_URL"
+          fi
           # Create a working copy (CoW overlay) so we don't modify the original.
           qemu-img create -f qcow2 -b "$FEDORA_IMAGE" -F qcow2 fedora-work.qcow2 20G
 
@@ -527,9 +538,20 @@ jobs:
 
           cloud-localds cloud-init/seed.iso cloud-init/user-data cloud-init/meta-data
 
+      - name: Cache Ubuntu Cloud image
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UBUNTU_IMAGE }}
+          key: vm-image-ubuntu-${{ env.UBUNTU_IMAGE_URL }}
+
       - name: Download Ubuntu Cloud image
         run: |
-          curl -fSL --retry 3 --retry-delay 10 -o "$UBUNTU_IMAGE" "$UBUNTU_IMAGE_URL"
+          if [ -f "$UBUNTU_IMAGE" ]; then
+            echo "Using cached image"
+            ls -lh "$UBUNTU_IMAGE"
+          else
+            curl -fSL --retry 3 --retry-delay 10 -o "$UBUNTU_IMAGE" "$UBUNTU_IMAGE_URL"
+          fi
           # Create a working copy (CoW overlay) so we don't modify the original.
           qemu-img create -f qcow2 -b "$UBUNTU_IMAGE" -F qcow2 ubuntu-work.qcow2 20G
 
