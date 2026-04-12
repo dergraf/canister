@@ -6,6 +6,8 @@
 #
 # GitHub Actions handles: check, unit tests, MSRV, policy compile tests.
 # Cirrus CI handles: integration tests requiring kernel-level access.
+#
+# Dashboard: https://cirrus-ci.com/github/dergraf/canister
 
 env:
   CIRRUS_SHELL: "/bin/bash"
