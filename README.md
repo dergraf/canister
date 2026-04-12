@@ -48,7 +48,7 @@ discarded.
 - **Recipe inspection** -- `can recipe show` emits the fully resolved policy as valid TOML for auditing or creating standalone recipes
 - **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
 - **Single binary** -- pure Rust, no external library dependencies
-- **AppArmor detection** -- detects AppArmor restrictions on mount operations and aborts with a clear error message and instructions
+- **MAC detection** -- detects AppArmor (Ubuntu) and SELinux (Fedora/RHEL) restrictions; auto-installs the correct security policy via `can setup`
 - **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata, `[syscalls]` section for per-recipe baseline customization
 - **TTY-aware logging** -- colored human output on terminals, JSON lines when piped
 
@@ -94,12 +94,8 @@ curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister
 
 ### Build from source
 
-```
-# Using mise (recommended)
-mise install
-mise run build
-
-# Or plain cargo
+```bash
+# Rust toolchain is pinned via rust-toolchain.toml — rustup handles it automatically
 cargo build --release
 ```
 
@@ -439,32 +435,42 @@ not expected to carry kernel exploits.
 immediate process termination on any denied syscall rather than returning
 an error code the process could handle.
 
-## AppArmor (Ubuntu 24.04+)
+## Security Policies (AppArmor / SELinux)
 
-Ubuntu 24.04+ restricts mount operations inside unprivileged user namespaces
-via AppArmor. Canister detects this and aborts with a clear error message.
+Some distributions restrict mount operations inside unprivileged user namespaces
+via Mandatory Access Control:
 
-To enable full isolation, install the AppArmor profile:
+- **Ubuntu 24.04+**: AppArmor (`apparmor_restrict_unprivileged_userns=1`)
+- **Fedora 41+ / RHEL 10+**: SELinux (`user_namespace { create }` permission)
+- **Arch, Void, Gentoo, etc.**: No restriction — works natively
+
+Canister detects the active MAC system and aborts with a clear error if a policy
+is needed but not installed.
 
 ```bash
-# Install (auto-detects binary path, generates profile from built-in template)
+# Install the security policy (auto-detects MAC system and binary path)
+# Interactive: shows the policy, asks for confirmation before writing
 sudo can setup
 
 # Force reinstall (e.g., after upgrading canister)
 sudo can setup --force
 
-# Check profile status
+# Check policy status
 can check
 
-# Remove profile
+# Remove the policy
 sudo can setup --remove
 ```
 
-The profile grants the `can` binary mount/capability permissions and transitions
-sandboxed child processes to a restricted sub-profile (`canister_sandboxed`)
-that denies all capabilities, mount operations, and user namespace creation.
-Trusted helper binaries (pasta, apparmor_parser) run unconfined via specific
-`ux` rules.
+**AppArmor:** The profile grants the `can` binary mount/capability permissions
+and transitions sandboxed child processes to a restricted sub-profile
+(`canister_sandboxed`) that denies all capabilities, mount operations, and user
+namespace creation. Trusted helper binaries (pasta, apparmor_parser) run
+unconfined via specific `ux` rules.
+
+**SELinux:** The policy module defines `canister_t` (supervisor domain) and
+`canister_sandboxed_t` (restricted child domain) with appropriate type
+transitions and permission grants.
 
 ## Project Structure
 
@@ -506,21 +512,24 @@ canister/
 ## Development
 
 ```bash
-# Prerequisites
-mise install           # or: rustup install 1.93
+# Prerequisites — rust-toolchain.toml pins the version, rustup installs it automatically
+rustup show
 
 # Build
-mise run build         # or: cargo build --workspace
+cargo build --workspace
 
 # Test
-mise run test          # or: cargo test --workspace
+cargo test --workspace
+
+# Integration tests (requires built binary + Linux namespaces)
+cargo build --workspace && ./tests/integration/run.sh
 
 # Lint
-mise run lint          # or: cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Format
-mise run fmt           # check
-mise run fmt-fix       # fix
+cargo fmt --all --check  # check
+cargo fmt --all          # fix
 ```
 
 ## License
