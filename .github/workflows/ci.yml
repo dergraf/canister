@@ -116,7 +116,7 @@ jobs:
     name: SELinux Policy Compile Test
     runs-on: ubuntu-latest
     container:
-      image: fedora:41
+      image: fedora:42
     steps:
       - uses: actions/checkout@v4
 
@@ -285,7 +285,7 @@ jobs:
     env:
       VM_SSH_PORT: 2222
       VM_USER: canister
-      FEDORA_IMAGE_URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2"
+      FEDORA_IMAGE_URL: "https://download.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2"
       FEDORA_IMAGE: "fedora-cloud.qcow2"
     steps:
       - name: Free disk space
