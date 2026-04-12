@@ -264,6 +264,7 @@ jobs:
           mkdir -p artifact
           cp target/release/can artifact/
           cp -r tests/integration artifact/
+          cp -r recipes artifact/
           tar czf canister-artifact.tar.gz -C artifact .
 
       - name: Upload artifact
@@ -334,7 +335,7 @@ jobs:
 
       - name: Download Fedora Cloud image
         run: |
-          curl -fSL -o "$FEDORA_IMAGE" "$FEDORA_IMAGE_URL"
+          curl -fSL --retry 3 --retry-delay 10 -o "$FEDORA_IMAGE" "$FEDORA_IMAGE_URL"
           # Create a working copy (CoW overlay) so we don't modify the original.
           qemu-img create -f qcow2 -b "$FEDORA_IMAGE" -F qcow2 fedora-work.qcow2 20G
 
@@ -389,8 +390,9 @@ jobs:
           chmod +x ~/canister/target/release/can
           cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
           chmod +x ~/canister/tests/integration/*.sh
+          cp -r /tmp/canister-unpack/recipes ~/canister/recipes
           echo "--- Artifact layout ---"
-          find ~/canister -type f | head -30
+          find ~/canister -type f | head -40
           REMOTE
 
       - name: Install dependencies in VM
@@ -527,7 +529,7 @@ jobs:
 
       - name: Download Ubuntu Cloud image
         run: |
-          curl -fSL -o "$UBUNTU_IMAGE" "$UBUNTU_IMAGE_URL"
+          curl -fSL --retry 3 --retry-delay 10 -o "$UBUNTU_IMAGE" "$UBUNTU_IMAGE_URL"
           # Create a working copy (CoW overlay) so we don't modify the original.
           qemu-img create -f qcow2 -b "$UBUNTU_IMAGE" -F qcow2 ubuntu-work.qcow2 20G
 
@@ -582,8 +584,9 @@ jobs:
           chmod +x ~/canister/target/release/can
           cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
           chmod +x ~/canister/tests/integration/*.sh
+          cp -r /tmp/canister-unpack/recipes ~/canister/recipes
           echo "--- Artifact layout ---"
-          find ~/canister -type f | head -30
+          find ~/canister -type f | head -40
           REMOTE
 
       - name: Install dependencies in VM
