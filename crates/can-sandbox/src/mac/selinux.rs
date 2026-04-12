@@ -95,10 +95,6 @@ allow canister_t self:cap_userns { sys_admin sys_ptrace net_admin sys_chroot };
 allow canister_t self:capability { sys_admin net_admin sys_chroot sys_ptrace dac_override dac_read_search };
 allow canister_t self:process { fork setexec setpgid setsched signal_perms transition };
 
-# Namespace operations.
-allow canister_t self:cap2_userns { audit_write };
-allow canister_t self:namespace { clone_newuser clone_newpid clone_newnet clone_newns };
-
 # Mount / pivot_root for filesystem isolation.
 allow canister_t fs_t:filesystem { mount unmount remount };
 allow canister_t self:filesystem { associate mount unmount };
