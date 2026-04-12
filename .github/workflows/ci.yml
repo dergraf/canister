@@ -436,7 +436,15 @@ jobs:
           # Install SELinux policy (non-interactive: not a TTY).
           sudo ~/canister/target/release/can setup --force 2>&1
           echo "--- SELinux policy installed ---"
-          sudo semodule -lfull 2>/dev/null | grep canister || sudo semodule -l | grep canister || echo "canister module not visible in semodule output"
+
+          # Debug: check what the build produced and module store state.
+          echo "--- Policy build artifacts ---"
+          ls -la /tmp/canister-selinux/ 2>/dev/null || echo "/tmp/canister-selinux not found"
+          echo "--- semodule -lfull (all modules) | grep -i can ---"
+          sudo semodule -lfull 2>&1 | grep -i can || echo "(none)"
+          echo "--- Module store ---"
+          ls /var/lib/selinux/targeted/active/modules/400/ 2>/dev/null | head -20 || echo "no priority-400 store"
+          ls /var/lib/selinux/targeted/active/modules/100/ 2>/dev/null | grep -i can || echo "no canister in priority-100"
 
           # Verify sandbox works after policy install.
           ~/canister/target/release/can run -- echo "sandbox works after SELinux policy install"
