@@ -436,7 +436,7 @@ jobs:
           # Install SELinux policy (non-interactive: not a TTY).
           sudo ~/canister/target/release/can setup --force 2>&1
           echo "--- SELinux policy installed ---"
-          sudo semodule -l | grep canister || echo "canister module not visible"
+          sudo semodule -lfull 2>/dev/null | grep canister || sudo semodule -l | grep canister || echo "canister module not visible in semodule output"
 
           # Verify sandbox works after policy install.
           ~/canister/target/release/can run -- echo "sandbox works after SELinux policy install"

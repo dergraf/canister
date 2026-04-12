@@ -52,10 +52,18 @@ assert_exit_code 0 "$RUN_EXIT"
 
 # ---- Test 3: semodule lists canister module ----
 begin_test "semodule lists canister module"
-if sudo semodule -l 2>/dev/null | grep -q canister; then
+# Fedora 42+ may require --list-modules=full to show custom modules
+# across all priority stores. Try -lfull first, fall back to -l.
+if sudo semodule -lfull 2>/dev/null | grep -q canister; then
+    pass
+elif sudo semodule -l 2>/dev/null | grep -q canister; then
     pass
 else
-    fail "canister module not found in semodule -l"
+    echo "--- semodule -lfull output (first 20 lines matching 'can') ---"
+    sudo semodule -lfull 2>/dev/null | grep -i can | head -20 || true
+    echo "--- semodule -l output (first 20 lines matching 'can') ---"
+    sudo semodule -l 2>/dev/null | grep -i can | head -20 || true
+    fail "canister module not found in semodule -l or -lfull"
 fi
 
 # ---- Test 4: Sandbox runs under SELinux confinement ----
@@ -76,7 +84,9 @@ run_sudo_can setup --remove
 assert_exit_code 0 "$RUN_EXIT"
 
 # Verify module is gone.
-if semodule -l 2>/dev/null | grep -q canister; then
+if sudo semodule -lfull 2>/dev/null | grep -q canister; then
+    fail "canister module still present after removal"
+elif sudo semodule -l 2>/dev/null | grep -q canister; then
     fail "canister module still present after removal"
 fi
 
