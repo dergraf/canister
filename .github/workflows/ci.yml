@@ -1,3 +1,6 @@
+# GitHub Actions CI — check, unit tests, MSRV, policy compile tests.
+# Integration tests requiring kernel-level access (user namespaces, MAC
+# enforcement) run on Cirrus CI with real VMs — see .cirrus.yml.
 name: CI
 
 on:
