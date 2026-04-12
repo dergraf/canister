@@ -1,11 +1,11 @@
 pub mod capabilities;
 pub mod cgroups;
+pub mod mac;
 pub mod namespace;
 pub mod notifier;
 pub mod overlay;
 pub mod process;
 pub mod seccomp;
-pub mod setup;
 
 use std::ffi::CString;
 use std::path::Path;

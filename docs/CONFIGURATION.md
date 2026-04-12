@@ -142,8 +142,8 @@ match_prefix = ["/nix/store"]
 
 Controls what the sandboxed process can see and access on the filesystem.
 
-When filesystem isolation is active (requires AppArmor override on Ubuntu
-24.04+), the sandbox starts with an empty tmpfs root. Only explicitly allowed
+When filesystem isolation is active (requires a MAC policy on Ubuntu 24.04+ and
+Fedora 41+), the sandbox starts with an empty tmpfs root. Only explicitly allowed
 paths and essential system paths are bind-mounted read-only.
 
 | Field | Type | Default | Description |
@@ -163,9 +163,9 @@ paths and essential system paths are bind-mounted read-only.
   appropriate package manager recipe via `match_prefix` and merges it into the
   recipe chain, bringing the necessary mount paths automatically. See
   [Auto-Detection via match_prefix](#auto-detection-via-match_prefix).
-- When filesystem isolation is blocked (AppArmor blocks mounts), the
-  sandbox aborts. Run `sudo can setup` to install the AppArmor profile
-  (use `--force` to reinstall if the profile is outdated).
+- When filesystem isolation is blocked (MAC system blocks mounts), the
+  sandbox aborts. Run `sudo can setup` to install the security policy
+  (use `--force` to reinstall if the policy is outdated).
 
 ```toml
 [filesystem]

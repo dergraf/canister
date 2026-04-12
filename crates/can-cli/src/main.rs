@@ -62,14 +62,14 @@ enum Commands {
     /// Check available kernel capabilities for sandboxing.
     Check,
 
-    /// Install or manage the AppArmor profile for filesystem isolation.
+    /// Install or manage the security policy (AppArmor/SELinux) for filesystem isolation.
     Setup {
-        /// Remove the AppArmor profile instead of installing it.
+        /// Remove the security policy instead of installing it.
         #[arg(long)]
         remove: bool,
 
-        /// Force reinstall even if the profile is already installed.
-        /// Useful after upgrading canister to pick up profile changes.
+        /// Force reinstall even if the policy is already installed.
+        /// Useful after upgrading canister to pick up policy changes.
         #[arg(long, short)]
         force: bool,
     },

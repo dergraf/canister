@@ -20,7 +20,7 @@ of a sandboxed process, and the security properties of each isolation layer.
   - [Monitor Mode](#8-monitor-mode)
   - [Strict Mode](#9-strict-mode)
 - [Parent-Child Protocol](#parent-child-protocol)
-- [AppArmor Interaction](#apparmor-interaction)
+- [Mandatory Access Control (MAC)](#mandatory-access-control-mac)
 - [Known Limitations](#known-limitations)
 
 ---
@@ -33,7 +33,7 @@ of a sandboxed process, and the security properties of each isolation layer.
 2. **Defense in depth.** Seven independent isolation mechanisms. Bypassing one
    layer does not compromise the others.
 
-3. **Fail closed.** When a feature cannot be set up (e.g., AppArmor blocks
+3. **Fail closed.** When a feature cannot be set up (e.g., a MAC system blocks
    mounts), Canister aborts. All setup failures are fatal in both normal and
    strict mode — the sandbox runs at full strength or not at all.
 
@@ -397,9 +397,10 @@ working directory is always bind-mounted writable so the sandboxed process
 can read/write files in its working directory. All other writes go to tmpfs
 and are discarded when the process exits.
 
-**AppArmor:** When AppArmor blocks mount operations (Ubuntu 24.04+),
-filesystem isolation cannot be established and the sandbox aborts. Install
-the AppArmor override profile to enable full isolation (see README).
+**MAC systems:** When a Mandatory Access Control system (AppArmor on Ubuntu,
+SELinux on Fedora/RHEL) blocks mount operations, filesystem isolation cannot be
+established and the sandbox aborts. Run `sudo can setup` to install the
+appropriate security policy (see [MAC section](#mandatory-access-control-mac)).
 
 ### 3. Network Namespace
 
@@ -985,12 +986,33 @@ This three-pipe protocol is necessary because:
 
 ---
 
-## AppArmor Interaction
+## Mandatory Access Control (MAC)
 
-Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns=1` by default.
-When a process calls `unshare(CLONE_NEWUSER)`, AppArmor transitions it to the
-`unprivileged_userns` profile which denies mount operations, capabilities, and
-module loading.
+Linux distributions use Mandatory Access Control systems to restrict
+unprivileged processes. Canister detects the active MAC system at runtime and
+manages the appropriate security policy via `can setup`. See ADR-0004 for the
+design rationale.
+
+### Supported MAC Systems
+
+| Distribution | MAC System | Restriction Mechanism |
+|-------------|-----------|----------------------|
+| Ubuntu 24.04+ | AppArmor | `kernel.apparmor_restrict_unprivileged_userns=1` |
+| Fedora 41+ / RHEL 10+ | SELinux | `user_namespace { create }` permission |
+| Arch, Void, Gentoo, etc. | None | No restriction — works natively |
+
+### Detection
+
+Canister detects the active MAC system at startup:
+
+1. AppArmor: `/sys/module/apparmor/parameters/enabled` == `"Y"`
+2. SELinux: `/sys/fs/selinux/enforce` exists
+3. Neither: no policy needed, sandbox works natively
+
+`can check` reports the active MAC system, its restriction status, and the
+canister policy status.
+
+### AppArmor (Ubuntu)
 
 **Two-profile architecture:**
 
@@ -1029,47 +1051,70 @@ AppArmor specific path rules (`ux /usr/bin/pasta`) take precedence over glob
 rules (`px /**`), so the `ux` rules for pasta and apparmor_parser work without
 conflicting with the catch-all `px` rule.
 
-**Impact on Canister:**
+**One-time upgrade note:** When upgrading from an older profile (without `ux`
+rules for pasta/apparmor_parser) to the new profile, `apparmor_parser` may be
+confined by the old profile and fail with "Access denied". In this case,
+manually reload: `sudo apparmor_parser -r /etc/apparmor.d/canister`.
 
-| Feature | With AppArmor restriction | With canister profile |
-|---------|--------------------------|----------------------|
+### SELinux (Fedora/RHEL)
+
+**Policy module architecture:**
+
+Canister's SELinux policy defines three types:
+
+1. **`canister_t`** — domain for the `can` binary. Grants `user_namespace
+   { create }`, `cap_userns { sys_admin sys_ptrace net_admin sys_chroot }`,
+   mount/pivot_root permissions, full file access, and ptrace over sandboxed
+   children.
+
+2. **`canister_sandboxed_t`** — restricted domain for sandboxed child
+   processes. Basic file read/execute and network socket access only. No
+   namespace creation, no capabilities, no mount operations.
+
+3. **`canister_exec_t`** — file type for the `can` binary, triggers automatic
+   domain transition from `unconfined_t` to `canister_t` on exec.
+
+**Installation:** SELinux policy installation requires `checkmodule`,
+`semodule_package`, and `semodule` (from `policycoreutils` and `checkpolicy`
+packages). `can setup` generates `.te` (type enforcement) and `.fc` (file
+context) files, compiles them, and installs the module.
+
+### Impact on Canister
+
+| Feature | With MAC restriction | With canister policy |
+|---------|---------------------|---------------------|
 | User namespace | Works | Works |
 | Mount namespace | Mounts fail → **aborts** | Full isolation |
 | Filesystem isolation | **Aborts** (cannot establish) | Full |
 | Network namespace | Works | Works |
 | Loopback bring-up | Fails → **aborts** | Works |
-| pasta | N/A (no connectivity) | Works (runs unconfined) |
+| pasta | N/A (no connectivity) | Works |
 | Seccomp | Works | Works |
 | USER_NOTIF supervisor | Works | Works |
 
-**Detection:** `can check` reads
-`/sys/kernel/security/apparmor/policy/unprivileged_userns` and
-`/proc/sys/kernel/apparmor_restrict_unprivileged_userns` to detect the
-restriction and report it clearly.
-
-**Profile management (`can setup`):**
+### Policy management (`can setup`)
 
 ```bash
-# Install the AppArmor profile (auto-detects binary path)
+# Install the security policy (auto-detects MAC system and binary path)
 sudo can setup
 
-# Force reinstall (even if profile exists and appears current)
+# Force reinstall (even if policy exists and appears current)
 sudo can setup --force
 
-# Remove the profile
+# Remove the policy
 sudo can setup --remove
 ```
 
-`can setup` generates the profile from a built-in template, writes it to
-`/etc/apparmor.d/canister`, and loads it via `apparmor_parser -r`. It also
-detects **stale** profiles — when the installed profile content doesn't match
-the current template (e.g., after a Canister upgrade that adds new `ux` rules),
-`can check` reports the profile as "OUTDATED" and `can setup` will update it.
+`can setup` is interactive when stdout is a terminal: it shows the generated
+policy content (or a diff when updating), and asks for confirmation before
+writing. In non-interactive mode (piped/CI), it writes without prompting.
 
-**One-time upgrade note:** When upgrading from an older profile (without `ux`
-rules for pasta/apparmor_parser) to the new profile, `apparmor_parser` may be
-confined by the old profile and fail with "Access denied". In this case,
-manually reload: `sudo apparmor_parser -r /etc/apparmor.d/canister`.
+The command auto-detects the active MAC system and generates the appropriate
+policy. On systems with no MAC, it reports that no policy is needed.
+
+Stale policy detection: when the installed policy content doesn't match the
+current template (e.g., after a Canister upgrade), `can check` reports the
+policy as "OUTDATED" and `can setup` will update it.
 
 ---
 

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,7 +7,7 @@ use can_policy::profile::baseline_search_dirs;
 use can_policy::{RecipeFile, SandboxConfig, SeccompProfile, resolve_base};
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
-use can_sandbox::setup::{self, ProfileStatus};
+use can_sandbox::mac::{self, PolicyStatus};
 
 /// Resolve a recipe argument to a filesystem path.
 ///
@@ -259,31 +260,45 @@ pub fn check() -> Result<i32> {
     let caps = KernelCapabilities::detect();
     println!("{}", caps.summary());
 
-    // AppArmor profile status.
-    let profile_status = setup::detect_profile_status();
-    match &profile_status {
-        ProfileStatus::NotNeeded => {
-            println!("  AppArmor profile: not needed (userns unrestricted)");
+    // MAC policy status.
+    let backend = mac::active_backend();
+    match &backend {
+        Some(b) => {
+            let status = b.policy_status();
+            let mac_name = b.name();
+            match &status {
+                PolicyStatus::NotNeeded => {
+                    println!("  {mac_name} policy: not needed (userns unrestricted)");
+                }
+                PolicyStatus::NotInstalled => {
+                    println!("  {mac_name} policy: NOT INSTALLED");
+                    println!(
+                        "                    Run `sudo can setup` to enable filesystem isolation"
+                    );
+                }
+                PolicyStatus::Installed { bin_path } => {
+                    println!("  {mac_name} policy: installed ({bin_path})");
+                }
+                PolicyStatus::WrongPath {
+                    installed_path,
+                    current_path,
+                } => {
+                    println!("  {mac_name} policy: WRONG PATH");
+                    println!("                    Installed for: {installed_path}");
+                    println!("                    Current binary: {current_path}");
+                    println!("                    Run `sudo can setup` to update");
+                }
+                PolicyStatus::Stale { bin_path } => {
+                    println!("  {mac_name} policy: OUTDATED ({bin_path})");
+                    println!(
+                        "                    Run `sudo can setup` to update to latest version"
+                    );
+                }
+            }
         }
-        ProfileStatus::NotInstalled => {
-            println!("  AppArmor profile: NOT INSTALLED");
-            println!("                    Run `sudo can setup` to enable filesystem isolation");
-        }
-        ProfileStatus::Installed { bin_path } => {
-            println!("  AppArmor profile: installed ({})", bin_path);
-        }
-        ProfileStatus::WrongPath {
-            installed_path,
-            current_path,
-        } => {
-            println!("  AppArmor profile: WRONG PATH");
-            println!("                    Installed for: {installed_path}");
-            println!("                    Current binary: {current_path}");
-            println!("                    Run `sudo can setup` to update");
-        }
-        ProfileStatus::Stale { bin_path } => {
-            println!("  AppArmor profile: OUTDATED ({bin_path})");
-            println!("                    Run `sudo can setup` to update to latest version");
+        None => {
+            println!("  MAC system:      none detected (AppArmor/SELinux not active)");
+            println!("                   No policy installation needed");
         }
     }
 
@@ -325,12 +340,16 @@ pub fn check() -> Result<i32> {
 
     if caps.meets_minimum() {
         println!("\nCanister can run on this system.");
-        if matches!(profile_status, ProfileStatus::NotInstalled) {
-            println!("  Note: filesystem isolation requires AppArmor profile.");
+
+        let policy_status = backend.as_ref().map(|b| b.policy_status());
+        if matches!(policy_status, Some(PolicyStatus::NotInstalled)) {
+            let mac_name = backend.as_ref().map(|b| b.name()).unwrap_or("MAC");
+            println!("  Note: filesystem isolation requires {mac_name} policy.");
             println!("  Run: sudo can setup");
         }
-        if matches!(profile_status, ProfileStatus::Stale { .. }) {
-            println!("  Note: AppArmor profile is outdated.");
+        if matches!(policy_status, Some(PolicyStatus::Stale { .. })) {
+            let mac_name = backend.as_ref().map(|b| b.name()).unwrap_or("MAC");
+            println!("  Note: {mac_name} policy is outdated.");
             println!("  Run: sudo can setup");
         }
         Ok(0)
@@ -347,43 +366,58 @@ pub fn setup(remove: bool, force: bool) -> Result<i32> {
         return setup_remove();
     }
 
-    // Check if setup is needed.
-    let status = setup::detect_profile_status();
-    match &status {
-        ProfileStatus::NotNeeded => {
-            println!("AppArmor does not restrict unprivileged user namespaces on this system.");
-            println!("No profile installation needed — filesystem isolation works natively.");
+    // Detect the active MAC backend.
+    let backend = match mac::active_backend() {
+        Some(b) => b,
+        None => {
+            println!("No MAC system detected (neither AppArmor nor SELinux is active).");
+            println!("Canister works without a security policy on this system.");
+            println!("Filesystem isolation is available natively.");
             return Ok(0);
         }
-        ProfileStatus::Installed { bin_path } if !force => {
-            println!("AppArmor profile is already installed and up to date for: {bin_path}");
+    };
+
+    let mac_name = backend.name();
+
+    // Check if setup is needed.
+    let status = backend.policy_status();
+    match &status {
+        PolicyStatus::NotNeeded => {
+            println!("{mac_name} does not restrict unprivileged user namespaces on this system.");
+            println!("No policy installation needed — filesystem isolation works natively.");
+            return Ok(0);
+        }
+        PolicyStatus::Installed { bin_path } if !force => {
+            println!("{mac_name} policy is already installed and up to date for: {bin_path}");
             println!("Filesystem isolation should work. Run `can check` to verify.");
             println!("\nTo force reinstall: sudo can setup --force");
             return Ok(0);
         }
-        ProfileStatus::Installed { bin_path } => {
-            println!("Force reinstalling AppArmor profile for: {bin_path}");
+        PolicyStatus::Installed { bin_path } => {
+            println!("Force reinstalling {mac_name} policy for: {bin_path}");
         }
-        ProfileStatus::Stale { bin_path } => {
-            println!("AppArmor profile for {bin_path} is outdated — updating to latest version...");
+        PolicyStatus::Stale { bin_path } => {
+            println!(
+                "{mac_name} policy for {bin_path} is outdated — updating to latest version..."
+            );
         }
-        ProfileStatus::WrongPath {
+        PolicyStatus::WrongPath {
             installed_path,
             current_path,
         } => {
-            println!("AppArmor profile is installed but for a different binary path.");
+            println!("{mac_name} policy is installed but for a different binary path.");
             println!("  Installed: {installed_path}");
             println!("  Current:   {current_path}");
-            println!("Updating profile...");
+            println!("Updating policy...");
         }
-        ProfileStatus::NotInstalled => {
-            println!("AppArmor restricts unprivileged user namespaces on this system.");
-            println!("Installing Canister AppArmor profile to enable filesystem isolation...");
+        PolicyStatus::NotInstalled => {
+            println!("{mac_name} restricts unprivileged user namespaces on this system.");
+            println!("Installing Canister {mac_name} policy to enable filesystem isolation...");
         }
     }
 
     // Resolve the binary path.
-    let bin_path = setup::resolve_bin_path().ok_or_else(|| {
+    let bin_path = mac::resolve_bin_path().ok_or_else(|| {
         anyhow::anyhow!(
             "could not determine path to `can` binary. \
              Ensure it is installed or run from a known location."
@@ -392,10 +426,35 @@ pub fn setup(remove: bool, force: bool) -> Result<i32> {
 
     println!("Binary path: {bin_path}");
 
-    // Install the profile.
-    match setup::install_profile(&bin_path) {
+    // Generate the policy for review.
+    let new_policy = backend.generate_policy(&bin_path);
+
+    // Interactive mode: show the policy and ask for confirmation.
+    let interactive = std::io::stdout().is_terminal();
+
+    if interactive {
+        // Show the existing policy diff if updating.
+        let policy_path = backend.policy_path();
+        if let Ok(existing) = std::fs::read_to_string(policy_path) {
+            println!("\n--- Policy diff ({policy_path}) ---");
+            print_unified_diff(&existing, &new_policy);
+            println!("--- End diff ---\n");
+        } else {
+            println!("\n--- New {mac_name} policy ---");
+            println!("{new_policy}");
+            println!("--- End policy ---\n");
+        }
+
+        if !confirm("Install this policy?")? {
+            println!("Aborted. No changes were made.");
+            return Ok(1);
+        }
+    }
+
+    // Install the policy.
+    match backend.install_policy(&bin_path) {
         Ok(()) => {
-            println!("\nAppArmor profile installed successfully.");
+            println!("\n{mac_name} policy installed successfully.");
             println!("Filesystem isolation is now enabled.");
             println!("\nVerify with: can check");
             Ok(0)
@@ -407,29 +466,110 @@ pub fn setup(remove: bool, force: bool) -> Result<i32> {
     }
 }
 
-/// Remove the Canister AppArmor profile.
+/// Remove the Canister MAC policy.
 fn setup_remove() -> Result<i32> {
-    let status = setup::detect_profile_status();
-    match &status {
-        ProfileStatus::NotInstalled | ProfileStatus::NotNeeded => {
-            println!("No Canister AppArmor profile is installed.");
+    let backend = match mac::active_backend() {
+        Some(b) => b,
+        None => {
+            println!("No MAC system detected — nothing to remove.");
             return Ok(0);
         }
-        ProfileStatus::Installed { .. }
-        | ProfileStatus::WrongPath { .. }
-        | ProfileStatus::Stale { .. } => {}
+    };
+
+    let mac_name = backend.name();
+    let status = backend.policy_status();
+
+    match &status {
+        PolicyStatus::NotInstalled | PolicyStatus::NotNeeded => {
+            println!("No Canister {mac_name} policy is installed.");
+            return Ok(0);
+        }
+        PolicyStatus::Installed { .. }
+        | PolicyStatus::WrongPath { .. }
+        | PolicyStatus::Stale { .. } => {}
     }
 
-    match setup::remove_profile() {
+    // Interactive confirmation for removal.
+    let interactive = std::io::stdout().is_terminal();
+    if interactive {
+        println!("This will remove the Canister {mac_name} policy.");
+        println!("Filesystem isolation will be disabled until the policy is reinstalled.");
+        if !confirm("Remove the policy?")? {
+            println!("Aborted. No changes were made.");
+            return Ok(1);
+        }
+    }
+
+    match backend.remove_policy() {
         Ok(()) => {
-            println!("Canister AppArmor profile removed.");
-            println!("Filesystem isolation will be disabled until the profile is reinstalled.");
+            println!("Canister {mac_name} policy removed.");
+            println!("Filesystem isolation will be disabled until the policy is reinstalled.");
             Ok(0)
         }
         Err(e) => {
             eprintln!("{e}");
             Ok(1)
         }
+    }
+}
+
+/// Ask the user for confirmation (Y/n). Returns true if confirmed.
+///
+/// Non-interactive environments (piped stdin) always return true.
+fn confirm(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+
+    eprint!("{prompt} [Y/n] ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading user input")?;
+
+    let trimmed = input.trim().to_lowercase();
+    Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
+}
+
+/// Print a minimal unified diff between two strings.
+///
+/// This is intentionally simple — no external crate needed.
+fn print_unified_diff(old: &str, new: &str) {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Simple line-by-line comparison (not a true LCS diff, but good enough
+    // for policy files which are relatively short and structured).
+    let max_len = old_lines.len().max(new_lines.len());
+    let mut has_changes = false;
+
+    for i in 0..max_len {
+        let old_line = old_lines.get(i).copied();
+        let new_line = new_lines.get(i).copied();
+
+        match (old_line, new_line) {
+            (Some(o), Some(n)) if o == n => {
+                println!(" {o}");
+            }
+            (Some(o), Some(n)) => {
+                println!("-{o}");
+                println!("+{n}");
+                has_changes = true;
+            }
+            (Some(o), None) => {
+                println!("-{o}");
+                has_changes = true;
+            }
+            (None, Some(n)) => {
+                println!("+{n}");
+                has_changes = true;
+            }
+            (None, None) => {}
+        }
+    }
+
+    if !has_changes {
+        println!("(no changes)");
     }
 }
 

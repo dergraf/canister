@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::setup;
+use crate::mac::{self, MACSystem, PolicyStatus};
 
 /// Detected kernel capabilities for sandboxing.
 #[derive(Debug, Clone)]
@@ -26,13 +26,16 @@ pub struct KernelCapabilities {
     /// Seccomp BPF is available.
     pub seccomp_bpf: bool,
 
-    /// AppArmor restricts unprivileged user namespaces.
-    /// When true, mount operations inside user namespaces are blocked
-    /// unless the canister AppArmor profile is installed.
-    pub apparmor_restricts_userns: bool,
+    /// Which MAC system is active (if any).
+    pub mac_system: Option<MACSystem>,
 
-    /// Whether the canister AppArmor profile is installed and active.
-    pub canister_profile_installed: bool,
+    /// Whether the active MAC system restricts unprivileged user namespaces.
+    /// When true, mount operations inside user namespaces are blocked
+    /// unless the canister MAC policy is installed.
+    pub mac_restricts_userns: bool,
+
+    /// Whether the canister MAC policy is installed and active.
+    pub canister_policy_installed: bool,
 
     /// Kernel version string.
     pub kernel_version: String,
@@ -41,17 +44,25 @@ pub struct KernelCapabilities {
 impl KernelCapabilities {
     /// Detect available kernel capabilities.
     pub fn detect() -> Self {
-        let apparmor_restricts = setup::apparmor_restricts_userns();
-        let profile_status = setup::detect_profile_status();
-        let profile_installed = matches!(
-            profile_status,
-            setup::ProfileStatus::NotNeeded
-                | setup::ProfileStatus::Installed { .. }
-                | setup::ProfileStatus::Stale { .. }
-        );
+        let backend = mac::active_backend();
 
-        // Mount namespaces work if AppArmor doesn't restrict, or if our profile is installed.
-        let mount_ns = !apparmor_restricts || profile_installed;
+        let (mac_system, mac_restricts, policy_installed) = match &backend {
+            Some(b) => {
+                let restricts = b.restricts_userns();
+                let status = b.policy_status();
+                let installed = matches!(
+                    status,
+                    PolicyStatus::NotNeeded
+                        | PolicyStatus::Installed { .. }
+                        | PolicyStatus::Stale { .. }
+                );
+                (Some(b.system()), restricts, installed)
+            }
+            None => (None, false, true), // No MAC = no restriction = effectively "installed"
+        };
+
+        // Mount namespaces work if MAC doesn't restrict, or if our policy is installed.
+        let mount_ns = !mac_restricts || policy_installed;
 
         Self {
             user_namespaces: check_user_namespaces(),
@@ -61,8 +72,9 @@ impl KernelCapabilities {
             cgroups_v2: check_cgroups_v2(),
             overlayfs: check_overlayfs(),
             seccomp_bpf: check_seccomp(),
-            apparmor_restricts_userns: apparmor_restricts,
-            canister_profile_installed: profile_installed,
+            mac_system,
+            mac_restricts_userns: mac_restricts,
+            canister_policy_installed: policy_installed,
             kernel_version: get_kernel_version(),
         }
     }
@@ -111,8 +123,12 @@ fn status(available: bool) -> &'static str {
 }
 
 fn fmt_mount_ns(caps: &KernelCapabilities) -> &'static str {
-    if caps.apparmor_restricts_userns && !caps.canister_profile_installed {
-        "BLOCKED by AppArmor (run `sudo can setup` to fix)"
+    if caps.mac_restricts_userns && !caps.canister_policy_installed {
+        match caps.mac_system {
+            Some(MACSystem::AppArmor) => "BLOCKED by AppArmor (run `sudo can setup` to fix)",
+            Some(MACSystem::SELinux) => "BLOCKED by SELinux (run `sudo can setup` to fix)",
+            None => "NOT available",
+        }
     } else if caps.mount_namespaces {
         "available"
     } else {

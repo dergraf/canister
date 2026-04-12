@@ -1,4 +1,4 @@
-//! AppArmor profile setup for Canister.
+//! AppArmor MAC backend for Canister.
 //!
 //! On Ubuntu 24.04+ with `kernel.apparmor_restrict_unprivileged_userns=1`,
 //! processes in unprivileged user namespaces transition to the `unprivileged_userns`
@@ -13,7 +13,9 @@
 //! - Detecting if the profile is already installed/loaded
 //! - Installing/removing the profile (requires root)
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use super::{MACBackend, MACSystem, PolicyStatus, SetupError};
 
 /// AppArmor profile name used by Canister.
 pub const PROFILE_NAME: &str = "canister";
@@ -110,111 +112,52 @@ profile canister_sandboxed flags=(attach_disconnected) {
 }
 "#;
 
-/// Status of the Canister AppArmor profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProfileStatus {
-    /// AppArmor doesn't restrict unprivileged user namespaces — no profile needed.
-    NotNeeded,
-    /// Profile is not installed; filesystem isolation is blocked.
-    NotInstalled,
-    /// Profile is installed and loaded in enforce mode.
-    Installed { bin_path: String },
-    /// Profile is installed but for a different binary path.
-    WrongPath {
-        installed_path: String,
-        current_path: String,
-    },
-    /// Profile is installed for the correct binary but has stale content
-    /// (e.g., template was updated in a new version of canister).
-    Stale { bin_path: String },
-}
+/// The AppArmor MAC backend.
+pub struct AppArmorBackend;
 
-/// Detect the current status of the Canister AppArmor profile.
-pub fn detect_profile_status() -> ProfileStatus {
-    // If AppArmor doesn't restrict user namespaces, no profile is needed.
-    if !apparmor_restricts_userns() {
-        return ProfileStatus::NotNeeded;
+impl MACBackend for AppArmorBackend {
+    fn name(&self) -> &'static str {
+        "AppArmor"
     }
 
-    // Check if the profile file exists.
-    let profile_path = Path::new(PROFILE_PATH);
-    if !profile_path.exists() {
-        return ProfileStatus::NotInstalled;
+    fn system(&self) -> MACSystem {
+        MACSystem::AppArmor
     }
 
-    // Read the installed profile to check the binary path.
-    let content = match std::fs::read_to_string(profile_path) {
-        Ok(c) => c,
-        Err(_) => return ProfileStatus::NotInstalled,
-    };
+    fn is_active(&self) -> bool {
+        is_enabled()
+    }
 
-    // Extract the binary path from the installed profile.
-    let installed_path = extract_bin_path(&content);
+    fn restricts_userns(&self) -> bool {
+        apparmor_restricts_userns()
+    }
 
-    // Get the current binary path.
-    let current_path = current_bin_path();
+    fn policy_status(&self) -> PolicyStatus {
+        detect_profile_status()
+    }
 
-    match (installed_path, current_path) {
-        (Some(installed), Some(current)) if installed == current => {
-            // Check if the profile is actually loaded in the kernel.
-            if !is_profile_loaded() {
-                return ProfileStatus::NotInstalled;
-            }
+    fn generate_policy(&self, bin_path: &str) -> String {
+        generate_profile(bin_path)
+    }
 
-            // Check if the installed content matches what we'd generate.
-            let expected = generate_profile(&installed);
-            if content.trim() != expected.trim() {
-                return ProfileStatus::Stale {
-                    bin_path: installed,
-                };
-            }
+    fn install_policy(&self, bin_path: &str) -> Result<(), SetupError> {
+        install_profile(bin_path)
+    }
 
-            ProfileStatus::Installed {
-                bin_path: installed,
-            }
-        }
-        (Some(installed), Some(current)) => ProfileStatus::WrongPath {
-            installed_path: installed,
-            current_path: current,
-        },
-        _ => ProfileStatus::NotInstalled,
+    fn remove_policy(&self) -> Result<(), SetupError> {
+        remove_profile()
+    }
+
+    fn policy_path(&self) -> &str {
+        PROFILE_PATH
     }
 }
 
-/// Generate the AppArmor profile content for the given binary path.
-pub fn generate_profile(bin_path: &str) -> String {
-    PROFILE_TEMPLATE.replace("{bin_path}", bin_path)
-}
-
-/// Get the canonical path to the current `can` binary.
-pub fn current_bin_path() -> Option<String> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.display().to_string())
-}
-
-/// Resolve a binary name to its installed path.
-/// First checks if the current exe is the right one, then falls back to PATH lookup.
-pub fn resolve_bin_path() -> Option<String> {
-    // First: current executable.
-    if let Some(path) = current_bin_path() {
-        return Some(path);
-    }
-
-    // Fallback: look up `can` in PATH.
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = PathBuf::from(dir).join("can");
-            if candidate.exists() {
-                if let Ok(canonical) = candidate.canonicalize() {
-                    return Some(canonical.display().to_string());
-                }
-            }
-        }
-    }
-
-    None
+/// Check if AppArmor is enabled on this kernel.
+pub fn is_enabled() -> bool {
+    std::fs::read_to_string("/sys/module/apparmor/parameters/enabled")
+        .map(|c| c.trim() == "Y")
+        .unwrap_or(false)
 }
 
 /// Check if AppArmor restricts unprivileged user namespaces.
@@ -224,9 +167,65 @@ pub fn apparmor_restricts_userns() -> bool {
         .unwrap_or(false)
 }
 
+/// Detect the current status of the Canister AppArmor profile.
+pub fn detect_profile_status() -> PolicyStatus {
+    // If AppArmor doesn't restrict user namespaces, no profile is needed.
+    if !apparmor_restricts_userns() {
+        return PolicyStatus::NotNeeded;
+    }
+
+    // Check if the profile file exists.
+    let profile_path = Path::new(PROFILE_PATH);
+    if !profile_path.exists() {
+        return PolicyStatus::NotInstalled;
+    }
+
+    // Read the installed profile to check the binary path.
+    let content = match std::fs::read_to_string(profile_path) {
+        Ok(c) => c,
+        Err(_) => return PolicyStatus::NotInstalled,
+    };
+
+    // Extract the binary path from the installed profile.
+    let installed_path = extract_bin_path(&content);
+
+    // Get the current binary path.
+    let current_path = super::current_bin_path();
+
+    match (installed_path, current_path) {
+        (Some(installed), Some(current)) if installed == current => {
+            // Check if the profile is actually loaded in the kernel.
+            if !is_profile_loaded() {
+                return PolicyStatus::NotInstalled;
+            }
+
+            // Check if the installed content matches what we'd generate.
+            let expected = generate_profile(&installed);
+            if content.trim() != expected.trim() {
+                return PolicyStatus::Stale {
+                    bin_path: installed,
+                };
+            }
+
+            PolicyStatus::Installed {
+                bin_path: installed,
+            }
+        }
+        (Some(installed), Some(current)) => PolicyStatus::WrongPath {
+            installed_path: installed,
+            current_path: current,
+        },
+        _ => PolicyStatus::NotInstalled,
+    }
+}
+
+/// Generate the AppArmor profile content for the given binary path.
+pub fn generate_profile(bin_path: &str) -> String {
+    PROFILE_TEMPLATE.replace("{bin_path}", bin_path)
+}
+
 /// Check if the canister profile is loaded in the kernel.
 fn is_profile_loaded() -> bool {
-    // Check /sys/kernel/security/apparmor/policy/profiles/ for canister.*
     let profiles_dir = Path::new("/sys/kernel/security/apparmor/policy/profiles");
     if !profiles_dir.exists() {
         return false;
@@ -253,11 +252,9 @@ fn is_profile_loaded() -> bool {
 
 /// Extract the binary path from an installed profile's content.
 fn extract_bin_path(content: &str) -> Option<String> {
-    // Look for "profile canister /path/to/can"
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("profile canister ") {
-            // The path is everything up to "flags=" or end of line.
             let path = rest.split("flags=").next().unwrap_or(rest).trim();
             if path.starts_with('/') {
                 return Some(path.to_string());
@@ -269,11 +266,9 @@ fn extract_bin_path(content: &str) -> Option<String> {
 
 /// Install the AppArmor profile.
 ///
-/// This writes the profile to `/etc/apparmor.d/canister` and loads it.
+/// Writes the profile to `/etc/apparmor.d/canister` and loads it.
 /// Must be run as root (typically via `sudo can setup`).
-///
-/// Returns the commands that need to be run if we don't have write access.
-pub fn install_profile(bin_path: &str) -> Result<(), SetupError> {
+fn install_profile(bin_path: &str) -> Result<(), SetupError> {
     let content = generate_profile(bin_path);
 
     // Try to write the profile directly.
@@ -283,12 +278,16 @@ pub fn install_profile(bin_path: &str) -> Result<(), SetupError> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return Err(SetupError::NeedsSudo {
-                profile_content: content,
+                policy_content: content.clone(),
                 bin_path: bin_path.to_string(),
+                manual_instructions: format!(
+                    "  sudo tee {PROFILE_PATH} << 'EOF'\n{content}EOF\n  \
+                     sudo apparmor_parser -r {PROFILE_PATH}"
+                ),
             });
         }
         Err(e) => {
-            return Err(SetupError::WriteProfile {
+            return Err(SetupError::WritePolicy {
                 path: PROFILE_PATH.to_string(),
                 source: e,
             });
@@ -302,9 +301,7 @@ pub fn install_profile(bin_path: &str) -> Result<(), SetupError> {
 }
 
 /// Remove the AppArmor profile.
-///
-/// Must be run as root.
-pub fn remove_profile() -> Result<(), SetupError> {
+fn remove_profile() -> Result<(), SetupError> {
     let profile_path = Path::new(PROFILE_PATH);
     if !profile_path.exists() {
         return Err(SetupError::NotInstalled);
@@ -325,7 +322,7 @@ pub fn remove_profile() -> Result<(), SetupError> {
     }
 
     // Remove the profile file.
-    std::fs::remove_file(profile_path).map_err(|e| SetupError::WriteProfile {
+    std::fs::remove_file(profile_path).map_err(|e| SetupError::WritePolicy {
         path: PROFILE_PATH.to_string(),
         source: e,
     })?;
@@ -354,7 +351,8 @@ fn reload_profile() -> Result<(), SetupError> {
         // OLD (currently loaded) profile doesn't. Detect this and give
         // the user a one-time workaround.
         if stderr.contains("Access denied") || stderr.contains("policy admin privileges") {
-            return Err(SetupError::ProfileLoad {
+            return Err(SetupError::ToolFailed {
+                tool: "apparmor_parser".to_string(),
                 stderr: format!(
                     "{}\n\n\
                      The currently loaded AppArmor profile is blocking apparmor_parser.\n\
@@ -368,46 +366,14 @@ fn reload_profile() -> Result<(), SetupError> {
             });
         }
 
-        return Err(SetupError::ProfileLoad {
+        return Err(SetupError::ToolFailed {
+            tool: "apparmor_parser".to_string(),
             stderr: stderr.to_string(),
         });
     }
 
     tracing::info!("AppArmor profile loaded");
     Ok(())
-}
-
-/// Errors from setup operations.
-#[derive(Debug, thiserror::Error)]
-pub enum SetupError {
-    #[error(
-        "permission denied — run with sudo:\n\n  \
-         sudo can setup\n\n  \
-         Or install manually:\n  \
-         sudo tee {path} << 'EOF'\n{profile_content}\nEOF\n  \
-         sudo apparmor_parser -r {path}",
-        path = PROFILE_PATH,
-        profile_content = profile_content,
-    )]
-    NeedsSudo {
-        profile_content: String,
-        bin_path: String,
-    },
-
-    #[error("failed to write profile to {path}: {source}")]
-    WriteProfile {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[error("failed to run {cmd}: {source}")]
-    Command { cmd: String, source: std::io::Error },
-
-    #[error("apparmor_parser failed to load profile:\n{stderr}")]
-    ProfileLoad { stderr: String },
-
-    #[error("canister AppArmor profile is not installed")]
-    NotInstalled,
 }
 
 #[cfg(test)]
@@ -464,18 +430,16 @@ mod tests {
     #[test]
     fn generate_profile_braces_are_valid_apparmor() {
         let profile = generate_profile("/usr/bin/can");
-        // AppArmor profile blocks use single { } not {{ }}
         assert!(!profile.contains("{{"));
         assert!(!profile.contains("}}"));
-        // But should have { and }
         assert!(profile.contains('{'));
         assert!(profile.contains('}'));
     }
 
     #[test]
-    fn current_bin_path_returns_some() {
-        // In test context, this should return the test binary path.
-        let path = current_bin_path();
-        assert!(path.is_some());
+    fn backend_name() {
+        let backend = AppArmorBackend;
+        assert_eq!(backend.name(), "AppArmor");
+        assert_eq!(backend.system(), MACSystem::AppArmor);
     }
 }
