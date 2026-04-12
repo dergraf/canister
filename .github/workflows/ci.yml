@@ -402,7 +402,7 @@ jobs:
 
           $SSH <<'REMOTE'
           set -euo pipefail
-          sudo dnf install -y passt selinux-policy-devel policycoreutils python3
+          sudo dnf install -y git passt selinux-policy-devel policycoreutils python3
           echo "--- Environment ---"
           uname -a
           getenforce
@@ -597,7 +597,7 @@ jobs:
           $SSH <<'REMOTE'
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq passt apparmor-utils python3
+          sudo apt-get install -y -qq git passt apparmor-utils python3
           echo "--- Environment ---"
           uname -a
           cat /sys/module/apparmor/parameters/enabled

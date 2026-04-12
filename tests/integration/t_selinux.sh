@@ -52,7 +52,7 @@ assert_exit_code 0 "$RUN_EXIT"
 
 # ---- Test 3: semodule lists canister module ----
 begin_test "semodule lists canister module"
-if semodule -l 2>/dev/null | grep -q canister; then
+if sudo semodule -l 2>/dev/null | grep -q canister; then
     pass
 else
     fail "canister module not found in semodule -l"
