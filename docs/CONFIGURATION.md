@@ -164,7 +164,8 @@ paths and essential system paths are bind-mounted read-only.
   recipe chain, bringing the necessary mount paths automatically. See
   [Auto-Detection via match_prefix](#auto-detection-via-match_prefix).
 - When filesystem isolation is blocked (AppArmor blocks mounts), the
-  sandbox aborts. Run `sudo can setup` to install the AppArmor profile.
+  sandbox aborts. Run `sudo can setup` to install the AppArmor profile
+  (use `--force` to reinstall if the profile is outdated).
 
 ```toml
 [filesystem]
@@ -220,6 +221,7 @@ explicitly allowed.
 | `allow_domains` | `string[]` | `[]` | Whitelisted domain names |
 | `allow_ips` | `string[]` | `[]` | Whitelisted IPs or CIDR ranges (IPv4 and IPv6) |
 | `deny_all` | `bool` | `true` | Deny all network except explicitly allowed |
+| `ports` | `string[]` | `[]` | Port forwarding specs (`[ip:]hostPort:containerPort[/protocol]`) |
 
 **Network mode determination:**
 
@@ -228,8 +230,11 @@ The combination of fields determines which isolation mode is used:
 | `deny_all` | Allowlists | Mode | Description |
 |------------|------------|------|-------------|
 | `true` | empty | **None** | No network. Empty network namespace, loopback only. |
-| `true` | non-empty | **Filtered** | Connectivity via slirp4netns. Domains pre-resolved. |
+| `true` | non-empty | **Filtered** | Connectivity via pasta. Domains pre-resolved. |
 | `false` | any | **Full** | No isolation. Shares host network namespace. |
+
+Specifying `ports` automatically upgrades None mode to Filtered
+mode (port forwarding requires a functional network namespace with pasta).
 
 **Domain matching:**
 
@@ -252,26 +257,55 @@ allow_ips = [
 
 **Filtered mode requirements:**
 
-Filtered mode requires `slirp4netns` installed on the host:
+Filtered mode requires `pasta` (from the passt project) installed on the host:
 
 ```bash
-sudo apt install slirp4netns   # Debian/Ubuntu
-sudo dnf install slirp4netns   # Fedora
+sudo apt install passt       # Debian/Ubuntu
+sudo dnf install passt       # Fedora
 ```
 
-In filtered mode, the sandbox gets a virtual network interface via slirp4netns:
+In filtered mode, pasta mirrors the host's network configuration into the
+sandbox namespace. pasta copies the host's real IP addresses and routes into
+the namespace. DNS is handled via a link-local address:
 
 | Address | Role |
 |---------|------|
-| `10.0.2.2` | Gateway (host) |
-| `10.0.2.3` | DNS server |
-| `10.0.2.100` | Sandbox IP |
+| Host's default gateway | Gateway |
+| `169.254.0.1` | DNS server (link-local, pasta `--dns`) |
+| Host's real IP | Sandbox IP (mirrored from host) |
 
 ```toml
 [network]
 allow_domains = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
 deny_all = true
 ```
+
+**Port forwarding (`ports`):**
+
+Port forwarding uses Docker/Podman-compatible syntax and is specified via
+the `-p` / `--port` CLI flag or the `ports` config field:
+
+```bash
+# CLI usage
+can run -p 8080:80 -- my-server
+can run -p 127.0.0.1:3000:3000 -p 5432:5432/tcp -- my-app
+```
+
+```toml
+# Config usage
+[network]
+ports = ["8080:80", "127.0.0.1:3000:3000", "5353:53/udp"]
+deny_all = true
+```
+
+Syntax: `[ip:]hostPort:containerPort[/protocol]`
+
+| Component | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `ip` | No | `0.0.0.0` | Host IP to bind (e.g., `127.0.0.1`) |
+| `hostPort` | Yes | — | Port on the host |
+| `containerPort` | Yes | — | Port inside the sandbox |
+| `protocol` | No | `tcp` | `tcp` or `udp` |
 
 ---
 
@@ -532,7 +566,7 @@ can run --monitor --recipe my_policy.toml -- python3 script.py
 | `[process].max_pids` | Enforces RLIMIT_NPROC | Logs limit, skips enforcement |
 | `[syscalls]` seccomp | Returns EPERM on denied syscalls | Logs to kernel audit, allows |
 | `[filesystem]` | Overlay + pivot_root | Unchanged (isolation active) |
-| `[network]` | Namespace + slirp4netns | Unchanged (isolation active) |
+| `[network]` | Namespace + pasta | Unchanged (isolation active) |
 
 **Reading monitor output:**
 

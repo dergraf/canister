@@ -202,10 +202,18 @@ pub fn run(
     recipe_args: &[String],
     monitor: bool,
     strict: bool,
+    port_args: &[String],
     command: Vec<String>,
 ) -> Result<i32> {
     let cmd_name = command.first().map(|s| s.as_str());
-    let config = load_recipes(recipe_args, cmd_name)?;
+    let mut config = load_recipes(recipe_args, cmd_name)?;
+
+    // Apply CLI --port flags (merged with any recipe-defined ports).
+    for port_str in port_args {
+        let mapping = can_policy::PortMapping::parse(port_str)
+            .map_err(|e| anyhow::anyhow!("invalid port spec '{port_str}': {e}"))?;
+        config.network.ports.push(mapping);
+    }
 
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;
@@ -273,14 +281,18 @@ pub fn check() -> Result<i32> {
             println!("                    Current binary: {current_path}");
             println!("                    Run `sudo can setup` to update");
         }
+        ProfileStatus::Stale { bin_path } => {
+            println!("  AppArmor profile: OUTDATED ({bin_path})");
+            println!("                    Run `sudo can setup` to update to latest version");
+        }
     }
 
     // Check network tooling.
-    if can_net::slirp::is_available() {
-        println!("  slirp4netns:     available");
+    if can_net::pasta::is_available() {
+        println!("  pasta:           available");
     } else {
-        println!("  slirp4netns:     NOT FOUND (needed for filtered network mode)");
-        println!("                   Install with: sudo apt install slirp4netns");
+        println!("  pasta:           NOT FOUND (needed for filtered network mode)");
+        println!("                   Install with: sudo apt install passt");
     }
 
     // Check cgroup v2 delegation.
@@ -317,6 +329,10 @@ pub fn check() -> Result<i32> {
             println!("  Note: filesystem isolation requires AppArmor profile.");
             println!("  Run: sudo can setup");
         }
+        if matches!(profile_status, ProfileStatus::Stale { .. }) {
+            println!("  Note: AppArmor profile is outdated.");
+            println!("  Run: sudo can setup");
+        }
         Ok(0)
     } else {
         println!("\nWARNING: This system does not meet minimum requirements.");
@@ -326,7 +342,7 @@ pub fn check() -> Result<i32> {
 }
 
 /// Execute the `can setup` command.
-pub fn setup(remove: bool) -> Result<i32> {
+pub fn setup(remove: bool, force: bool) -> Result<i32> {
     if remove {
         return setup_remove();
     }
@@ -339,10 +355,17 @@ pub fn setup(remove: bool) -> Result<i32> {
             println!("No profile installation needed — filesystem isolation works natively.");
             return Ok(0);
         }
-        ProfileStatus::Installed { bin_path } => {
-            println!("AppArmor profile is already installed for: {bin_path}");
+        ProfileStatus::Installed { bin_path } if !force => {
+            println!("AppArmor profile is already installed and up to date for: {bin_path}");
             println!("Filesystem isolation should work. Run `can check` to verify.");
+            println!("\nTo force reinstall: sudo can setup --force");
             return Ok(0);
+        }
+        ProfileStatus::Installed { bin_path } => {
+            println!("Force reinstalling AppArmor profile for: {bin_path}");
+        }
+        ProfileStatus::Stale { bin_path } => {
+            println!("AppArmor profile for {bin_path} is outdated — updating to latest version...");
         }
         ProfileStatus::WrongPath {
             installed_path,
@@ -392,7 +415,9 @@ fn setup_remove() -> Result<i32> {
             println!("No Canister AppArmor profile is installed.");
             return Ok(0);
         }
-        _ => {}
+        ProfileStatus::Installed { .. }
+        | ProfileStatus::WrongPath { .. }
+        | ProfileStatus::Stale { .. } => {}
     }
 
     match setup::remove_profile() {

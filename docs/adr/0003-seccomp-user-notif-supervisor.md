@@ -30,7 +30,7 @@ This created three security gaps:
 - **connect() filtering**: Whitelisted domains were pre-resolved to IPs at
   startup, but the resolved IPs were never used to filter actual `connect()`
   calls. The sandbox in filtered network mode could connect to any IP
-  reachable via slirp4netns.
+  reachable via pasta.
 
 - **Ongoing execve enforcement**: `allow_execve` validated the initial command
   before forking, but child processes inside the sandbox could exec arbitrary

@@ -42,6 +42,7 @@ profile canister {bin_path} flags=(attach_disconnected) {
   allow capability sys_admin,
   allow capability net_admin,
   allow capability sys_chroot,
+  allow capability sys_ptrace,
   allow capability dac_override,
   allow capability dac_read_search,
 
@@ -59,6 +60,23 @@ profile canister {bin_path} flags=(attach_disconnected) {
 
   # Sandboxed children get restricted sub-profile
   allow px /** -> canister//&canister_sandboxed,
+
+  # apparmor_parser must run unconfined to load/unload profiles during setup.
+  allow ux /usr/sbin/apparmor_parser,
+  allow ux /sbin/apparmor_parser,
+
+  # pasta (network backend) must run unconfined because it needs CAP_SYS_ADMIN
+  # to call setns(CLONE_NEWUSER) — the kernel requires this capability to join
+  # user namespaces. The canister_sandboxed sub-profile denies sys_admin (which
+  # is correct for sandboxed commands), but pasta needs it for legitimate
+  # namespace setup. pasta is a trusted system binary from the passt package.
+  #
+  # pasta dispatches to an AVX2-optimized variant (pasta.avx2) on supported
+  # CPUs, so both paths need unconfined exec rules.
+  allow ux /usr/bin/pasta,
+  allow ux /usr/bin/pasta.avx2,
+  allow ux /bin/pasta,
+  allow ux /bin/pasta.avx2,
 
   include if exists <local/canister>
 }
@@ -80,6 +98,7 @@ profile canister_sandboxed flags=(attach_disconnected) {
   allow ptrace (readby tracedby) peer=canister,
   audit deny ptrace (read trace),
 
+  # Deny all dangerous capabilities and operations for sandboxed processes.
   audit deny capability,
   audit deny mount,
   audit deny umount,
@@ -105,6 +124,9 @@ pub enum ProfileStatus {
         installed_path: String,
         current_path: String,
     },
+    /// Profile is installed for the correct binary but has stale content
+    /// (e.g., template was updated in a new version of canister).
+    Stale { bin_path: String },
 }
 
 /// Detect the current status of the Canister AppArmor profile.
@@ -135,13 +157,20 @@ pub fn detect_profile_status() -> ProfileStatus {
     match (installed_path, current_path) {
         (Some(installed), Some(current)) if installed == current => {
             // Check if the profile is actually loaded in the kernel.
-            if is_profile_loaded() {
-                ProfileStatus::Installed {
+            if !is_profile_loaded() {
+                return ProfileStatus::NotInstalled;
+            }
+
+            // Check if the installed content matches what we'd generate.
+            let expected = generate_profile(&installed);
+            if content.trim() != expected.trim() {
+                return ProfileStatus::Stale {
                     bin_path: installed,
-                }
-            } else {
-                // File exists but profile not loaded — needs reload.
-                ProfileStatus::NotInstalled
+                };
+            }
+
+            ProfileStatus::Installed {
+                bin_path: installed,
             }
         }
         (Some(installed), Some(current)) => ProfileStatus::WrongPath {
@@ -317,6 +346,28 @@ fn reload_profile() -> Result<(), SetupError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // When the canister AppArmor profile is already loaded, exec'ing
+        // apparmor_parser triggers the `px /**` rule, confining it under
+        // canister_sandboxed which denies the capabilities it needs.
+        // The new profile has a `ux` rule for apparmor_parser, but the
+        // OLD (currently loaded) profile doesn't. Detect this and give
+        // the user a one-time workaround.
+        if stderr.contains("Access denied") || stderr.contains("policy admin privileges") {
+            return Err(SetupError::ProfileLoad {
+                stderr: format!(
+                    "{}\n\n\
+                     The currently loaded AppArmor profile is blocking apparmor_parser.\n\
+                     This is a one-time issue when upgrading from an older profile.\n\n\
+                     Fix: manually reload the profile:\n\
+                     \n  sudo apparmor_parser -r {PROFILE_PATH}\n\n\
+                     The new profile file has already been written. After reloading,\n\
+                     future `can setup` runs will work automatically.",
+                    stderr.trim()
+                ),
+            });
+        }
+
         return Err(SetupError::ProfileLoad {
             stderr: stderr.to_string(),
         });
@@ -385,6 +436,10 @@ mod tests {
         assert!(profile.contains("allow ptrace (readby tracedby) peer=canister,"));
         assert!(profile.contains("audit deny ptrace (read trace),"));
         assert!(profile.contains("deny dbus,"));
+        // Verify ux rules for pasta and apparmor_parser
+        assert!(profile.contains("allow ux /usr/bin/pasta,"));
+        assert!(profile.contains("allow ux /usr/bin/pasta.avx2,"));
+        assert!(profile.contains("allow ux /usr/sbin/apparmor_parser,"));
     }
 
     #[test]

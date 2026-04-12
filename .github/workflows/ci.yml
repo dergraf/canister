@@ -66,8 +66,8 @@ jobs:
       - name: Unit tests
         run: mise run test-std
 
-      - name: Install slirp4netns
-        run: sudo apt-get update && sudo apt-get install -y slirp4netns
+      - name: Install passt
+        run: sudo apt-get update && sudo apt-get install -y passt
 
       - name: Check sandbox support
         id: sandbox-check

@@ -1,8 +1,8 @@
 //! Minimal DNS proxy with domain-based filtering.
 //!
 //! Runs in the parent process on the host, listening on an ephemeral port
-//! on 127.0.0.1. slirp4netns forwards DNS queries from the sandbox
-//! (10.0.2.3:53) to this proxy via its `--dns` flag. Queries for
+//! on 127.0.0.1. pasta intercepts DNS queries from the sandbox and
+//! forwards them to this proxy via `--dns-forward`. Queries for
 //! whitelisted domains are forwarded to the upstream DNS server.
 //! Queries for non-whitelisted domains get a REFUSED response.
 //!
@@ -105,10 +105,10 @@ impl DnsProxyConfig {
     /// upstream is the host's DNS resolver (from /etc/resolv.conf, or
     /// 8.8.8.8 as fallback).
     ///
-    /// The DNS proxy runs in the parent process. slirp4netns's `--dns`
-    /// flag forwards sandbox DNS queries (10.0.2.3:53) to this port on
-    /// the host's loopback. Port 0 lets the OS pick an available port
-    /// (port 53 is privileged and would require root).
+    /// The DNS proxy runs in the parent process. pasta's `--dns-forward`
+    /// option forwards sandbox DNS queries to this port on the host's
+    /// loopback. Port 0 lets the OS pick an available port (port 53 is
+    /// privileged and would require root).
     pub fn default_with_policy(policy: NetworkConfig) -> Self {
         let upstream = read_host_nameserver().unwrap_or_else(|| "8.8.8.8:53".parse().unwrap());
         Self {

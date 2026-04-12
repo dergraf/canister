@@ -3,12 +3,13 @@
 // Provides:
 // - Network namespace creation (CLONE_NEWNET)
 // - Loopback interface setup
-// - slirp4netns integration for selective connectivity
+// - pasta integration for selective connectivity
 // - DNS proxy with domain-based filtering
+// - Port forwarding via pasta
 
 pub mod dns;
 pub mod netns;
-pub mod slirp;
+pub mod pasta;
 
 use std::net::IpAddr;
 
@@ -24,8 +25,8 @@ pub enum NetError {
     #[error("loopback setup failed: {0}")]
     Loopback(std::io::Error),
 
-    #[error("slirp4netns failed: {0}")]
-    Slirp(String),
+    #[error("pasta failed: {0}")]
+    Pasta(String),
 
     #[error("DNS proxy error: {0}")]
     Dns(String),
@@ -40,7 +41,7 @@ pub enum NetworkMode {
     /// No network at all — empty network namespace with only loopback.
     None,
 
-    /// Filtered network — connectivity via slirp4netns, DNS queries
+    /// Filtered network — connectivity via pasta, DNS queries
     /// filtered through our proxy.
     Filtered,
 
@@ -51,14 +52,18 @@ pub enum NetworkMode {
 
 impl NetworkMode {
     /// Determine the appropriate network mode from policy config.
+    ///
+    /// Port forwarding requires Filtered mode, so its presence
+    /// upgrades None → Filtered.
     pub fn from_config(config: &NetworkConfig) -> Self {
         if !config.deny_all() {
             return NetworkMode::Full;
         }
 
         let has_allowlist = !config.allow_domains.is_empty() || !config.allow_ips.is_empty();
+        let has_ports = !config.ports.is_empty();
 
-        if has_allowlist {
+        if has_allowlist || has_ports {
             NetworkMode::Filtered
         } else {
             NetworkMode::None
@@ -68,11 +73,11 @@ impl NetworkMode {
 
 /// State for the parent side of network isolation.
 ///
-/// Holds handles to child processes (slirp4netns) and the DNS proxy
+/// Holds handles to child processes (pasta) and the DNS proxy
 /// thread so they can be cleaned up when the sandbox exits.
 pub struct NetworkState {
-    /// The slirp4netns child process, if running.
-    pub slirp_child: Option<std::process::Child>,
+    /// The pasta child process, if running.
+    pub pasta_child: Option<std::process::Child>,
 
     /// Handle to the DNS proxy thread.
     pub dns_shutdown: Option<dns::DnsProxyHandle>,
@@ -88,18 +93,18 @@ impl NetworkState {
     /// Create a new empty network state.
     pub fn new() -> Self {
         Self {
-            slirp_child: None,
+            pasta_child: None,
             dns_shutdown: None,
         }
     }
 
-    /// Shut down all network infrastructure (slirp, DNS proxy).
+    /// Shut down all network infrastructure (pasta, DNS proxy).
     pub fn shutdown(&mut self) {
         if let Some(handle) = self.dns_shutdown.take() {
             handle.shutdown();
         }
 
-        if let Some(mut child) = self.slirp_child.take() {
+        if let Some(mut child) = self.pasta_child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -128,7 +133,7 @@ pub fn is_domain_allowed(domain: &str, config: &NetworkConfig) -> bool {
 /// Pre-resolve whitelisted domains to their IP addresses.
 ///
 /// This is done in the parent process before sandboxing, so the results
-/// can be used to build an IP allow-set for seccomp filtering (Phase 4).
+/// can be used to build an IP allow-set for seccomp filtering.
 ///
 /// Returns a map of domain -> resolved IPs.
 pub fn resolve_allowed_domains(config: &NetworkConfig) -> Vec<(String, Vec<IpAddr>)> {
@@ -173,6 +178,7 @@ mod tests {
             allow_domains: vec!["example.com".to_string()],
             allow_ips: vec![],
             deny_all: Some(true),
+            ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
@@ -183,6 +189,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
             deny_all: Some(true),
+            ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
@@ -193,7 +200,25 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec![],
             deny_all: Some(false),
+            ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Full);
+    }
+
+    #[test]
+    fn network_mode_ports_upgrade_to_filtered() {
+        use can_policy::config::{PortMapping, PortProtocol};
+        let config = NetworkConfig {
+            allow_domains: vec![],
+            allow_ips: vec![],
+            deny_all: Some(true),
+            ports: vec![PortMapping {
+                host_ip: None,
+                host_port: 8080,
+                container_port: 80,
+                protocol: PortProtocol::Tcp,
+            }],
+        };
+        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
 }

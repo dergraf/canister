@@ -74,8 +74,8 @@ has_user_namespaces() {
     unshare --user true 2>/dev/null
 }
 
-has_slirp4netns() {
-    command -v slirp4netns &>/dev/null
+has_pasta() {
+    command -v pasta &>/dev/null
 }
 
 has_cgroups_v2() {
@@ -92,9 +92,9 @@ require_user_namespaces() {
     fi
 }
 
-require_slirp4netns() {
-    if ! has_slirp4netns; then
-        skip_all "slirp4netns not installed"
+require_pasta() {
+    if ! has_pasta; then
+        skip_all "pasta not installed"
     fi
 }
 

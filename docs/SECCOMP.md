@@ -345,9 +345,9 @@ sockets are always permitted.
 ### DNS proxy integration
 
 When the notifier is active, a DNS proxy runs in the **parent process** on
-an ephemeral port. The sandbox's `/etc/resolv.conf` points to slirp4netns's
-DNS forwarding address (`10.0.2.3:53`), which is configured via
-`slirp4netns --dns` to forward queries to the parent's DNS proxy. The proxy
+an ephemeral port. The sandbox's `/etc/resolv.conf` points to pasta's
+DNS address (`169.254.0.1:53`), which is configured via `--dns-forward`
+to forward queries to the parent's DNS proxy. The proxy
 only resolves domains in the `allow_domains` list — all other queries receive
 an NXDOMAIN response. This prevents DNS-based information exfiltration and
 ensures the sandbox can only resolve whitelisted domains.

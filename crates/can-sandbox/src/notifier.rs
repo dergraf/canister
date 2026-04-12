@@ -64,6 +64,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
+use can_net::pasta::PASTA_DNS_ADDR;
+
 use crate::seccomp::SeccompError;
 
 // ---------------------------------------------------------------------------
@@ -925,10 +927,31 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
         return Verdict::Deny(libc::EPERM as u32);
     }
 
+    classify_connect_addr(pid, &addr_bytes, addr_len, policy)
+}
+
+/// Classify a connect() destination address and return a verdict.
+///
+/// This is factored out of `evaluate_connect` so that the address
+/// classification logic can be unit-tested with synthetic sockaddr
+/// bytes without requiring real `/proc/<pid>/mem` access or seccomp
+/// notification fds.
+fn classify_connect_addr(
+    pid: u32,
+    addr_bytes: &[u8],
+    addr_len: usize,
+    policy: &NotifierPolicy,
+) -> Verdict {
     // Parse the address family (first 2 bytes of sockaddr, native endian).
     let sa_family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
 
     match sa_family as i32 {
+        libc::AF_UNSPEC => {
+            // AF_UNSPEC is used by connect() to "disconnect" a UDP socket
+            // or as part of address probing. This is harmless local operation.
+            tracing::debug!(pid, "connect: AF_UNSPEC (disconnect/probe), allowing");
+            Verdict::Allow
+        }
         libc::AF_UNIX => {
             // AF_UNIX connections are always allowed (local IPC).
             tracing::debug!(pid, "connect: AF_UNIX, allowing");
@@ -944,10 +967,12 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
             let ip = Ipv4Addr::new(addr_bytes[4], addr_bytes[5], addr_bytes[6], addr_bytes[7]);
             let ip_addr = IpAddr::V4(ip);
 
-            // Block unspecified address (0.0.0.0) — commonly used for bind, not connect.
+            // Allow unspecified address (0.0.0.0) — used by programs to probe
+            // their own network configuration (e.g., Python's http.server,
+            // getaddrinfo probing). This is not an outbound connection.
             if ip.is_unspecified() {
-                tracing::warn!(pid, port, "connect: IPv4 unspecified (0.0.0.0), denying");
-                return Verdict::Deny(libc::EACCES as u32);
+                tracing::debug!(pid, port, "connect: IPv4 unspecified (0.0.0.0), allowing");
+                return Verdict::Allow;
             }
 
             // Block multicast (224.0.0.0/4).
@@ -956,7 +981,15 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
                 return Verdict::Deny(libc::EACCES as u32);
             }
 
-            // Block link-local (169.254.0.0/16) — often used for cloud metadata services.
+            // Allow the pasta DNS address (link-local) — needed for DNS resolution
+            // inside the sandbox. The sandbox's resolv.conf points here.
+            if ip_addr == PASTA_DNS_ADDR.parse::<IpAddr>().unwrap() {
+                tracing::debug!(pid, %ip_addr, port, "connect: pasta DNS address, allowing");
+                return Verdict::Allow;
+            }
+
+            // Block other link-local (169.254.0.0/16) — often used for cloud
+            // metadata services (e.g., AWS 169.254.169.254).
             if ip.is_link_local() {
                 tracing::warn!(pid, %ip_addr, port, "connect: IPv4 link-local, denying");
                 return Verdict::Deny(libc::EACCES as u32);
@@ -988,10 +1021,11 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
             let ip = Ipv6Addr::from(addr_buf);
             let ip_addr = IpAddr::V6(ip);
 
-            // Block unspecified address (::).
+            // Allow unspecified address (::) — used by programs to probe
+            // their own network configuration. Not an outbound connection.
             if ip.is_unspecified() {
-                tracing::warn!(pid, port, "connect: IPv6 unspecified (::), denying");
-                return Verdict::Deny(libc::EACCES as u32);
+                tracing::debug!(pid, port, "connect: IPv6 unspecified (::), allowing");
+                return Verdict::Allow;
             }
 
             // Block multicast (ff00::/8).
@@ -1326,11 +1360,17 @@ pub fn policy_from_config(
         }
     }
 
-    // Slirp4netns internal addresses — always allowed.
-    // 10.0.2.2 (gateway), 10.0.2.3 (DNS), 10.0.2.100 (sandbox)
-    allowed_ips.insert("10.0.2.2".parse().unwrap());
-    allowed_ips.insert("10.0.2.3".parse().unwrap());
-    allowed_ips.insert("10.0.2.100".parse().unwrap());
+    // pasta infrastructure addresses — always allowed.
+    // Allow the DNS proxy address (link-local) used inside the namespace.
+    allowed_ips.insert(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap());
+
+    // Allow the host's default gateway — pasta mirrors the host's
+    // network configuration, so the gateway is a real IP that the
+    // sandbox needs to reach for outbound traffic.
+    if let Some(gw) = can_net::pasta::detect_default_gateway() {
+        allowed_ips.insert(IpAddr::V4(gw));
+        tracing::debug!(gateway = %gw, "added default gateway to notifier allowlist");
+    }
 
     // Build allowed exec paths from process config.
     // Entries ending in `/*` are treated as prefix rules (match any path
@@ -1520,13 +1560,13 @@ mod tests {
     }
 
     #[test]
-    fn policy_from_config_adds_slirp_addrs() {
+    fn policy_from_config_adds_pasta_addrs() {
         use can_policy::SandboxConfig;
         let config = SandboxConfig::default_deny();
         let policy = policy_from_config(&config, &[]);
-        assert!(policy.is_ip_allowed("10.0.2.2".parse().unwrap()));
-        assert!(policy.is_ip_allowed("10.0.2.3".parse().unwrap()));
-        assert!(policy.is_ip_allowed("10.0.2.100".parse().unwrap()));
+        // The pasta DNS address (link-local) must always be allowed.
+        assert!(policy.is_ip_allowed(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap()));
+        // Note: default gateway depends on host, so we don't assert a specific IP.
     }
 
     #[test]
@@ -1850,6 +1890,226 @@ mod tests {
         // With empty paths AND prefixes, is_exec_path_allowed returns false.
         // But evaluate_execve short-circuits to Allow when both are empty.
         assert!(!is_exec_path_allowed(Path::new("/any/path"), &policy));
+    }
+
+    // ---- classify_connect_addr unit tests ----
+    //
+    // These test the address classification logic extracted from
+    // evaluate_connect() using synthetic sockaddr byte arrays.
+
+    /// Build a synthetic sockaddr_in byte array.
+    fn make_sockaddr_in(ip: Ipv4Addr, port: u16) -> Vec<u8> {
+        let family = (libc::AF_INET as u16).to_ne_bytes();
+        let port_bytes = port.to_be_bytes();
+        let octets = ip.octets();
+        let mut buf = vec![0u8; 16]; // sockaddr_in is 16 bytes
+        buf[0..2].copy_from_slice(&family);
+        buf[2..4].copy_from_slice(&port_bytes);
+        buf[4..8].copy_from_slice(&octets);
+        buf
+    }
+
+    /// Build a synthetic sockaddr_in6 byte array.
+    fn make_sockaddr_in6(ip: Ipv6Addr, port: u16) -> Vec<u8> {
+        let family = (libc::AF_INET6 as u16).to_ne_bytes();
+        let port_bytes = port.to_be_bytes();
+        let octets = ip.octets();
+        let mut buf = vec![0u8; 28]; // sockaddr_in6 is 28 bytes
+        buf[0..2].copy_from_slice(&family);
+        buf[2..4].copy_from_slice(&port_bytes);
+        // bytes 4-7 = flowinfo (zero)
+        buf[8..24].copy_from_slice(&octets);
+        // bytes 24-27 = scope_id (zero)
+        buf
+    }
+
+    /// Build a synthetic sockaddr with just a family (for AF_UNSPEC etc.).
+    fn make_sockaddr_family(family: i32) -> Vec<u8> {
+        let family_bytes = (family as u16).to_ne_bytes();
+        let mut buf = vec![0u8; 16];
+        buf[0..2].copy_from_slice(&family_bytes);
+        buf
+    }
+
+    #[test]
+    fn connect_af_unspec_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_family(libc::AF_UNSPEC);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for AF_UNSPEC, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_af_unix_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_family(libc::AF_UNIX);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for AF_UNIX, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv4_unspecified_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::UNSPECIFIED, 0);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for 0.0.0.0, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv6_unspecified_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in6(Ipv6Addr::UNSPECIFIED, 0);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for ::, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv4_loopback_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::LOCALHOST, 8080);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for 127.0.0.1, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv6_loopback_allowed() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in6(Ipv6Addr::LOCALHOST, 8080);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for ::1, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_pasta_dns_addr_allowed() {
+        let policy = NotifierPolicy::default();
+        let dns_ip: Ipv4Addr = PASTA_DNS_ADDR.parse().unwrap();
+        let addr = make_sockaddr_in(dns_ip, 53);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => {
+                panic!("expected Allow for pasta DNS {PASTA_DNS_ADDR}, got Deny({e})")
+            }
+        }
+    }
+
+    #[test]
+    fn connect_other_link_local_denied() {
+        // AWS metadata endpoint 169.254.169.254 should be denied.
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::new(169, 254, 169, 254), 80);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for 169.254.169.254"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv4_multicast_denied() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::new(224, 0, 0, 1), 5353);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for multicast 224.0.0.1"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv6_multicast_denied() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in6("ff02::1".parse().unwrap(), 5353);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for IPv6 multicast ff02::1"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv4_broadcast_denied() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::BROADCAST, 1234);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for broadcast 255.255.255.255"),
+        }
+    }
+
+    #[test]
+    fn connect_ipv6_link_local_denied() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in6("fe80::1".parse().unwrap(), 80);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for IPv6 link-local fe80::1"),
+        }
+    }
+
+    #[test]
+    fn connect_unknown_family_denied() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_family(99);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for unknown family 99"),
+        }
+    }
+
+    #[test]
+    fn connect_policy_allowed_ip() {
+        let mut policy = NotifierPolicy::default();
+        policy.allowed_ips.insert("93.184.216.34".parse().unwrap());
+        let addr = make_sockaddr_in(Ipv4Addr::new(93, 184, 216, 34), 443);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(e) => panic!("expected Allow for policy-allowed IP, got Deny({e})"),
+        }
+    }
+
+    #[test]
+    fn connect_policy_denied_ip() {
+        let policy = NotifierPolicy::default();
+        let addr = make_sockaddr_in(Ipv4Addr::new(8, 8, 8, 8), 53);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for non-allowed IP 8.8.8.8"),
+        }
+    }
+
+    #[test]
+    fn connect_af_inet_too_short_denied() {
+        let policy = NotifierPolicy::default();
+        // AF_INET with only 4 bytes (less than required 8).
+        let family = (libc::AF_INET as u16).to_ne_bytes();
+        let mut addr = vec![0u8; 4];
+        addr[0..2].copy_from_slice(&family);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for truncated AF_INET sockaddr"),
+        }
+    }
+
+    #[test]
+    fn connect_af_inet6_too_short_denied() {
+        let policy = NotifierPolicy::default();
+        // AF_INET6 with only 16 bytes (less than required 24).
+        let family = (libc::AF_INET6 as u16).to_ne_bytes();
+        let mut addr = vec![0u8; 16];
+        addr[0..2].copy_from_slice(&family);
+        match classify_connect_addr(1, &addr, addr.len(), &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for truncated AF_INET6 sockaddr"),
+        }
     }
 
     #[test]

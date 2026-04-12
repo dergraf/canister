@@ -35,7 +35,7 @@ discarded.
 - **Unprivileged** -- uses user namespaces, no root or suid binary needed
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
-- **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via slirp4netns), or full
+- **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~170 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
 - **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw/netlink), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
@@ -55,7 +55,7 @@ discarded.
 ## Requirements
 
 - Linux 5.6+ with unprivileged user namespaces enabled
-- `slirp4netns` (only for filtered network mode)
+- `pasta` from passt (only for filtered network mode)
 
 Check your system:
 
@@ -69,7 +69,7 @@ Kernel: 6.8.0-106-generic
   Cgroups v2:         available
   OverlayFS:          available
   Seccomp BPF:        available
-  slirp4netns:        available
+  pasta:              available
   seccomp:            supported
 
 Canister can run on this system.
@@ -127,6 +127,10 @@ can run -r cargo -r generic-strict -- cargo build
 # Nix, Homebrew, Cargo, Snap, Flatpak, Guix -- prefix is auto-detected via match_prefix
 can run -- iex -e 'IO.puts("hello")'        # Nix-installed Elixir
 can run -- rg --help                         # Cargo-installed ripgrep
+
+# Port forwarding -- expose sandbox ports on the host
+can run -p 8080:80 -r elixir -- mix phx.server
+can run -p 127.0.0.1:3000:3000 -p 5432:5432 -- my-app
 
 # Strict mode for CI -- seccomp kills on violation instead of EPERM
 can run --strict -r elixir -- mix test
@@ -192,13 +196,15 @@ Canister combines eight Linux isolation mechanisms:
                     │  PARENT   │          │   CHILD    │
                     │           │          │            │
                     │ write     │  pipes   │ unshare()  │
-                    │ uid/gid   │◄────────►│ USER+MNT   │
-                    │ maps      │          │ +PID+[NET] │
+                    │ uid/gid   │◄────────►│ USER+PID   │
+                    │ maps      │          │ [+NET]     │
                     │           │          │            │
-                    │ start     │          │ fork()     │
-                    │ slirp4netns          │ → PID 1    │
+                    │ start     │          │ unshare()  │
+                    │ pasta     │          │ MNT        │
+                    │           │          │ fork()     │
+                    │ wait()    │          │ → PID 1    │
                     │           │          │ pivot_root │
-                    │ wait()    │          │ seccomp    │
+                    │           │          │ seccomp    │
                     │           │          │ env filter │
                     │           │          │ execve()   │
                     └───────────┘          └────────────┘
@@ -217,9 +223,10 @@ Canister combines eight Linux isolation mechanisms:
 3. **PID namespace** -- the sandboxed process becomes PID 1 in its own PID
    namespace. It cannot see or signal any host processes.
 
-4. **Network namespace + slirp4netns** -- in filtered mode, the sandbox gets
-   its own network stack. `slirp4netns` provides user-mode TCP/IP from the
-   parent side. Whitelisted domains are pre-resolved to IPs at startup.
+4. **Network namespace + pasta** -- in filtered mode, the sandbox gets
+   its own network stack. `pasta` (from passt) provides user-mode TCP/IP by
+   mirroring the host's network configuration into the namespace. Whitelisted
+   domains are pre-resolved to IPs at startup.
 
 5. **Seccomp BPF** -- a Berkeley Packet Filter program is loaded right before
    `exec`. It operates in **default-deny (allow-list) mode**: only syscalls
@@ -346,10 +353,32 @@ The network mode is determined automatically from the `[network]` config:
 | Config | Mode | Behavior |
 |--------|------|----------|
 | `deny_all = true`, no allowlists | **None** | Empty network namespace, loopback only |
-| `deny_all = true`, with allowlists | **Filtered** | slirp4netns provides connectivity, domains pre-resolved |
+| `deny_all = true`, with allowlists | **Filtered** | pasta provides connectivity, domains pre-resolved |
 | `deny_all = false` | **Full** | No network isolation (trust mode) |
 
-Filtered mode requires `slirp4netns` installed (`sudo apt install slirp4netns`).
+Filtered mode requires `pasta` installed (`sudo apt install passt` on Debian/Ubuntu, `sudo dnf install passt` on Fedora).
+
+### Port Forwarding
+
+Use `-p` / `--port` to forward ports from the host into the sandbox (Docker-compatible syntax):
+
+```bash
+# Forward host port 8080 to sandbox port 80
+can run -p 8080:80 -r my-recipe -- my-server
+
+# Bind to a specific host IP
+can run -p 127.0.0.1:3000:3000 -- my-app
+
+# Forward UDP
+can run -p 5353:53/udp -- dns-server
+
+# Multiple ports
+can run -p 8080:80 -p 8443:443 -- nginx
+```
+
+Syntax: `-p [ip:]hostPort:containerPort[/protocol]`
+
+Port forwarding automatically enables filtered network mode.
 
 ## Security Model
 
@@ -415,12 +444,27 @@ an error code the process could handle.
 Ubuntu 24.04+ restricts mount operations inside unprivileged user namespaces
 via AppArmor. Canister detects this and aborts with a clear error message.
 
-To enable full isolation, install the override profile:
+To enable full isolation, install the AppArmor profile:
 
 ```bash
-sudo cp canister.apparmor /etc/apparmor.d/local/unprivileged_userns
-sudo apparmor_parser -r /etc/apparmor.d/unprivileged_userns
+# Install (auto-detects binary path, generates profile from built-in template)
+sudo can setup
+
+# Force reinstall (e.g., after upgrading canister)
+sudo can setup --force
+
+# Check profile status
+can check
+
+# Remove profile
+sudo can setup --remove
 ```
+
+The profile grants the `can` binary mount/capability permissions and transitions
+sandboxed child processes to a restricted sub-profile (`canister_sandboxed`)
+that denies all capabilities, mount operations, and user namespace creation.
+Trusted helper binaries (pasta, apparmor_parser) run unconfined via specific
+`ux` rules.
 
 ## Project Structure
 
@@ -430,7 +474,7 @@ canister/
 │   ├── can-cli/        # CLI binary (clap): commands, recipe resolution, can init/update
 │   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp, process control
 │   ├── can-policy/     # Config parsing, recipe merge, whitelist logic, env var expansion
-│   ├── can-net/        # Network isolation: netns, slirp4netns, DNS proxy
+│   ├── can-net/        # Network isolation: netns, pasta, DNS proxy
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
 │   ├── default.toml    # Default seccomp baseline (embedded + overridable)
@@ -455,7 +499,8 @@ canister/
 │       └── 0002-recipe-composition-and-lifecycle.md
 ├── tests/
 │   └── integration/    # Bash integration tests (15 test files)
-└── canister.apparmor   # AppArmor override for Ubuntu 24.04+
+└── .github/
+    └── workflows/      # CI configuration
 ```
 
 ## Development

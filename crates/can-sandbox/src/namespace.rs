@@ -58,18 +58,23 @@ pub enum NamespaceError {
 /// 1. Parent validates command against `allow_execve` whitelist
 /// 2. Parent pre-resolves DNS for whitelisted domains (if filtered network)
 /// 3. Parent forks → child
-/// 4. Child calls `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID [| CLONE_NEWNET])` atomically
+/// 4. Child calls `unshare(CLONE_NEWUSER | CLONE_NEWPID [| CLONE_NEWNET])` atomically
 /// 5. Child signals parent via pipe that namespaces are created
-/// 6. Parent writes UID/GID maps, starts slirp4netns + DNS proxy
-/// 7. Parent signals child via pipe that maps (and network) are ready
-/// 8. Child forks again for PID namespace:
+/// 6. Parent writes UID/GID maps, signals child
+/// 7. Parent starts pasta (with `--userns` + `--netns` pointing at
+///    `/proc/<child_pid>/ns/*`) and the DNS proxy
+/// 8. Parent signals child that network is ready
+/// 9. Child creates mount namespace (CLONE_NEWNS) — this is deferred so
+///    the parent can still access `/proc/<child_pid>/ns/*` via the init
+///    mount namespace's procfs
+/// 10. Child forks again for PID namespace:
 ///    - **Intermediate process**: receives seccomp notifier fd from inner child,
 ///      runs the supervisor thread (inside the user namespace so `/proc/<pid>/mem`
 ///      access works), waits for inner child, shuts down supervisor, exits.
 ///    - **Inner child (PID 1)**: sets up filesystem, network, RLIMIT_NPROC,
 ///      seccomp, env filtering, installs notifier filter, sends fd to
 ///      intermediate, then execs the target command.
-/// 9. Parent waits for child and cleans up network.
+/// 11. Parent waits for child and cleans up network.
 pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let command_path =
         resolve_command(&opts.command).map_err(|_| NamespaceError::Exec(nix::Error::ENOENT))?;
@@ -128,9 +133,18 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             Vec::new()
         };
 
-    // Create two pipes for parent-child synchronization.
+    // Create pipes for parent-child synchronization.
+    //
+    // The protocol has two phases:
+    // Phase 1: child unshares → child_ready → parent writes uid_map → maps_done
+    // Phase 2: parent starts pasta (using /proc/<child_pid>/ns/*) → network_done → child continues
+    //
+    // No bind-mount is needed: pasta is invoked with --userns and --netns
+    // pointing directly at /proc/<child_pid>/ns/{user,net}. These files
+    // are world-readable symlinks, so pasta can open them directly.
     let child_ready = pipe().map_err(NamespaceError::Fork)?;
-    let parent_done = pipe().map_err(NamespaceError::Fork)?;
+    let maps_done = pipe().map_err(NamespaceError::Fork)?;
+    let network_done = pipe().map_err(NamespaceError::Fork)?;
 
     // Capture UID/GID before fork.
     let uid = nix::unistd::getuid();
@@ -145,9 +159,10 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     match fork_result {
         ForkResult::Parent { child } => {
             drop(child_ready.1);
-            drop(parent_done.0);
+            drop(maps_done.0);
+            drop(network_done.0);
 
-            // Wait for child to signal that namespaces are created.
+            // Phase 1: Wait for child to signal that namespaces are created.
             let mut buf = [0u8; 1];
             let mut ready_r = std::fs::File::from(child_ready.0);
             ready_r
@@ -162,12 +177,23 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             // Write UID/GID mappings from the parent.
             write_uid_gid_maps(child, uid, gid)?;
 
-            // Set up network infrastructure from the parent side.
-            // DNS resolution was already done before fork; only start
-            // slirp4netns and the DNS proxy here.
+            // Signal child that uid/gid maps are written.
+            let mut maps_w = std::fs::File::from(maps_done.1);
+            maps_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
+            drop(maps_w);
+
+            // Phase 2: Start pasta with --userns + --netns /proc/<child_pid>/ns/*.
+            //
+            // The child called prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY) before
+            // signaling us, allowing pasta (a sibling process) to open
+            // /proc/<child_pid>/ns/* despite Yama ptrace_scope=1.
+            //
+            // pasta must join the user namespace first (setns(CLONE_NEWUSER))
+            // to acquire CAP_SYS_ADMIN over the network namespace, then join
+            // the network namespace (setns(CLONE_NEWNET)).
             let mut net_state = NetworkState::new();
             if net_mode == NetworkMode::Filtered {
-                match setup_parent_network(child, &opts.config, &mut net_state) {
+                match setup_parent_network(child.as_raw() as u32, &opts.config, &mut net_state) {
                     Ok(()) => tracing::debug!("parent network setup complete"),
                     Err(e) => {
                         tracing::error!(error = %e, "parent network setup failed");
@@ -176,10 +202,10 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 }
             }
 
-            // Signal child that maps (and network) are written.
-            let mut done_w = std::fs::File::from(parent_done.1);
-            done_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
-            drop(done_w);
+            // Signal child that network is ready.
+            let mut net_w = std::fs::File::from(network_done.1);
+            net_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
+            drop(net_w);
 
             // The seccomp supervisor now runs inside the child's user namespace
             // (in the intermediate process after enter_pid_namespace). The parent
@@ -192,14 +218,16 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         }
         ForkResult::Child => {
             drop(child_ready.0);
-            drop(parent_done.1);
+            drop(maps_done.1);
+            drop(network_done.1);
 
             let result = child_entry(
                 &cmd,
                 &argv,
                 &command_path,
                 child_ready.1,
-                parent_done.0,
+                maps_done.0,
+                network_done.0,
                 &opts.config,
                 net_mode,
                 opts.monitor,
@@ -218,24 +246,30 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     }
 }
 
-/// Set up parent-side network infrastructure (slirp4netns + DNS proxy).
+/// Set up parent-side network infrastructure (pasta + DNS proxy).
 ///
-/// DNS resolution is done before fork (in `spawn_sandboxed`). This function
-/// only starts the DNS proxy and slirp4netns.
+/// `child_pid` is the PID of the sandboxed child process. pasta is
+/// invoked with `--userns /proc/<pid>/ns/user` and `--netns /proc/<pid>/ns/net`.
+/// DNS resolution is done before fork (in `spawn_sandboxed`).
+/// This function only starts the DNS proxy and pasta.
 fn setup_parent_network(
-    child_pid: Pid,
+    child_pid: u32,
     config: &SandboxConfig,
     state: &mut NetworkState,
 ) -> Result<(), can_net::NetError> {
-    if !can_net::slirp::is_available() {
+    if !can_net::pasta::is_available() {
         tracing::warn!(
-            "slirp4netns not found. Filtered network mode requires slirp4netns. \
-             Install it with: sudo apt install slirp4netns"
+            "pasta not found. Filtered network mode requires pasta. \
+             Install it with: sudo apt install passt"
         );
-        return Err(can_net::NetError::Slirp(
-            "slirp4netns not found".to_string(),
-        ));
+        return Err(can_net::NetError::Pasta("pasta not found".to_string()));
     }
+
+    let mut pasta_config = can_net::pasta::PastaConfig {
+        ports: config.network.ports.clone(),
+        dns_proxy_port: None,
+        child_pid: Some(child_pid),
+    };
 
     // Start the DNS proxy if there are domain-based rules.
     // The DNS proxy filters queries: whitelisted domains are forwarded,
@@ -247,31 +281,30 @@ fn setup_parent_network(
             Ok(handle) => {
                 let dns_port = handle.local_port();
                 tracing::info!(port = dns_port, "DNS proxy started");
+                pasta_config.dns_proxy_port = Some(dns_port);
                 state.dns_shutdown = Some(handle);
-
-                // Start slirp4netns with DNS forwarded to our proxy.
-                let slirp_child = can_net::slirp::start_with_dns(child_pid, dns_port)?;
-                state.slirp_child = Some(slirp_child);
-                return Ok(());
             }
             Err(e) => {
-                tracing::warn!(error = %e, "DNS proxy failed to start, falling back to plain slirp");
+                tracing::warn!(error = %e, "DNS proxy failed to start, starting pasta without DNS filtering");
             }
         }
     }
 
-    // Start slirp4netns without custom DNS (no domain rules, or DNS proxy failed).
-    let slirp_child = can_net::slirp::start(child_pid)?;
-    state.slirp_child = Some(slirp_child);
+    // Start pasta to provide networking in the sandbox.
+    let pasta_child = can_net::pasta::start(&pasta_config)?;
+    state.pasta_child = Some(pasta_child);
 
     Ok(())
 }
 
 /// Child process entry point.
 ///
-/// Creates all namespaces atomically in a single `unshare` call, then
-/// waits for the parent to write UID/GID maps before proceeding with
-/// mount operations that require mapped UIDs.
+/// Creates user + PID [+ net] namespaces, then coordinates with the
+/// parent via pipes:
+/// 1. Signal parent that namespaces are created (child_ready)
+/// 2. Wait for parent to write UID/GID maps (maps_done)
+/// 3. Wait for parent to start pasta (network_done)
+/// 4. Create mount namespace and continue sandbox setup
 ///
 /// The seccomp USER_NOTIF supervisor runs in the intermediate process
 /// (after `enter_pid_namespace`'s inner fork) rather than in the original
@@ -285,7 +318,8 @@ fn child_entry(
     argv: &[CString],
     command_path: &Path,
     ready_write: OwnedFd,
-    done_read: OwnedFd,
+    maps_read: OwnedFd,
+    network_read: OwnedFd,
     config: &SandboxConfig,
     net_mode: NetworkMode,
     monitor: bool,
@@ -293,9 +327,14 @@ fn child_entry(
     notifier_enabled: bool,
     resolved_ips: &[(String, Vec<std::net::IpAddr>)],
 ) -> Result<(), NamespaceError> {
-    // Build clone flags: always user + mount + PID namespaces.
-    let mut clone_flags =
-        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+    // Build clone flags for the first unshare: user + PID [+ net] namespaces.
+    //
+    // CLONE_NEWNS (mount namespace) is deliberately excluded here and done
+    // in a second unshare() call AFTER the parent has started pasta. If we
+    // included CLONE_NEWNS here, the parent couldn't access our
+    // /proc/<pid>/ns/* files because the child's /proc would be in an
+    // isolated mount namespace.
+    let mut clone_flags = CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID;
 
     // Add network namespace isolation when not in Full (trust) mode.
     if net_mode != NetworkMode::Full {
@@ -303,25 +342,60 @@ fn child_entry(
         tracing::debug!("including CLONE_NEWNET in unshare");
     }
 
-    // Create namespaces atomically.
-    // Doing this in one call avoids issues with AppArmor restrictions
-    // that may block sequential namespace creation.
+    // Create user + PID [+ net] namespaces.
     unshare(clone_flags).map_err(NamespaceError::Unshare)?;
+
+    // Allow pasta (a sibling process) to access our /proc/<pid>/ns/* files.
+    //
+    // Yama ptrace_scope=1 restricts /proc/<pid>/ns/* access to ancestor
+    // processes or those with CAP_SYS_PTRACE. Since pasta is spawned by
+    // the parent (our sibling, not ancestor), it would fail to open
+    // /proc/<our_pid>/ns/net without this.
+    //
+    // PR_SET_PTRACER with PR_SET_PTRACER_ANY tells Yama to allow any
+    // process to access our /proc/<pid>/ns/* files. This is safe because:
+    // - The sandbox process is already isolated in its own user namespace
+    // - PR_SET_PTRACER only relaxes the Yama ancestry check, not other
+    //   permission checks (user namespace membership, etc.)
+    // - The setting is per-process and dies with the process
+    //
+    // We call this BEFORE signaling the parent so pasta can immediately
+    // access /proc/<child>/ns/net when the parent starts it.
+    unsafe {
+        libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+    }
 
     // Signal parent that namespaces are created.
     let mut ready_w = std::fs::File::from(ready_write);
     ready_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
     drop(ready_w);
 
-    // Wait for parent to write UID/GID maps and set up network.
+    // Wait for parent to write UID/GID maps.
     let mut buf = [0u8; 1];
-    let mut done_r = std::fs::File::from(done_read);
-    done_r
+    let mut maps_r = std::fs::File::from(maps_read);
+    maps_r
         .read_exact(&mut buf)
         .map_err(NamespaceError::UidMap)?;
-    drop(done_r);
+    drop(maps_r);
 
-    tracing::debug!("namespaces created, uid/gid mapped, setting up sandbox");
+    tracing::debug!("uid/gid maps written, proceeding with namespace setup");
+
+    // Wait for parent to start pasta and complete network setup.
+    // The parent spawns pasta with --userns + --netns pointing at our
+    // /proc/<pid>/ns/* paths. Pasta joins our user namespace first (to
+    // acquire CAP_SYS_ADMIN), then our network namespace.
+    let mut net_r = std::fs::File::from(network_read);
+    net_r.read_exact(&mut buf).map_err(NamespaceError::UidMap)?;
+    drop(net_r);
+
+    tracing::debug!("network ready, continuing sandbox setup");
+
+    // Now create the mount namespace. This is done as a second unshare() call
+    // after pasta has started so that /proc/<child_pid>/ns/* paths remain
+    // accessible to pasta via the init mount namespace's procfs. After this
+    // call, our mount namespace is isolated and we can proceed with pivot_root.
+    unshare(CloneFlags::CLONE_NEWNS).map_err(NamespaceError::Unshare)?;
+    tracing::debug!("mount namespace created");
 
     if monitor {
         tracing::warn!("MONITOR MODE: namespace isolation active, policy enforcement relaxed");
@@ -444,16 +518,17 @@ fn child_entry(
             }
         }
         NetworkMode::Filtered => {
-            // In Filtered mode, slirp4netns provides user-mode networking.
+            // In Filtered mode, pasta provides user-mode networking.
             // The parent-side DNS proxy filters queries by domain allowlist.
             // The seccomp USER_NOTIF supervisor filters connect() by IP.
-            // Override resolv.conf to point at the DNS proxy (127.0.0.1).
-            if let Err(e) = can_net::netns::write_resolv_conf("10.0.2.3") {
+            // pasta configures resolv.conf via --dns, but if that doesn't
+            // take effect (e.g., after pivot_root), write it explicitly.
+            if let Err(e) = can_net::netns::write_resolv_conf(can_net::pasta::PASTA_DNS_ADDR) {
                 tracing::warn!(error = %e, "failed to write sandbox resolv.conf, DNS may not work");
             }
             tracing::info!(
                 notifier = notifier_enabled,
-                "network: filtered mode via slirp4netns + seccomp notifier"
+                "network: filtered mode via pasta + seccomp notifier"
             );
         }
         NetworkMode::Full => {

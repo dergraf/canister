@@ -6,8 +6,8 @@
 #   1. No external network access in none mode
 #   2. Loopback interface exists
 #
-# NOTE: Filtered network mode (slirp4netns) tests are separate because they
-# require slirp4netns to be installed and take longer to run.
+# NOTE: Filtered network mode (pasta) tests are separate because they
+# require pasta to be installed and take longer to run.
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"

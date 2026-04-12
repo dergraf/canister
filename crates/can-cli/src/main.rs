@@ -46,6 +46,14 @@ enum Commands {
         #[arg(short, long)]
         strict: bool,
 
+        /// Publish a container port to the host.
+        ///
+        /// Syntax: [ip:]hostPort:containerPort[/protocol]
+        /// Examples: -p 8080:80, -p 127.0.0.1:8443:443/tcp, -p 5000:5000/udp
+        /// Can be repeated. Implies filtered network mode.
+        #[arg(short = 'p', long = "port")]
+        ports: Vec<String>,
+
         /// The command to execute.
         #[arg(required = true)]
         command: Vec<String>,
@@ -59,6 +67,11 @@ enum Commands {
         /// Remove the AppArmor profile instead of installing it.
         #[arg(long)]
         remove: bool,
+
+        /// Force reinstall even if the profile is already installed.
+        /// Useful after upgrading canister to pick up profile changes.
+        #[arg(long, short)]
+        force: bool,
     },
 
     /// Manage and inspect recipes.
@@ -149,10 +162,11 @@ fn main() -> ExitCode {
             recipe,
             monitor,
             strict,
+            ports,
             command,
-        } => commands::run(&recipe, monitor, strict, command),
+        } => commands::run(&recipe, monitor, strict, &ports, command),
         Commands::Check => commands::check(),
-        Commands::Setup { remove } => commands::setup(remove),
+        Commands::Setup { remove, force } => commands::setup(remove, force),
         Commands::Recipe { action } => match action {
             RecipeAction::List => recipes::list(),
             RecipeAction::Show { recipe, command } => commands::show(&recipe, command),

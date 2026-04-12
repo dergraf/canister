@@ -38,7 +38,7 @@ of a sandboxed process, and the security properties of each isolation layer.
    strict mode — the sandbox runs at full strength or not at all.
 
 4. **Single binary.** No runtime dependencies beyond the Linux kernel (and
-   optionally slirp4netns for filtered networking). No dynamic linking to
+   optionally pasta for filtered networking). No dynamic linking to
    external libraries.
 
 5. **One-shot execution.** Fork, isolate, exec, wait, exit. No daemon, no
@@ -68,7 +68,7 @@ canister/
 │                  definitions. No Linux-specific code.
 │
 ├── can-net        Network isolation. Network namespace setup,
-│                  loopback interface, slirp4netns integration,
+│                  loopback interface, pasta integration,
 │                  DNS proxy with domain filtering.
 │
 └── can-log        Logging setup. TTY detection, human vs JSON
@@ -110,36 +110,38 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
 │ 2. FORK                                                             │
-│    Create two pipes (child_ready, parent_done).                     │
-│    Capture UID/GID. Call fork().                                    │
+│    Create three pipes (child_ready, maps_done, network_done).   │
+│    Capture UID/GID. Call fork().                                │
 └──────────┬──────────────────────────────────────┬───────────────────┘
            │                                      │
     ┌──────▼──────┐                        ┌──────▼──────┐
     │   PARENT    │                        │    CHILD    │
     │             │                        │             │
     │             │                        │ 3. UNSHARE  │
-    │             │                        │    Atomic:  │
-    │             │                        │    USER+MNT │
-    │             │                        │    +PID     │
+    │             │                        │    Phase 1: │
+    │             │                        │    USER+PID │
     │             │                        │    [+NET]   │
     │             │    "ready" ◄────────── │             │
     │             │                        │             │
-    │ 4. UID/GID  │                        │   (blocks)  │
-    │    MAPPING   │                        │             │
+    │ 4. UID/GID  │                        │   (blocks   │
+    │    MAPPING   │                        │   maps_done)│
     │    Write     │                        │             │
     │    /proc/    │                        │             │
     │    <pid>/    │                        │             │
     │    uid_map   │                        │             │
     │    gid_map   │                        │             │
-    │             │                        │             │
-    │ 5. NETWORK  │                        │             │
+    │             │ ──► "maps_done"        │             │
+    │             │                        │   (blocks   │
+    │ 5. NETWORK  │                        │   net_done) │
     │    Start    │                        │             │
-    │    slirp4   │                        │             │
-    │    netns    │                        │             │
-    │    (if      │                        │             │
-    │    filtered)│                        │             │
+    │    pasta    │                        │             │
+    │    --userns │                        │             │
+    │    --netns  │                        │             │
+    │             │ ──► "net_done"         │             │
     │             │                        │             │
-    │             │ ──────────► "done"     │             │
+    │             │                        │ 5b.UNSHARE  │
+    │             │                        │    Phase 2: │
+    │             │                        │    NEWNS    │
     │             │                        │             │
      │             │                        │ 6. PID NS   │
      │             │                        │    First    │
@@ -253,7 +255,7 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
     │             │                        └─────────────┘
      │ 15. CLEANUP│
      │    Kill     │
-     │    slirp    │
+     │    pasta    │
      │    Stop DNS │
      │    proxy    │
      │    Return   │
@@ -266,12 +268,16 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 - Recipe composition (load, merge, env expansion) happens entirely in the
   CLI layer **before** forking. The child receives an already-resolved
   `SandboxConfig`.
-- `unshare()` must be a single atomic call. Splitting `CLONE_NEWUSER` and
-  `CLONE_NEWNS` into separate calls fails under AppArmor.
+- `unshare()` is split into two phases. Phase 1: `unshare(CLONE_NEWUSER |
+  CLONE_NEWPID | CLONE_NEWNET)` — creates user, PID, and network namespaces.
+  Phase 2: `unshare(CLONE_NEWNS)` — creates the mount namespace. The split
+  is necessary so pasta can access `/proc/<child_pid>/ns/net` before the
+  child's mount namespace changes.
 - UID/GID maps must be written from the **parent** process. The child cannot
   write its own maps after `unshare(CLONE_NEWUSER)`.
-- slirp4netns must be started after the child creates `CLONE_NEWNET` but
-  before the child tries to use the network.
+- pasta must be started after the child creates `CLONE_NEWNET` and after
+  UID/GID maps are written, but before the child calls `unshare(CLONE_NEWNS)`.
+  pasta is invoked with `--userns /proc/<child_pid>/ns/user --netns /proc/<child_pid>/ns/net --runas <uid>`.
 - The inner fork for PID namespace must happen before filesystem setup so
   `/proc` mount reflects the new PID namespace.
 - `setsid()` must be called after the inner PID namespace fork. PID 1
@@ -397,32 +403,32 @@ the AppArmor override profile to enable full isolation (see README).
 
 ### 3. Network Namespace
 
-**Syscall:** `unshare(CLONE_NEWNET)` + slirp4netns
+**Syscall:** `unshare(CLONE_NEWNET)` + pasta
 
 Three modes, determined from config:
 
 **None mode:** The sandbox has an empty network namespace with only loopback.
 No external connectivity.
 
-**Filtered mode:** The parent starts `slirp4netns --configure --mtu=65520
---disable-host-loopback` which creates a TAP interface (`tap0`) inside the
-child's network namespace and provides user-mode TCP/IP:
+**Filtered mode:** The parent starts `pasta` which mirrors the host's
+network configuration into the child's network namespace. pasta copies the
+host's real IP addresses, routes, and gateway into the namespace:
 
 ```
 ┌──────────────────────────────────┐
 │         Host network             │
 │                                  │
-│   slirp4netns ◄──── TAP fd      │
+│   pasta ◄──── namespace fd       │
 │       │                          │
-│       │  user-mode TCP/IP        │
+│       │  mirrors host config     │
 │       │                          │
 └───────┼──────────────────────────┘
         │
 ┌───────┼──────────────────────────┐
 │       ▼      Sandbox network     │
-│   tap0 (10.0.2.100)             │
-│   gateway: 10.0.2.2             │
-│   DNS:     10.0.2.3             │
+│   Host's real IP (mirrored)      │
+│   gateway: host's default gw     │
+│   DNS: 169.254.0.1 (link-local)  │
 │                                  │
 │   ┌─────────────────────────┐    │
 │   │   sandboxed process     │    │
@@ -436,13 +442,19 @@ the USER_NOTIF supervisor, which intercepts `connect()` syscalls and validates
 the destination IP against the allowlist. A DNS proxy runs in the **parent
 process** on an ephemeral port, filtering DNS queries to only resolve
 whitelisted domains. The sandbox's `/etc/resolv.conf` is configured to use
-slirp4netns's `--dns` forwarding (on `10.0.2.3:53`), which routes queries
-to the parent's DNS proxy. This prevents DNS-based information exfiltration.
+pasta's DNS address (`169.254.0.1:53`, set via `--dns`), which routes
+queries to the parent's DNS proxy via `--dns-forward`. This prevents
+DNS-based information exfiltration.
+
+**Port forwarding:** When `-p` / `--port` flags are specified, pasta is
+configured with explicit port forwarding rules via `-t` (TCP) and `-u`
+(UDP) options. Auto-forwarding is disabled (`-t none -u none`) and only
+the specified ports are forwarded.
 
 **Full mode:** No `CLONE_NEWNET`. The sandbox shares the host network.
 
 **Security property:** In None mode, the process has zero network access.
-In Filtered mode, connectivity is routed through slirp4netns, and the
+In Filtered mode, connectivity is routed through pasta, and the
 USER_NOTIF supervisor enforces IP-level connect() filtering against the
 allowed domain/IP whitelist. DNS queries are restricted to whitelisted
 domains. In Full mode, there is no network isolation.
@@ -830,7 +842,7 @@ observation) but relaxes policy enforcement. Each enforcement point logs what
 | Seccomp BPF | `SECCOMP_RET_ERRNO` (EPERM) | `SECCOMP_RET_LOG` (allowed but kernel-logged) |
 | USER_NOTIF supervisor | Active (intercepts syscalls) | Disabled (incompatible with `SECCOMP_RET_LOG`) |
 | Filesystem isolation | Full overlay + pivot_root | Full overlay + pivot_root (unchanged) |
-| Network isolation | Namespace + slirp4netns | Namespace + slirp4netns (unchanged) |
+| Network isolation | Namespace + pasta | Namespace + pasta (unchanged) |
 
 **Key design decisions:**
 
@@ -906,23 +918,30 @@ environment where reduced isolation is worse than no execution.
 
 ## Parent-Child Protocol
 
-The parent and child synchronize via two anonymous pipes:
+The parent and child synchronize via three anonymous pipes:
 
 ```
-Pipe 1: child_ready (child → parent)
-Pipe 2: parent_done (parent → child)
+Pipe 1: child_ready  (child → parent)   "namespaces created"
+Pipe 2: maps_done    (parent → child)   "UID/GID maps written"
+Pipe 3: network_done (parent → child)   "pasta started, network ready"
 
 Timeline:
-  Child: unshare()
+  Child: unshare(USER+PID+NET)
   Child: write(child_ready, 0x00)       ← "namespaces created"
-  Child: read(parent_done)              ← blocks
+  Child: read(maps_done)                ← blocks
 
   Parent: read(child_ready)             ← unblocks
   Parent: write uid_map, gid_map
-  Parent: start slirp4netns (if needed)
-  Parent: write(parent_done, 0x00)      ← "maps written, network ready"
+  Parent: write(maps_done, 0x00)        ← "maps written"
 
-  Child: read(parent_done)              ← unblocks
+  Child: read(maps_done)                ← unblocks
+  Child: read(network_done)             ← blocks
+
+  Parent: start pasta --userns /proc/<child>/ns/user --netns /proc/<child>/ns/net --runas <uid>
+  Parent: write(network_done, 0x00)     ← "network ready"
+
+  Child: read(network_done)             ← unblocks
+  Child: unshare(NEWNS)
   Child: install notifier filter, send fd to PID 1 supervisor (if enabled)
   Child: setup overlay, network, seccomp
   Child: execve()
@@ -930,19 +949,36 @@ Timeline:
   PID 1: receive notifier fd, run inline supervisor loop (if enabled)
 ```
 
-This protocol is necessary because:
+This three-pipe protocol is necessary because:
 
 1. **UID/GID maps must be written from outside the namespace.** The kernel
    requires an external process to write `/proc/<pid>/uid_map`.
 
-2. **slirp4netns needs the child's PID and network namespace.** It must be
-   started after the child creates `CLONE_NEWNET` but before the child tries
-   to use the network.
+2. **pasta needs the child's user and network namespaces.** pasta is invoked
+   with `--userns /proc/<child_pid>/ns/user --netns /proc/<child_pid>/ns/net
+   --runas <uid>`. The `setns(CLONE_NEWNET)` syscall requires `CAP_SYS_ADMIN`
+   in the **user namespace that owns** the target network namespace — not the
+   caller's user namespace. Since the child created both namespaces atomically
+   via `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, the network namespace is owned
+   by the child's user namespace. pasta must therefore first join the child's
+   user namespace (`setns(CLONE_NEWUSER)`) to acquire `CAP_SYS_ADMIN` there,
+   then join the network namespace (`setns(CLONE_NEWNET)`). The child calls
+   `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` before signaling the parent,
+   so that pasta (a sibling process) can open `/proc/<child>/ns/*` despite
+   Yama `ptrace_scope=1`. `--runas <uid>` prevents pasta from dropping to
+   "nobody", which would fail the kernel's UID ownership check on namespace
+   files. This must happen after the child creates `CLONE_NEWNET` but before
+   the child tries to use the network.
 
-3. **Mount operations need mapped UIDs.** The child cannot mount anything
+3. **Mount namespace is split from the initial unshare.** The child first
+   calls `unshare(USER+PID+NET)`, then waits for pasta, then calls
+   `unshare(NEWNS)` separately. This split ensures pasta can access
+   `/proc/<child_pid>/ns/net` before the child's mount namespace changes.
+
+4. **Mount operations need mapped UIDs.** The child cannot mount anything
    until its UID is mapped (otherwise the kernel rejects it).
 
-4. **The notifier fd must be passed from worker to supervisor.** The `seccomp()`
+5. **The notifier fd must be passed from worker to supervisor.** The `seccomp()`
    syscall returns the notifier fd in the worker's process. The fd is sent to
    PID 1 (supervisor) via `SCM_RIGHTS` over an anonymous Unix socket pair
    created before the supervisor/worker fork.
@@ -953,22 +989,56 @@ This protocol is necessary because:
 
 Ubuntu 24.04+ sets `kernel.apparmor_restrict_unprivileged_userns=1` by default.
 When a process calls `unshare(CLONE_NEWUSER)`, AppArmor transitions it to the
-`unprivileged_userns` profile which denies:
+`unprivileged_userns` profile which denies mount operations, capabilities, and
+module loading.
 
-- All mount operations (mount, umount, pivot_root)
-- All capabilities (CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, etc.)
-- Module loading
+**Two-profile architecture:**
+
+Canister uses two AppArmor profiles, managed by `can setup`:
+
+1. **`canister`** — attached to the `can` binary. Grants mount, pivot_root,
+   capabilities (`sys_admin`, `net_admin`, `sys_chroot`, `sys_ptrace`,
+   `dac_override`, `dac_read_search`), userns creation, and full file/network
+   access. Has a catch-all `px /** -> canister//&canister_sandboxed` rule that
+   transitions all child exec's to the restricted sub-profile. Also has
+   specific `ux` (unconfined exec) rules for:
+
+   - **pasta** (`/usr/bin/pasta`, `/usr/bin/pasta.avx2`, `/bin/pasta`,
+     `/bin/pasta.avx2`): pasta needs `CAP_SYS_ADMIN` to call
+     `setns(CLONE_NEWUSER)`, which is denied by `canister_sandboxed`. The `ux`
+     rules take precedence over the `px /**` glob, so pasta runs unconfined.
+   - **apparmor_parser** (`/usr/sbin/apparmor_parser`, `/sbin/apparmor_parser`):
+     needs `CAP_MAC_ADMIN` to load/unload profiles during `can setup`.
+
+2. **`canister_sandboxed`** — maximally strict sub-profile for sandboxed
+   commands. Denies all capabilities (`audit deny capability`), mount/umount/
+   pivot_root, user namespace creation, ptrace (except allowing the
+   USER_NOTIF supervisor to read process memory), and DBus.
+
+**Profile transition chain:**
+
+```
+canister (binary starts, never execs itself)
+    ├─ fork (child inherits "canister") → all namespace setup happens here
+    │   └─ execve(command) → "canister//&canister_sandboxed"
+    ├─ spawn(pasta) → ux rule fires → runs unconfined
+    └─ spawn(apparmor_parser) → ux rule fires → runs unconfined
+```
+
+AppArmor specific path rules (`ux /usr/bin/pasta`) take precedence over glob
+rules (`px /**`), so the `ux` rules for pasta and apparmor_parser work without
+conflicting with the catch-all `px` rule.
 
 **Impact on Canister:**
 
-| Feature | With AppArmor restriction | Without |
-|---------|--------------------------|---------|
+| Feature | With AppArmor restriction | With canister profile |
+|---------|--------------------------|----------------------|
 | User namespace | Works | Works |
-| Mount namespace | Created but mounts fail → **aborts** | Works |
+| Mount namespace | Mounts fail → **aborts** | Full isolation |
 | Filesystem isolation | **Aborts** (cannot establish) | Full |
 | Network namespace | Works | Works |
 | Loopback bring-up | Fails → **aborts** | Works |
-| slirp4netns | Works (runs in parent) | Works |
+| pasta | N/A (no connectivity) | Works (runs unconfined) |
 | Seccomp | Works | Works |
 | USER_NOTIF supervisor | Works | Works |
 
@@ -977,8 +1047,29 @@ When a process calls `unshare(CLONE_NEWUSER)`, AppArmor transitions it to the
 `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` to detect the
 restriction and report it clearly.
 
-**Fix:** The `canister.apparmor` file provides a local override that grants
-mount and umount permissions to processes in the `unprivileged_userns` profile.
+**Profile management (`can setup`):**
+
+```bash
+# Install the AppArmor profile (auto-detects binary path)
+sudo can setup
+
+# Force reinstall (even if profile exists and appears current)
+sudo can setup --force
+
+# Remove the profile
+sudo can setup --remove
+```
+
+`can setup` generates the profile from a built-in template, writes it to
+`/etc/apparmor.d/canister`, and loads it via `apparmor_parser -r`. It also
+detects **stale** profiles — when the installed profile content doesn't match
+the current template (e.g., after a Canister upgrade that adds new `ux` rules),
+`can check` reports the profile as "OUTDATED" and `can setup` will update it.
+
+**One-time upgrade note:** When upgrading from an older profile (without `ux`
+rules for pasta/apparmor_parser) to the new profile, `apparmor_parser` may be
+confined by the old profile and fail with "Access denied". In this case,
+manually reload: `sudo apparmor_parser -r /etc/apparmor.d/canister`.
 
 ---
 

@@ -45,7 +45,9 @@ impl KernelCapabilities {
         let profile_status = setup::detect_profile_status();
         let profile_installed = matches!(
             profile_status,
-            setup::ProfileStatus::NotNeeded | setup::ProfileStatus::Installed { .. }
+            setup::ProfileStatus::NotNeeded
+                | setup::ProfileStatus::Installed { .. }
+                | setup::ProfileStatus::Stale { .. }
         );
 
         // Mount namespaces work if AppArmor doesn't restrict, or if our profile is installed.

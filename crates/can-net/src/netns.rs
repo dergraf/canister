@@ -1,14 +1,22 @@
 //! Network namespace creation and loopback setup.
 //!
 //! When the sandbox needs network isolation, the child process calls
-//! `unshare(CLONE_NEWNET)` to get an empty network namespace. We then
-//! bring up the loopback interface so `127.0.0.1` works (needed for
-//! the DNS proxy).
+//! `unshare(CLONE_NEWNET)` to get an empty network namespace. The parent
+//! then passes the child's PID to pasta with `--userns /proc/<pid>/ns/user`
+//! and `--netns /proc/<pid>/ns/net`. We also bring up the loopback
+//! interface so `127.0.0.1` works (needed for the DNS proxy).
 //!
-//! Note: CLONE_NEWNET is handled separately from CLONE_NEWUSER+CLONE_NEWNS
-//! because:
-//! 1. It can be added to the same `unshare()` call safely
-//! 2. It only takes effect if network isolation is requested by policy
+//! Using `--userns` + `--netns` with `/proc/<pid>/ns/*` paths avoids the
+//! need for bind-mounting the network namespace. The key insight is that
+//! pasta needs to join the child's user namespace first (via `--userns`)
+//! before it can join the network namespace. Without `--userns`, pasta
+//! detects the `/proc` path and tries to infer the user namespace, which
+//! fails with "No child processes" for processes in a different user
+//! namespace.
+//!
+//! The `/proc/<pid>/ns/*` files are world-readable symlinks, so pasta
+//! (spawned from the parent process) can open them directly. Yama
+//! ptrace_scope only restricts `ptrace()`, not `open()`.
 
 use std::io::Write;
 
@@ -19,7 +27,6 @@ use crate::NetError;
 /// The clone flag for network namespace isolation.
 pub const NET_NS_FLAG: CloneFlags = CloneFlags::CLONE_NEWNET;
 
-/// Bring up the loopback interface inside the current (new) network namespace.
 ///
 /// After `unshare(CLONE_NEWNET)`, the namespace has only a `lo` interface
 /// that is DOWN. We need it UP for the DNS proxy to bind to 127.0.0.1.
@@ -88,8 +95,9 @@ fn bring_up_loopback_ioctl() -> Result<(), NetError> {
 
 /// Write the sandbox's resolv.conf to point at our DNS server.
 ///
-/// When using slirp4netns, the sandbox gets its own /etc/resolv.conf
-/// pointing to the DNS proxy address (typically 10.0.2.3).
+/// When using pasta, the sandbox gets its own /etc/resolv.conf
+/// pointing to the DNS proxy address (the `PASTA_DNS_ADDR` link-local
+/// address that pasta intercepts via `--dns`).
 ///
 /// After pivot_root, /etc/resolv.conf is a read-only bind mount from
 /// the host. We unmount it first (safe — we're in our own mount
