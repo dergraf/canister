@@ -1,0 +1,97 @@
+# Canister recipe for Neovim with LSP support.
+#
+# Mounts the user's full Neovim configuration (config, data, state, cache)
+# so plugin managers (lazy.nvim), LSP servers (via Mason), tree-sitter
+# parsers, and other tooling work out of the box.
+#
+# Usage:
+#   can run --recipe recipes/neovim.toml -- nvim
+#   can run --recipe recipes/neovim.toml -- nvim src/main.rs
+
+[recipe]
+name = "neovim"
+description = "Neovim editor with LSP, tree-sitter, and plugin support"
+version = "1"
+
+[filesystem]
+allow = [
+    # Neovim XDG directories
+    "$HOME/.config/nvim",
+    "$HOME/.local/share/nvim",
+    "$HOME/.local/state/nvim",
+    "$HOME/.cache/nvim",
+
+    # System libs (for LSP servers, tree-sitter compilers, etc.)
+    "/usr/lib",
+    "/usr/bin",
+    "/usr/local/lib",
+    "/usr/local/bin",
+    "/lib",
+    "/tmp",
+]
+deny = ["/etc/shadow", "/root"]
+
+[network]
+# LSP servers, Mason, and plugin managers may need network access
+# for installation and updates. Lock down to known hosts.
+allow_domains = [
+    # Mason registry + installers
+    "github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "api.github.com",
+
+    # Mason packages (npm-based LSPs)
+    "registry.npmjs.org",
+
+    # Mason packages (PyPI-based LSPs)
+    "pypi.org",
+    "files.pythonhosted.org",
+
+    # Luarocks (some plugins)
+    "luarocks.org",
+
+    # Lazy.nvim plugin manager
+    "github.com",
+]
+deny_all = true
+
+[process]
+max_pids = 256
+allow_execve = []
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "TERMINFO",
+    "USER",
+    "SHELL",
+    "EDITOR",
+    "VISUAL",
+
+    # XDG directories (so nvim finds its config)
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+
+    # Nix
+    "NIX_PATH",
+    "NIX_PROFILES",
+
+    # LSP / language tooling
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "NODE_PATH",
+    "npm_config_prefix",
+]
+
+[syscalls]
+# Neovim + LSP servers need ptrace (for debugging) and
+# memfd_create (used by various runtimes)
+allow_extra = ["ptrace", "memfd_create"]

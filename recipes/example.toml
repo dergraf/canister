@@ -28,8 +28,10 @@ deny_all = true
 [process]
 # Max child PIDs.
 max_pids = 64
-# Executables the sandbox may exec.
-allow_execve = ["/usr/bin/python3"]
+# Restrict which executables the sandbox may run (optional, opt-in).
+# By default, all executables are allowed — the real security boundaries
+# are network, filesystem, and seccomp. Uncomment to lock down:
+# allow_execve = ["/usr/bin/python3"]
 # Environment variables passed through from host.
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 

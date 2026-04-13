@@ -33,11 +33,6 @@ deny_all = true
 
 [process]
 max_pids = 32
-allow_execve = [
-    "/usr/bin/python3",
-    "/usr/local/bin/pip",
-    "/usr/local/bin/pip3",
-]
 env_passthrough = [
     "PATH",
     "HOME",

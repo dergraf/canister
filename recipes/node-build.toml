@@ -34,12 +34,6 @@ deny_all = true
 
 [process]
 max_pids = 128
-allow_execve = [
-    "/usr/bin/node",
-    "/usr/local/bin/node",
-    "/usr/local/bin/npm",
-    "/usr/local/bin/npx",
-]
 env_passthrough = [
     "PATH",
     "HOME",

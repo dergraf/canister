@@ -50,13 +50,6 @@ deny_all = true
 # scheduler count equals the CPU core count. 256 is generous for most
 # mix tasks and development servers.
 max_pids = 256
-# Allow the BEAM VM and common Elixir/Erlang entry points.
-allow_execve = [
-    "/usr/local/bin/elixir",
-    "/usr/local/bin/mix",
-    "/usr/local/bin/iex",
-    "/usr/local/lib/erlang/erts-15.0/bin/beam.smp",
-]
 # Environment variables the BEAM commonly needs.
 env_passthrough = [
     "PATH",
