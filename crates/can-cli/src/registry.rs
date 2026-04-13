@@ -142,9 +142,9 @@ fn clone_and_install(
             continue;
         }
 
-        // Skip default.toml and base.toml — embedded in the binary.
-        if name == "default.toml" || name == "base.toml" {
-            tracing::debug!(file = name, "skipping infrastructure recipe");
+        // Skip infrastructure files — embedded in the binary or not recipes.
+        if name == "default.toml" || name == "base.toml" || name == "checksums.toml" {
+            tracing::debug!(file = name, "skipping infrastructure file");
             continue;
         }
 
