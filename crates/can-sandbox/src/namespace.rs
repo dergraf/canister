@@ -197,9 +197,13 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             // to acquire CAP_SYS_ADMIN over the network namespace, then join
             // the network namespace (setns(CLONE_NEWNET)).
             let mut net_state = NetworkState::new();
+            let mut dns_addr = can_net::pasta::PASTA_DNS_ADDR.to_string();
             if net_mode == NetworkMode::Filtered {
                 match setup_parent_network(child.as_raw() as u32, &opts.config, &mut net_state) {
-                    Ok(()) => tracing::debug!("parent network setup complete"),
+                    Ok(addr) => {
+                        dns_addr = addr;
+                        tracing::debug!(dns = %dns_addr, "parent network setup complete");
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "parent network setup failed");
                         return Err(NamespaceError::Network(e));
@@ -207,9 +211,15 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 }
             }
 
-            // Signal child that network is ready.
+            // Signal child that network is ready, including the DNS address.
+            // Protocol: u16 length (big-endian) + DNS address string bytes.
+            let dns_bytes = dns_addr.as_bytes();
+            let len_bytes = (dns_bytes.len() as u16).to_be_bytes();
             let mut net_w = std::fs::File::from(network_done.1);
-            net_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
+            net_w
+                .write_all(&len_bytes)
+                .map_err(NamespaceError::UidMap)?;
+            net_w.write_all(dns_bytes).map_err(NamespaceError::UidMap)?;
             drop(net_w);
 
             // Forward SIGTERM/SIGINT to the child process so that killing
@@ -266,11 +276,13 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 /// invoked with `--userns /proc/<pid>/ns/user` and `--netns /proc/<pid>/ns/net`.
 /// DNS resolution is handled by the seccomp notifier's domain-aware
 /// filtering — no separate DNS proxy is needed.
+///
+/// Returns the DNS address configured inside the namespace by pasta.
 fn setup_parent_network(
     child_pid: u32,
     config: &SandboxConfig,
     state: &mut NetworkState,
-) -> Result<(), can_net::NetError> {
+) -> Result<String, can_net::NetError> {
     if !can_net::pasta::is_available() {
         tracing::warn!(
             "pasta not found. Filtered network mode requires pasta. \
@@ -285,10 +297,10 @@ fn setup_parent_network(
     };
 
     // Start pasta to provide networking in the sandbox.
-    let pasta_child = can_net::pasta::start(&pasta_config)?;
+    let (pasta_child, dns_addr) = can_net::pasta::start(&pasta_config)?;
     state.pasta_child = Some(pasta_child);
 
-    Ok(())
+    Ok(dns_addr)
 }
 
 /// Child process entry point.
@@ -378,11 +390,27 @@ fn child_entry(
     // The parent spawns pasta with --userns + --netns pointing at our
     // /proc/<pid>/ns/* paths. Pasta joins our user namespace first (to
     // acquire CAP_SYS_ADMIN), then our network namespace.
+    //
+    // The parent also sends the DNS address that pasta configured inside
+    // the namespace. Protocol: u16 length (big-endian) + DNS address bytes.
     let mut net_r = std::fs::File::from(network_read);
-    net_r.read_exact(&mut buf).map_err(NamespaceError::UidMap)?;
+    let mut len_buf = [0u8; 2];
+    net_r
+        .read_exact(&mut len_buf)
+        .map_err(NamespaceError::UidMap)?;
+    let dns_len = u16::from_be_bytes(len_buf) as usize;
+    let dns_addr = if dns_len > 0 && dns_len < 256 {
+        let mut dns_buf = vec![0u8; dns_len];
+        net_r
+            .read_exact(&mut dns_buf)
+            .map_err(NamespaceError::UidMap)?;
+        String::from_utf8(dns_buf).unwrap_or_else(|_| can_net::pasta::PASTA_DNS_ADDR.to_string())
+    } else {
+        can_net::pasta::PASTA_DNS_ADDR.to_string()
+    };
     drop(net_r);
 
-    tracing::debug!("network ready, continuing sandbox setup");
+    tracing::debug!(dns = %dns_addr, "network ready, continuing sandbox setup");
 
     // Now create the mount namespace. This is done as a second unshare() call
     // after pasta has started so that /proc/<child_pid>/ns/* paths remain
@@ -400,7 +428,7 @@ fn child_entry(
     // The supervisor runs as PID 1 inside the same user + PID namespace
     // as the sandboxed processes, so /proc/<pid>/mem access works.
     let supervisor_context = if notifier_enabled {
-        let policy = notifier::policy_from_config(config, resolved_ips);
+        let policy = notifier::policy_from_config(config, resolved_ips, &dns_addr);
         let dynamic_allowlist = notifier::DynamicAllowlist::new();
         tracing::info!(
             allowed_ips = policy.allowed_ips.len(),
@@ -443,7 +471,7 @@ fn child_entry(
     // The supervisor runs inside the same user + PID namespace as the
     // sandboxed processes, so /proc/<pid>/mem access works without
     // cross-namespace permission issues.
-    enter_pid_namespace_supervised(supervisor_context)?;
+    enter_pid_namespace_supervised(supervisor_context, &dns_addr)?;
 
     // --- From here on, we are the worker process in the new PID namespace. ---
     // When the notifier is enabled, we are PID 2+ (PID 1 is the supervisor).
@@ -515,14 +543,16 @@ fn child_entry(
         }
         NetworkMode::Filtered => {
             // In Filtered mode, pasta provides user-mode networking.
-            // The parent-side DNS proxy filters queries by domain allowlist.
-            // The seccomp USER_NOTIF supervisor filters connect() by IP.
+            // The seccomp USER_NOTIF supervisor filters connect() by IP
+            // and DNS queries by domain allowlist.
             // pasta configures resolv.conf via --dns, but if that doesn't
-            // take effect (e.g., after pivot_root), write it explicitly.
-            if let Err(e) = can_net::netns::write_resolv_conf(can_net::pasta::PASTA_DNS_ADDR) {
+            // take effect (e.g., after pivot_root), write it explicitly
+            // with the actual DNS server address detected by pasta.
+            if let Err(e) = can_net::netns::write_resolv_conf(&dns_addr) {
                 tracing::warn!(error = %e, "failed to write sandbox resolv.conf, DNS may not work");
             }
             tracing::info!(
+                dns = %dns_addr,
                 notifier = notifier_enabled,
                 "network: filtered mode via pasta + seccomp notifier"
             );
@@ -810,6 +840,7 @@ fn enter_pid_namespace_supervised(
         OwnedFd,
         OwnedFd,
     )>,
+    dns_addr: &str,
 ) -> Result<(), NamespaceError> {
     // SAFETY: fork is safe here because we're in the child process after the
     // initial fork, before spawning any threads.
@@ -868,6 +899,19 @@ fn enter_pid_namespace_supervised(
                             // The PIDs visible here match the seccomp notification's
                             // pid field (both use this PID namespace).
                             mount_supervisor_proc();
+
+                            // Write resolv.conf in the supervisor's mount namespace.
+                            //
+                            // The supervisor has its own mount namespace (unshared
+                            // in mount_supervisor_proc). The worker will later do
+                            // pivot_root and write its own resolv.conf. But the
+                            // supervisor's getaddrinfo() still reads from the
+                            // inherited host /etc/resolv.conf, which points to the
+                            // host's resolver (e.g., 127.0.0.53 for systemd-resolved).
+                            // Inside the pasta network namespace, that address has no
+                            // listener — the actual DNS server is at dns_addr.
+                            // Without this, resolve_and_add() fails with SERVFAIL.
+                            write_supervisor_resolv_conf(dns_addr);
 
                             // Receive the notifier fd from the worker.
                             match notifier::recv_fd(&recv_fd, worker.as_raw()) {
@@ -954,6 +998,76 @@ fn mount_supervisor_proc() {
     } else {
         tracing::debug!("mounted supervisor /proc (owned by user namespace)");
     }
+}
+
+/// Write `/etc/resolv.conf` in the supervisor's mount namespace.
+///
+/// The supervisor lives in a separate mount namespace (unshared in
+/// [`mount_supervisor_proc`]) and inherits the host's `/etc/resolv.conf`.
+/// Inside the pasta network namespace the host's nameserver (e.g.,
+/// systemd-resolved on `127.0.0.53`) is unreachable — the actual DNS
+/// server is at `dns_addr` (either the detected upstream or pasta's
+/// link-local forwarder). Without overwriting resolv.conf, the
+/// supervisor's `getaddrinfo()` calls (used by `resolve_and_add`)
+/// fail with "Temporary failure in name resolution".
+///
+/// We bind-mount a tmpfile over `/etc/resolv.conf` so it works even when
+/// the root filesystem is read-only inside the user namespace.
+fn write_supervisor_resolv_conf(dns_addr: &str) {
+    use std::io::Write;
+
+    let content = format!("nameserver {dns_addr}\n");
+
+    // Create a temporary file with the desired content.
+    let tmp_path = "/tmp/.canister-supervisor-resolv.conf";
+    match std::fs::File::create(tmp_path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(content.as_bytes()) {
+                tracing::warn!(error = %e, "supervisor: failed to write tmp resolv.conf");
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "supervisor: failed to create tmp resolv.conf");
+            return;
+        }
+    }
+
+    // Bind-mount the tmp file over /etc/resolv.conf.
+    // This works in user namespaces even when the root fs is read-only,
+    // because bind mounts are allowed within unshared mount namespaces.
+    let resolv_path = c"/etc/resolv.conf";
+    let tmp_cpath = c"/tmp/.canister-supervisor-resolv.conf";
+    let ret = unsafe {
+        libc::mount(
+            tmp_cpath.as_ptr(),
+            resolv_path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %err,
+            "supervisor: failed to bind-mount resolv.conf, \
+             trying direct write"
+        );
+        // Fallback: try writing directly (works if /etc is writable).
+        if let Err(e) = can_net::netns::write_resolv_conf(dns_addr) {
+            tracing::warn!(
+                error = %e,
+                "supervisor: failed to write resolv.conf, \
+                 dynamic DNS resolution may fail"
+            );
+        }
+    } else {
+        tracing::debug!(dns = dns_addr, "supervisor: resolv.conf bind-mounted");
+    }
+
+    // Clean up the tmp file (the bind mount keeps the content alive).
+    let _ = std::fs::remove_file(tmp_path);
 }
 
 /// Storage for the notifier send fd.

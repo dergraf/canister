@@ -69,8 +69,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use can_net::pasta::PASTA_DNS_ADDR;
-
 use crate::seccomp::SeccompError;
 
 // ---------------------------------------------------------------------------
@@ -254,6 +252,16 @@ pub struct NotifierPolicy {
     /// domain or IP allowlist), all outbound IP traffic is permitted.
     /// The notifier still enforces clone/socket/execve policy.
     pub restrict_outbound: bool,
+
+    /// The DNS server address configured inside the namespace by pasta.
+    ///
+    /// This may be the real upstream DNS (detected from systemd-resolved)
+    /// or the fallback `PASTA_DNS_ADDR` link-local address. The notifier
+    /// uses this to:
+    /// - Recognize connect()/sendto() to the DNS server and allow it
+    /// - Send supervisor-side DNS queries to this address for
+    ///   `resolve_and_add()` (dynamic allowlist population)
+    pub dns_server_addr: String,
 }
 
 impl Default for NotifierPolicy {
@@ -267,6 +275,7 @@ impl Default for NotifierPolicy {
             allow_af_unix: true,
             allow_af_inet: true,
             restrict_outbound: true,
+            dns_server_addr: can_net::pasta::PASTA_DNS_ADDR.to_string(),
         }
     }
 }
@@ -1127,11 +1136,13 @@ fn classify_connect_addr(
                 return Verdict::Deny(libc::EACCES as u32);
             }
 
-            // Allow the pasta DNS address (link-local) — needed for DNS resolution
-            // inside the sandbox. The sandbox's resolv.conf points here.
-            if ip_addr == PASTA_DNS_ADDR.parse::<IpAddr>().unwrap() {
-                tracing::debug!(pid, %ip_addr, port, "connect: pasta DNS address, allowing");
-                return Verdict::Allow;
+            // Allow the namespace's DNS server address — needed for DNS
+            // resolution inside the sandbox. The sandbox's resolv.conf points here.
+            if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+                if ip_addr == dns_ip {
+                    tracing::debug!(pid, %ip_addr, port, "connect: DNS server address, allowing");
+                    return Verdict::Allow;
+                }
             }
 
             // Block other link-local (169.254.0.0/16) — often used for cloud
@@ -1249,7 +1260,22 @@ fn evaluate_sendto(
     let addr_len = notif.data.args[5] as usize;
 
     // NULL dest_addr → connected socket, destination was checked at connect() time.
+    //
+    // However, some runtimes (notably Erlang/OTP's inet_res resolver) first
+    // connect() a UDP socket to the DNS server, then use sendto() with a
+    // NULL dest_addr to send the query. In this pattern, the DNS query
+    // content is never seen by the non-NULL path, so the dynamic allowlist
+    // is never populated with the resolved IPs.
+    //
+    // To handle this: when domain rules are configured, speculatively
+    // inspect the payload. If it looks like a valid DNS query for an
+    // allowed domain, resolve it synchronously so the dynamic allowlist
+    // is ready before the sandbox process gets the response and calls
+    // connect() to the resolved IP.
     if dest_addr_ptr == 0 {
+        if !policy.allowed_domains.is_empty() && policy.restrict_outbound {
+            try_inspect_connected_dns(notif, policy, dynamic_allowlist, notifier_fd);
+        }
         tracing::debug!(pid, "sendto: NULL dest_addr (connected socket), allowing");
         return Verdict::Allow;
     }
@@ -1493,10 +1519,12 @@ fn classify_outbound_ip(
         _ => {}
     }
 
-    // Allow pasta DNS address.
-    if ip_addr == PASTA_DNS_ADDR.parse::<IpAddr>().unwrap() {
-        tracing::debug!(pid, %ip_addr, port, "{syscall_name}: pasta DNS address, allowing");
-        return Verdict::Allow;
+    // Allow namespace DNS server address.
+    if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+        if ip_addr == dns_ip {
+            tracing::debug!(pid, %ip_addr, port, "{syscall_name}: DNS server address, allowing");
+            return Verdict::Allow;
+        }
     }
 
     // Block link-local (except pasta DNS already handled above).
@@ -1537,13 +1565,80 @@ fn classify_outbound_ip(
 // DNS query inspection and supervisor-side resolution
 // ---------------------------------------------------------------------------
 
+/// Speculatively inspect a sendto() on a connected socket for DNS queries.
+///
+/// Some runtimes (notably Erlang/OTP's inet_res resolver) `connect()` a UDP
+/// socket to the DNS server first, then use `sendto(fd, buf, len, 0, NULL, 0)`
+/// to send the query. Because `dest_addr` is NULL, the normal DNS inspection
+/// path in `classify_sendto_addr()` is never reached, and the dynamic allowlist
+/// is never populated.
+///
+/// This function reads the payload and attempts to parse it as a DNS query.
+/// If it contains a valid query for an allowed domain, resolve it synchronously
+/// to populate the dynamic allowlist before the sandboxed process gets the DNS
+/// response and calls connect() to the resolved IP.
+///
+/// This is best-effort: if the payload isn't DNS or doesn't parse, we do nothing
+/// (the sendto is allowed regardless since the connected socket's destination
+/// was already checked at connect() time).
+fn try_inspect_connected_dns(
+    notif: &SeccompNotif,
+    policy: &NotifierPolicy,
+    dynamic_allowlist: &DynamicAllowlist,
+    notifier_fd: RawFd,
+) {
+    let pid = notif.pid;
+    let buf_ptr = notif.data.args[1];
+    let buf_len = notif.data.args[2] as usize;
+
+    // Too small for a DNS header — not DNS.
+    if buf_len < DNS_HEADER_SIZE {
+        return;
+    }
+
+    let read_len = buf_len.min(DNS_MAX_INSPECT);
+    let payload = match read_proc_mem(pid, buf_ptr, read_len) {
+        Ok(b) => b,
+        Err(_) => return, // Can't read — skip quietly.
+    };
+
+    // TOCTOU re-check.
+    if !is_notif_id_valid(notifier_fd, notif.id) {
+        return;
+    }
+
+    // Try to parse as DNS.
+    let domain = match extract_dns_query_name(&payload) {
+        Some(d) => d,
+        None => return, // Not a DNS query — skip.
+    };
+
+    // Check domain against policy and resolve if allowed.
+    if is_domain_allowed_by_policy(&domain, &policy.allowed_domains) {
+        tracing::debug!(
+            pid,
+            domain,
+            "sendto(connected): DNS query detected, resolving"
+        );
+        resolve_and_add(&domain, dynamic_allowlist, &policy.dns_server_addr);
+    } else {
+        tracing::debug!(
+            pid,
+            domain,
+            "sendto(connected): DNS query for denied domain (query still allowed, connect will be denied)"
+        );
+    }
+}
+
 /// Evaluate a sendto() that targets port 53 (DNS).
 ///
 /// Reads the DNS query payload from the process's memory, extracts the
 /// queried domain name, and checks it against the domain allowlist.
 /// If allowed, the query is permitted and the supervisor resolves the
-/// domain in a background thread, adding the resulting IPs to the
-/// dynamic allowlist.
+/// domain synchronously, adding the resulting IPs to the dynamic allowlist
+/// before returning the verdict. This ensures the allowlist is populated
+/// before the sandboxed process receives the DNS response and calls
+/// connect() to the resolved IP.
 ///
 /// If no domain rules are configured (empty `allowed_domains`), DNS
 /// traffic is subject to normal IP-based filtering.
@@ -1625,24 +1720,23 @@ fn evaluate_dns_sendto(
         tracing::debug!(
             pid,
             domain,
-            "DNS sendto: domain allowed, triggering resolution"
+            "DNS sendto: domain allowed, resolving before release"
         );
 
-        // Spawn a background thread to resolve the domain and populate
-        // the dynamic allowlist. The supervisor process (PID 1 in the
-        // sandbox namespace) has its own network access through pasta,
-        // and its syscalls are NOT filtered by seccomp (only the worker's
-        // are). This avoids recursion.
-        let dyn_list = dynamic_allowlist.clone();
-        let domain_owned = domain.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("dns-resolve-{domain}"))
-            .spawn(move || {
-                resolve_and_add(&domain_owned, &dyn_list);
-            })
-        {
-            tracing::warn!(error = %e, domain, "failed to spawn resolver thread");
-        }
+        // Resolve the domain synchronously before returning the verdict.
+        //
+        // The sandboxed process is suspended in the seccomp notification —
+        // it cannot proceed until we return a verdict. By resolving here,
+        // the DynamicAllowlist is guaranteed to contain the IPs before the
+        // process receives the DNS response and calls connect().
+        //
+        // This eliminates the TOCTOU race where the process would get a
+        // DNS response, immediately connect(), and find the DynamicAllowlist
+        // not yet populated.
+        //
+        // The supervisor (PID 1) runs outside the seccomp filter, so its
+        // own DNS resolution (via getaddrinfo/sendto) is not intercepted.
+        resolve_and_add(&domain, dynamic_allowlist, &policy.dns_server_addr);
 
         Verdict::Allow
     } else {
@@ -1727,25 +1821,170 @@ fn is_domain_allowed_by_policy(domain: &str, allowed_domains: &[String]) -> bool
 
 /// Resolve a domain name and add the resulting IPs to the dynamic allowlist.
 ///
-/// Runs in a background thread spawned by the supervisor. Uses the system
-/// resolver (getaddrinfo), which in the supervisor's context goes through
-/// pasta's network — the same resolver the sandbox process uses.
-fn resolve_and_add(domain: &str, dynamic_allowlist: &DynamicAllowlist) {
-    use std::net::ToSocketAddrs;
+/// Sends DNS queries directly to the configured DNS server inside the
+/// namespace instead of using `getaddrinfo()`. This avoids glibc resolver
+/// caching issues — after fork, glibc may cache the host's nameserver
+/// address (e.g., `127.0.0.53`) which is unreachable inside the pasta
+/// namespace.
+///
+/// Sends both A (IPv4) and AAAA (IPv6) queries and adds all resolved IPs
+/// to the dynamic allowlist.
+fn resolve_and_add(domain: &str, dynamic_allowlist: &DynamicAllowlist, dns_server_addr: &str) {
+    let dns_server = format!("{dns_server_addr}:53");
 
-    match (domain, 0u16).to_socket_addrs() {
-        Ok(addrs) => {
-            let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-            if ips.is_empty() {
-                tracing::warn!(domain, "resolver returned no addresses");
-            } else {
-                tracing::debug!(domain, ips = ?ips, "resolved domain, adding to dynamic allowlist");
-                dynamic_allowlist.add_ips(ips);
-            }
+    let mut all_ips: Vec<IpAddr> = Vec::new();
+
+    // Query A records (IPv4).
+    if let Some(ips) = dns_query_direct(domain, 1, &dns_server) {
+        all_ips.extend(ips);
+    }
+
+    // Query AAAA records (IPv6).
+    if let Some(ips) = dns_query_direct(domain, 28, &dns_server) {
+        all_ips.extend(ips);
+    }
+
+    if all_ips.is_empty() {
+        tracing::warn!(domain, "resolver returned no addresses");
+    } else {
+        tracing::debug!(domain, ips = ?all_ips, "resolved domain, adding to dynamic allowlist");
+        dynamic_allowlist.add_ips(all_ips);
+    }
+}
+
+/// Send a direct DNS query and parse the response.
+///
+/// `qtype`: 1 = A (IPv4), 28 = AAAA (IPv6).
+/// Returns `None` on any error (timeout, parse failure, etc.).
+fn dns_query_direct(domain: &str, qtype: u16, dns_server: &str) -> Option<Vec<IpAddr>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+    use std::time::Duration;
+
+    // Build the DNS query packet.
+    let mut packet = Vec::with_capacity(64);
+
+    // Header: ID=0xCAFE, RD=1, QDCOUNT=1
+    packet.extend_from_slice(&[
+        0xCA, 0xFE, // ID
+        0x01, 0x00, // Flags: RD=1 (recursion desired)
+        0x00, 0x01, // QDCOUNT=1
+        0x00, 0x00, // ANCOUNT=0
+        0x00, 0x00, // NSCOUNT=0
+        0x00, 0x00, // ARCOUNT=0
+    ]);
+
+    // Encode domain as DNS labels.
+    for label in domain.split('.') {
+        if label.is_empty() {
+            continue;
         }
-        Err(e) => {
-            tracing::warn!(domain, error = %e, "failed to resolve domain for dynamic allowlist");
+        if label.len() > 63 {
+            return None; // Label too long.
         }
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0); // Root label terminator.
+
+    // QTYPE and QCLASS=IN(1).
+    packet.extend_from_slice(&qtype.to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+
+    // Send the query via UDP.
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    socket.send_to(&packet, dns_server).ok()?;
+
+    // Read the response.
+    let mut buf = [0u8; 512];
+    let len = socket.recv(&mut buf).ok()?;
+    if len < 12 {
+        return None; // Too short for DNS header.
+    }
+
+    // Verify response ID matches.
+    if buf[0] != 0xCA || buf[1] != 0xFE {
+        return None;
+    }
+
+    // Check QR bit (response) and RCODE.
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        return None; // Not a response.
+    }
+    let rcode = flags & 0x000F;
+    if rcode != 0 {
+        return None; // Error response (NXDOMAIN, SERVFAIL, etc.).
+    }
+
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    if ancount == 0 {
+        return Some(Vec::new()); // No answers (but no error).
+    }
+
+    // Skip the question section.
+    let mut pos = 12;
+    // Skip QNAME.
+    pos = skip_dns_name(&buf[..len], pos)?;
+    pos += 4; // Skip QTYPE + QCLASS.
+
+    // Parse answer records.
+    let mut ips = Vec::new();
+    for _ in 0..ancount {
+        if pos >= len {
+            break;
+        }
+        // Skip NAME (may be a pointer).
+        pos = skip_dns_name(&buf[..len], pos)?;
+        if pos + 10 > len {
+            break;
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        // Skip TYPE(2) + CLASS(2) + TTL(4).
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        pos += 10;
+
+        if pos + rdlength > len {
+            break;
+        }
+
+        if rtype == 1 && rdlength == 4 {
+            // A record: 4 bytes IPv4.
+            let ip = Ipv4Addr::new(buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
+            ips.push(IpAddr::V4(ip));
+        } else if rtype == 28 && rdlength == 16 {
+            // AAAA record: 16 bytes IPv6.
+            let mut addr_buf = [0u8; 16];
+            addr_buf.copy_from_slice(&buf[pos..pos + 16]);
+            ips.push(IpAddr::V6(Ipv6Addr::from(addr_buf)));
+        }
+        // Skip to next record.
+        pos += rdlength;
+    }
+
+    Some(ips)
+}
+
+/// Skip a DNS name (label sequence or pointer) and return the new position.
+fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+    // DNS names are either a sequence of labels ending with a zero-length
+    // label, or end with a pointer (2 bytes starting with 0xC0).
+    loop {
+        if pos >= buf.len() {
+            return None;
+        }
+        let b = buf[pos];
+        if b == 0 {
+            // End of labels.
+            return Some(pos + 1);
+        }
+        if b & 0xC0 == 0xC0 {
+            // Pointer: 2 bytes total, skip both.
+            return Some(pos + 2);
+        }
+        // Regular label: skip length byte + label.
+        let label_len = b as usize;
+        pos += 1 + label_len;
     }
 }
 
@@ -2022,9 +2261,13 @@ fn ip_in_cidr(ip: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
 
 /// Build a `NotifierPolicy` from the sandbox configuration and
 /// pre-resolved IP addresses.
+///
+/// `dns_addr` is the DNS server address configured inside the namespace
+/// by pasta (either the real upstream DNS or the fallback link-local).
 pub fn policy_from_config(
     config: &can_policy::SandboxConfig,
     resolved_ips: &[(String, Vec<IpAddr>)],
+    dns_addr: &str,
 ) -> NotifierPolicy {
     let mut allowed_ips: HashSet<IpAddr> = HashSet::new();
     let mut allowed_cidrs: Vec<(IpAddr, u8)> = Vec::new();
@@ -2047,11 +2290,14 @@ pub fn policy_from_config(
         }
     }
 
-    // pasta infrastructure addresses — always allowed.
-    // Allow the pasta DNS address (link-local) used by resolv.conf inside
-    // the namespace. Pasta configures this as the nameserver; the actual
-    // DNS filtering happens at the query level (domain allowlist check in
-    // evaluate_dns_sendto).
+    // DNS server address — always allowed.
+    // The namespace's resolv.conf points to this address. The actual DNS
+    // filtering happens at the query level (domain allowlist check in
+    // evaluate_dns_sendto). We also allow the PASTA_DNS_ADDR fallback
+    // in case the detection result is different from the link-local address.
+    if let Ok(ip) = dns_addr.parse::<IpAddr>() {
+        allowed_ips.insert(ip);
+    }
     allowed_ips.insert(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap());
 
     // Allow the host's default gateway — pasta mirrors the host's
@@ -2101,6 +2347,7 @@ pub fn policy_from_config(
         allow_af_unix: true,
         allow_af_inet: true,
         restrict_outbound,
+        dns_server_addr: dns_addr.to_string(),
     }
 }
 
@@ -2263,7 +2510,7 @@ mod tests {
     fn policy_from_config_adds_pasta_addrs() {
         use can_policy::SandboxConfig;
         let config = SandboxConfig::default_deny();
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         // The pasta DNS address (link-local) must always be allowed.
         assert!(policy.is_ip_allowed(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap()));
         // Note: default gateway depends on host, so we don't assert a specific IP.
@@ -2277,7 +2524,7 @@ mod tests {
             "example.com".to_string(),
             vec!["93.184.216.34".parse::<IpAddr>().unwrap()],
         )];
-        let policy = policy_from_config(&config, &resolved);
+        let policy = policy_from_config(&config, &resolved, can_net::pasta::PASTA_DNS_ADDR);
         assert!(policy.is_ip_allowed("93.184.216.34".parse().unwrap()));
     }
 
@@ -2285,7 +2532,7 @@ mod tests {
     fn policy_from_config_with_cidr() {
         let mut config = can_policy::SandboxConfig::default_deny();
         config.network.allow_ips = vec!["10.0.0.0/8".to_string()];
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert!(policy.is_ip_allowed("10.1.2.3".parse().unwrap()));
         assert!(!policy.is_ip_allowed("11.0.0.0".parse().unwrap()));
     }
@@ -2696,12 +2943,12 @@ mod tests {
     #[test]
     fn connect_pasta_dns_addr_allowed() {
         let policy = NotifierPolicy::default();
-        let dns_ip: Ipv4Addr = PASTA_DNS_ADDR.parse().unwrap();
+        let dns_ip: Ipv4Addr = can_net::pasta::PASTA_DNS_ADDR.parse().unwrap();
         let addr = make_sockaddr_in(dns_ip, 53);
         match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
             Verdict::Allow => {}
             Verdict::Deny(e) => {
-                panic!("expected Allow for pasta DNS {PASTA_DNS_ADDR}, got Deny({e})")
+                panic!("expected Allow for pasta DNS {dns_ip}, got Deny({e})")
             }
         }
     }
@@ -2821,7 +3068,7 @@ mod tests {
             PathBuf::from("/usr/bin/python3"),
             PathBuf::from("/nix/store/*"),
         ];
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         // Exact path should be in allowed_exec_paths.
         // "/usr/bin/python3" may or may not canonicalize depending on fs,
         // but "/nix/store/*" should produce a prefix, not an exact path.
@@ -3076,6 +3323,69 @@ mod tests {
         }
     }
 
+    // ---- resolve_and_add synchronous behavior test ----
+
+    #[test]
+    fn skip_dns_name_regular_labels() {
+        // "example.com" encoded: \x07example\x03com\x00
+        let buf = b"\x07example\x03com\x00";
+        assert_eq!(skip_dns_name(buf, 0), Some(13));
+    }
+
+    #[test]
+    fn skip_dns_name_pointer() {
+        // Pointer at offset 0: 0xC0 0x0C → points to offset 12.
+        let buf = [0xC0, 0x0C];
+        assert_eq!(skip_dns_name(&buf, 0), Some(2));
+    }
+
+    #[test]
+    fn skip_dns_name_label_then_pointer() {
+        // "www" label + pointer: \x03www\xC0\x0C
+        let buf = b"\x03www\xC0\x0C";
+        assert_eq!(skip_dns_name(buf, 0), Some(6));
+    }
+
+    #[test]
+    fn skip_dns_name_empty_returns_none_past_end() {
+        let buf: &[u8] = &[];
+        assert_eq!(skip_dns_name(buf, 0), None);
+    }
+
+    #[test]
+    fn dns_query_direct_to_real_resolver() {
+        // This test sends a real DNS query to the system resolver.
+        // Skip if we can't determine the system nameserver.
+        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
+            Ok(c) => c,
+            Err(_) => return, // Can't read resolv.conf, skip test.
+        };
+        let nameserver = resolv.lines().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("nameserver") {
+                line.split_whitespace().nth(1).map(String::from)
+            } else {
+                None
+            }
+        });
+        let Some(ns) = nameserver else { return };
+        let dns_server = format!("{ns}:53");
+
+        // Query A record for a well-known domain.
+        let result = dns_query_direct("example.com", 1, &dns_server);
+        // example.com should have at least one A record.
+        if let Some(ips) = result {
+            assert!(
+                !ips.is_empty(),
+                "example.com should resolve to at least one IPv4 address"
+            );
+            for ip in &ips {
+                assert!(ip.is_ipv4(), "A query should return IPv4 addresses");
+            }
+        }
+        // Note: don't fail if DNS is unreachable in the test environment.
+    }
+
     // ---- classify_outbound_ip tests ----
 
     #[test]
@@ -3129,7 +3439,7 @@ mod tests {
     fn outbound_ip_pasta_dns_allowed() {
         let policy = NotifierPolicy::default();
         let al = DynamicAllowlist::new();
-        let dns_ip: IpAddr = PASTA_DNS_ADDR.parse().unwrap();
+        let dns_ip: IpAddr = can_net::pasta::PASTA_DNS_ADDR.parse().unwrap();
         match classify_outbound_ip(1, dns_ip, 53, &policy, &al, "test") {
             Verdict::Allow => {}
             Verdict::Deny(e) => panic!("expected Allow for pasta DNS, got Deny({e})"),
@@ -3211,7 +3521,7 @@ mod tests {
     fn policy_from_config_includes_allowed_domains() {
         let mut config = can_policy::SandboxConfig::default_deny();
         config.network.allow_domains = vec!["example.com".to_string(), "github.com".to_string()];
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert_eq!(policy.allowed_domains.len(), 2);
         assert!(policy.allowed_domains.contains(&"example.com".to_string()));
         assert!(policy.allowed_domains.contains(&"github.com".to_string()));
@@ -3220,7 +3530,7 @@ mod tests {
     #[test]
     fn policy_from_config_empty_domains() {
         let config = can_policy::SandboxConfig::default_deny();
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert!(policy.allowed_domains.is_empty());
     }
 
@@ -3256,7 +3566,7 @@ mod tests {
     fn policy_from_config_restrict_outbound_with_domains() {
         let mut config = can_policy::SandboxConfig::default_deny();
         config.network.allow_domains = vec!["example.com".to_string()];
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert!(
             policy.restrict_outbound,
             "restrict_outbound should be true when domains are configured"
@@ -3267,7 +3577,7 @@ mod tests {
     fn policy_from_config_restrict_outbound_with_ips() {
         let mut config = can_policy::SandboxConfig::default_deny();
         config.network.allow_ips = vec!["1.2.3.4".to_string()];
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert!(
             policy.restrict_outbound,
             "restrict_outbound should be true when IPs are configured"
@@ -3278,7 +3588,7 @@ mod tests {
     fn policy_from_config_no_restrict_outbound_ports_only() {
         let config = can_policy::SandboxConfig::default_deny();
         // No domains, no IPs — port-forwarding-only config.
-        let policy = policy_from_config(&config, &[]);
+        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
         assert!(
             !policy.restrict_outbound,
             "restrict_outbound should be false when no domains or IPs are configured"

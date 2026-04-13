@@ -105,6 +105,55 @@ fn pasta_supports_option(option: &str) -> bool {
     }
 }
 
+/// Detect the host's real upstream DNS server address.
+///
+/// On systems running `systemd-resolved`, `/etc/resolv.conf` typically
+/// points to the stub resolver at `127.0.0.53`, which is unreachable
+/// from inside a network namespace (there's no systemd-resolved listening
+/// in the sandbox). pasta's auto-detection also fails for the same reason.
+///
+/// This function tries:
+/// 1. `/run/systemd/resolve/resolv.conf` — systemd-resolved's upstream file
+/// 2. `/etc/resolv.conf` — filtered to exclude loopback addresses
+///
+/// Returns the first non-loopback nameserver found, or `None`.
+pub fn detect_upstream_dns() -> Option<String> {
+    // Try systemd-resolved's upstream resolv.conf first.
+    if let Some(dns) = parse_resolv_conf_for_nameserver("/run/systemd/resolve/resolv.conf") {
+        tracing::debug!(dns, "detected upstream DNS from systemd-resolved");
+        return Some(dns);
+    }
+
+    // Fall back to /etc/resolv.conf, filtering out loopback.
+    if let Some(dns) = parse_resolv_conf_for_nameserver("/etc/resolv.conf") {
+        tracing::debug!(dns, "detected upstream DNS from /etc/resolv.conf");
+        return Some(dns);
+    }
+
+    tracing::warn!("could not detect upstream DNS server");
+    None
+}
+
+/// Parse a resolv.conf file and return the first non-loopback nameserver.
+fn parse_resolv_conf_for_nameserver(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(addr_str) = line.strip_prefix("nameserver") {
+            let addr_str = addr_str.trim();
+            // Skip loopback addresses (127.x.x.x, ::1).
+            if addr_str.starts_with("127.") || addr_str == "::1" {
+                continue;
+            }
+            // Validate it's a real IP address.
+            if addr_str.parse::<std::net::IpAddr>().is_ok() {
+                return Some(addr_str.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Options for starting pasta.
 pub struct PastaConfig {
     /// Port forwarding rules (empty = no port forwarding).
@@ -148,8 +197,10 @@ pub struct PastaConfig {
 ///   that owns the target network namespace.
 /// - `--runas <uid>` — stay as our uid instead of dropping to "nobody".
 ///
-/// Returns the pasta child process handle.
-pub fn start(config: &PastaConfig) -> Result<Child, NetError> {
+/// Returns the pasta child process handle and the DNS address configured
+/// inside the namespace (needed by the seccomp notifier and supervisor
+/// to recognize DNS traffic and resolve domains).
+pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
     let pasta_path =
         which_pasta().ok_or_else(|| NetError::Pasta("pasta not found in PATH".to_string()))?;
 
@@ -219,6 +270,34 @@ pub fn start(config: &PastaConfig) -> Result<Child, NetError> {
     cmd.arg("-T").arg("none");
     cmd.arg("-U").arg("none");
 
+    // DNS setup: configure the namespace to use a reachable DNS resolver.
+    //
+    // The host's /etc/resolv.conf may point to a stub resolver like
+    // systemd-resolved on 127.0.0.53, which is unreachable from inside
+    // the pasta network namespace. We detect the real upstream DNS servers
+    // and configure pasta accordingly.
+    //
+    // `--dns ADDR` tells pasta what nameserver address to write in the
+    // namespace's resolv.conf.
+    // `--dns-forward ADDR` tells pasta to intercept DNS queries sent to
+    // ADDR and forward them to the host's real upstream resolver.
+    let dns_addr = if let Some(dns) = detect_upstream_dns() {
+        tracing::info!(dns = %dns, "using detected upstream DNS for pasta");
+        // Tell pasta to write this DNS address in the namespace resolv.conf.
+        // The sandbox's resolv.conf will point to this real upstream DNS
+        // server, which is routable inside the pasta network namespace.
+        cmd.arg("--dns").arg(&dns);
+        dns
+    } else {
+        // Fallback: use the well-known pasta DNS forwarder address.
+        // Pasta will intercept queries sent to this address and forward
+        // them to whatever upstream it can auto-detect.
+        let fallback = PASTA_DNS_ADDR.to_string();
+        cmd.arg("--dns").arg(PASTA_DNS_ADDR);
+        cmd.arg("--dns-forward").arg(PASTA_DNS_ADDR);
+        fallback
+    };
+
     // Target: the child's network namespace via /proc/<pid>/ns/* paths.
     //
     // setns(CLONE_NEWNET) requires CAP_SYS_ADMIN in the user namespace that
@@ -275,7 +354,7 @@ pub fn start(config: &PastaConfig) -> Result<Child, NetError> {
         }
     }
 
-    Ok(child)
+    Ok((child, dns_addr))
 }
 
 /// Build a pasta port spec string from a list of port mappings.
