@@ -12,6 +12,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -712,3 +715,46 @@ jobs:
           name: qemu-ubuntu-log
           path: /tmp/qemu-ubuntu.log
           retention-days: 3
+
+  # -----------------------------------------------------------------------
+  # Publish latest release on every push to main
+  # -----------------------------------------------------------------------
+  latest-release:
+    name: Update latest release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [check, test, build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: canister-artifact
+
+      - name: Package release binary
+        run: |
+          mkdir -p release-staging
+          tar xzf canister-artifact.tar.gz -C release-staging
+          cp release-staging/can .
+          tar czf canister-x86_64-linux.tar.gz can
+          sha256sum canister-x86_64-linux.tar.gz > canister-x86_64-linux.tar.gz.sha256
+
+      - name: Create or update latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete existing latest release if it exists.
+          gh release delete latest --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+
+          # Create new latest release.
+          gh release create latest \
+            canister-x86_64-linux.tar.gz \
+            canister-x86_64-linux.tar.gz.sha256 \
+            --title "Latest (unstable)" \
+            --notes "Built from \`main\` at $(date -u +%Y-%m-%d) — commit ${GITHUB_SHA:0:7}.
+
+          This is an automatically updated pre-release from the latest \`main\` branch.
+          For stable releases, see tagged versions (\`v*\`)." \
+            --prerelease
