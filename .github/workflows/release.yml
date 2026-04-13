@@ -27,26 +27,30 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-${{ runner.os }}-
+          key: release-musl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-musl-${{ runner.os }}-
 
-      - name: Build
-        run: cargo build --release --package can-cli
+      - name: Build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl --package can-cli
+
+      - name: Verify static linking
+        run: |
+          file target/x86_64-unknown-linux-musl/release/can
+          ldd target/x86_64-unknown-linux-musl/release/can 2>&1 | grep -q "statically linked"
 
       - name: Package
         run: |
-          cd target/release
-          tar czf ../../canister-x86_64-unknown-linux-gnu.tar.gz can
-          cd ../..
-          sha256sum canister-x86_64-unknown-linux-gnu.tar.gz > canister-x86_64-unknown-linux-gnu.tar.gz.sha256
+          cp target/x86_64-unknown-linux-musl/release/can .
+          tar czf canister-x86_64-linux.tar.gz can
+          sha256sum canister-x86_64-linux.tar.gz > canister-x86_64-linux.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: canister-x86_64-unknown-linux-gnu
+          name: canister-x86_64-linux
           path: |
-            canister-x86_64-unknown-linux-gnu.tar.gz
-            canister-x86_64-unknown-linux-gnu.tar.gz.sha256
+            canister-x86_64-linux.tar.gz
+            canister-x86_64-linux.tar.gz.sha256
 
   release:
     name: Create Release

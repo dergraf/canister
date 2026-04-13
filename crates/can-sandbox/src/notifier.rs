@@ -492,7 +492,7 @@ pub fn send_fd(socket: &OwnedFd, fd_to_send: &OwnedFd) -> Result<(), NotifierErr
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space;
+    msg.msg_controllen = cmsg_space as _;
 
     // Fill in the cmsg header.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -539,7 +539,7 @@ pub fn recv_fd(socket: &OwnedFd) -> Result<OwnedFd, NotifierError> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space;
+    msg.msg_controllen = cmsg_space as _;
 
     let ret = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
     if ret < 0 {

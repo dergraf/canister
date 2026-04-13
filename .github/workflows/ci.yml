@@ -253,16 +253,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: build-${{ runner.os }}-
+          key: build-musl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-musl-${{ runner.os }}-
 
-      - name: Build release binary
-        run: cargo build --release --workspace
+      - name: Build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify static linking
+        run: |
+          file target/x86_64-unknown-linux-musl/release/can
+          ldd target/x86_64-unknown-linux-musl/release/can 2>&1 | grep -q "statically linked"
 
       - name: Package artifact
         run: |
           mkdir -p artifact
-          cp target/release/can artifact/
+          cp target/x86_64-unknown-linux-musl/release/can artifact/
           cp -r tests/integration artifact/
           cp -r recipes artifact/
           tar czf canister-artifact.tar.gz -C artifact .
