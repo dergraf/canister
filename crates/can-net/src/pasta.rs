@@ -15,10 +15,10 @@
 //! - Same default gateway as the host
 //! - DNS configured via `--config-net` (copies host resolv.conf setup)
 //!
-//! When the sandbox has whitelisted domains/IPs, we:
-//! 1. Start pasta with `pasta --userns /proc/<pid>/ns/user --netns /proc/<pid>/ns/net --runas <uid>`
-//! 2. Use `--dns` + `--dns-forward` to redirect DNS to our filtering proxy
-//! 3. Our DNS proxy filters queries and forwards allowed ones upstream
+//! DNS filtering is handled by the seccomp notifier in `can-sandbox`, which
+//! intercepts `sendto`/`sendmsg` syscalls to port 53 and checks the queried
+//! domain against the policy's allowed domains list. This avoids the need for
+//! a separate DNS proxy process.
 //!
 //! ## Port forwarding
 //!
@@ -37,13 +37,16 @@ use can_policy::config::{PortMapping, PortProtocol};
 
 use crate::NetError;
 
-/// DNS address used inside the namespace for our filtering proxy.
+/// DNS address configured by pasta inside the namespace.
 ///
-/// We configure pasta with `--dns <addr>` so that the namespace's
-/// resolv.conf points to this address. Combined with `--dns-forward`,
-/// DNS queries to this address are intercepted by pasta and forwarded
-/// to our host-side filtering proxy. We use a link-local address to
-/// avoid conflicting with the host's real DNS or gateway.
+/// When pasta runs with `--config-net`, it writes a `resolv.conf` inside the
+/// namespace pointing to this address. pasta then transparently forwards DNS
+/// queries sent to this address to the host's upstream resolver.
+///
+/// The seccomp notifier allows `sendto`/`sendmsg` to this address on port 53
+/// unconditionally (the domain-level check happens on the DNS query content,
+/// not the destination IP). This constant is used by both the notifier policy
+/// and the namespace setup to keep things consistent.
 pub const PASTA_DNS_ADDR: &str = "169.254.0.1";
 
 /// Check whether pasta is available on the system.
@@ -107,11 +110,6 @@ pub struct PastaConfig {
     /// Port forwarding rules (empty = no port forwarding).
     pub ports: Vec<PortMapping>,
 
-    /// DNS proxy port on the host (if domain filtering is active).
-    /// When set, pasta is configured with `--dns` and `--dns-forward`
-    /// to redirect namespace DNS queries to our filtering proxy.
-    pub dns_proxy_port: Option<u16>,
-
     /// PID of the child process whose network namespace to join.
     ///
     /// pasta is invoked with:
@@ -159,12 +157,7 @@ pub fn start(config: &PastaConfig) -> Result<Child, NetError> {
         .child_pid
         .ok_or_else(|| NetError::Pasta("child_pid must be set in PastaConfig".to_string()))?;
 
-    tracing::info!(
-        child_pid,
-        dns_proxy = ?config.dns_proxy_port,
-        ports = config.ports.len(),
-        "starting pasta"
-    );
+    tracing::info!(child_pid, ports = config.ports.len(), "starting pasta");
 
     let mut cmd = Command::new(pasta_path);
 
@@ -225,15 +218,6 @@ pub fn start(config: &PastaConfig) -> Result<Child, NetError> {
     // Disable reverse (namespace → host) auto-forwarding.
     cmd.arg("-T").arg("none");
     cmd.arg("-U").arg("none");
-
-    // Configure DNS interception for our filtering proxy.
-    if let Some(dns_port) = config.dns_proxy_port {
-        // Tell the namespace to use our known DNS address in resolv.conf.
-        cmd.arg("--dns").arg(PASTA_DNS_ADDR);
-        // Forward DNS queries to that address → our host-side proxy.
-        cmd.arg("--dns-forward")
-            .arg(format!("127.0.0.1:{dns_port}"));
-    }
 
     // Target: the child's network namespace via /proc/<pid>/ns/* paths.
     //

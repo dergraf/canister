@@ -2,10 +2,15 @@ use std::ffi::CString;
 use std::io::{Read as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork, pipe};
+
+/// PID of the child process, used by signal handlers to forward signals.
+/// Set to -1 when no child exists.
+static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
 
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
@@ -207,11 +212,15 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             net_w.write_all(&[0u8]).map_err(NamespaceError::UidMap)?;
             drop(net_w);
 
-            // The seccomp supervisor now runs inside the child's user namespace
-            // (in the intermediate process after enter_pid_namespace). The parent
-            // just waits for the child to exit and cleans up network state.
+            // Forward SIGTERM/SIGINT to the child process so that killing
+            // `can run` propagates into the sandbox. The signal handler uses
+            // the CHILD_PID atomic to find the target.
+            CHILD_PID.store(child.as_raw(), Ordering::Release);
+            install_signal_forwarder();
+
             let result = wait_for_child(child);
 
+            CHILD_PID.store(-1, Ordering::Release);
             net_state.shutdown();
 
             result
@@ -220,6 +229,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             drop(child_ready.0);
             drop(maps_done.1);
             drop(network_done.1);
+
+            // If the parent (original `can run`) dies, kill this child.
+            // This prevents orphaned namespace processes when the user
+            // kills the `can run` process or it crashes.
+            set_pdeathsig(libc::SIGKILL);
 
             let result = child_entry(
                 &cmd,
@@ -246,12 +260,12 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     }
 }
 
-/// Set up parent-side network infrastructure (pasta + DNS proxy).
+/// Set up parent-side network infrastructure (pasta).
 ///
 /// `child_pid` is the PID of the sandboxed child process. pasta is
 /// invoked with `--userns /proc/<pid>/ns/user` and `--netns /proc/<pid>/ns/net`.
-/// DNS resolution is done before fork (in `spawn_sandboxed`).
-/// This function only starts the DNS proxy and pasta.
+/// DNS resolution is handled by the seccomp notifier's domain-aware
+/// filtering — no separate DNS proxy is needed.
 fn setup_parent_network(
     child_pid: u32,
     config: &SandboxConfig,
@@ -265,30 +279,10 @@ fn setup_parent_network(
         return Err(can_net::NetError::Pasta("pasta not found".to_string()));
     }
 
-    let mut pasta_config = can_net::pasta::PastaConfig {
+    let pasta_config = can_net::pasta::PastaConfig {
         ports: config.network.ports.clone(),
-        dns_proxy_port: None,
         child_pid: Some(child_pid),
     };
-
-    // Start the DNS proxy if there are domain-based rules.
-    // The DNS proxy filters queries: whitelisted domains are forwarded,
-    // others get REFUSED.
-    let has_domain_rules = !config.network.allow_domains.is_empty();
-    if has_domain_rules {
-        let dns_config = can_net::dns::DnsProxyConfig::default_with_policy(config.network.clone());
-        match can_net::dns::start_dns_proxy(dns_config) {
-            Ok(handle) => {
-                let dns_port = handle.local_port();
-                tracing::info!(port = dns_port, "DNS proxy started");
-                pasta_config.dns_proxy_port = Some(dns_port);
-                state.dns_shutdown = Some(handle);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "DNS proxy failed to start, starting pasta without DNS filtering");
-            }
-        }
-    }
 
     // Start pasta to provide networking in the sandbox.
     let pasta_child = can_net::pasta::start(&pasta_config)?;
@@ -407,9 +401,11 @@ fn child_entry(
     // as the sandboxed processes, so /proc/<pid>/mem access works.
     let supervisor_context = if notifier_enabled {
         let policy = notifier::policy_from_config(config, resolved_ips);
+        let dynamic_allowlist = notifier::DynamicAllowlist::new();
         tracing::info!(
             allowed_ips = policy.allowed_ips.len(),
             allowed_cidrs = policy.allowed_cidrs.len(),
+            allowed_domains = policy.allowed_domains.len(),
             allowed_exec_paths = policy.allowed_exec_paths.len(),
             allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
             "notifier policy built for supervisor"
@@ -417,7 +413,7 @@ fn child_entry(
         match notifier::create_fd_channel() {
             Ok((recv_fd, send_fd)) => {
                 tracing::debug!("created notifier fd channel (worker → PID-1 supervisor)");
-                Some((policy, recv_fd, send_fd))
+                Some((policy, dynamic_allowlist, recv_fd, send_fd))
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to create notifier fd channel");
@@ -575,9 +571,13 @@ fn child_entry(
                     tracing::error!(error = %e, "failed to send notifier fd to supervisor");
                     return Err(NamespaceError::Notifier(e));
                 }
-                // Close fds — the PID-1 supervisor now has the notifier fd.
-                drop(notifier_fd);
+                // Close the pipe write end — we're done sending.
                 drop(send_fd);
+                // Keep notifier_fd alive until exec(). The supervisor uses
+                // pidfd_getfd() to duplicate it from our fd table, so it
+                // must remain open. The kernel sets O_CLOEXEC on seccomp
+                // listener fds, so exec() will close it automatically.
+                std::mem::forget(notifier_fd);
             }
             Err(e) => {
                 tracing::error!(error = %e, "notifier filter install failed");
@@ -687,13 +687,60 @@ fn wait_for_child(child: Pid) -> Result<i32, NamespaceError> {
     tracing::debug!(pid = child.as_raw(), "waiting for sandboxed process");
 
     loop {
-        match waitpid(child, None).map_err(NamespaceError::Wait)? {
-            WaitStatus::Exited(_, code) => return Ok(code),
-            WaitStatus::Signaled(_, signal, _) => {
+        match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
                 tracing::warn!(%signal, "sandboxed process killed by signal");
                 return Ok(128 + signal as i32);
             }
-            _ => continue,
+            Err(nix::Error::EINTR) => continue,
+            Err(e) => return Err(NamespaceError::Wait(e)),
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Set `PR_SET_PDEATHSIG` so this process receives `sig` when its parent dies.
+///
+/// This is critical for process cleanup: without it, forked sandbox
+/// processes become orphans when the user kills the `can run` process.
+fn set_pdeathsig(sig: libc::c_int) {
+    // SAFETY: prctl with PR_SET_PDEATHSIG is safe and has no pointer args.
+    let ret = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, sig) };
+    if ret != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "failed to set PR_SET_PDEATHSIG"
+        );
+    }
+}
+
+/// Install a signal handler that forwards SIGTERM and SIGINT to the child
+/// process stored in [`CHILD_PID`].
+///
+/// The handler is async-signal-safe: it only uses `kill()` and atomic loads.
+fn install_signal_forwarder() {
+    // SAFETY: The signal handler only calls async-signal-safe functions
+    // (kill) and reads an atomic variable.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// Async-signal-safe signal handler that forwards the signal to the child.
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pid = CHILD_PID.load(Ordering::Acquire);
+    if pid > 0 {
+        // SAFETY: kill is async-signal-safe.
+        unsafe {
+            libc::kill(pid, sig);
         }
     }
 }
@@ -707,7 +754,7 @@ fn wait_for_child(child: Pid) -> Result<i32, NamespaceError> {
 ///
 /// # Supervisor architecture
 ///
-/// When `supervisor_context` is `Some((policy, recv_fd, send_fd))`:
+/// When `supervisor_context` is `Some((policy, dynamic_allowlist, recv_fd, send_fd))`:
 /// - The intermediate process closes `send_fd`, receives the notifier fd
 ///   from the inner child via `recv_fd`, starts the supervisor thread,
 ///   waits for the inner child, then shuts down the supervisor.
@@ -757,27 +804,44 @@ fn wait_for_child(child: Pid) -> Result<i32, NamespaceError> {
 /// - When it exits, the kernel kills all remaining processes in the
 ///   PID namespace
 fn enter_pid_namespace_supervised(
-    supervisor_context: Option<(notifier::NotifierPolicy, OwnedFd, OwnedFd)>,
+    supervisor_context: Option<(
+        notifier::NotifierPolicy,
+        notifier::DynamicAllowlist,
+        OwnedFd,
+        OwnedFd,
+    )>,
 ) -> Result<(), NamespaceError> {
     // SAFETY: fork is safe here because we're in the child process after the
     // initial fork, before spawning any threads.
     match unsafe { nix::unistd::fork() }.map_err(process::ProcessError::PidFork)? {
         nix::unistd::ForkResult::Parent { child } => {
-            // Intermediate process (old PID namespace): just wait for child.
+            // Intermediate process (old PID namespace): wait for PID 1 child.
             // Drop all supervisor-related fds.
             drop(supervisor_context);
 
-            let status =
-                nix::sys::wait::waitpid(child, None).unwrap_or(WaitStatus::Exited(child, 1));
-            let code = match status {
-                WaitStatus::Exited(_, code) => code,
-                WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
-                _ => 1,
+            // Forward signals to PID 1 child so that killing the parent
+            // chain propagates cleanly into the PID namespace.
+            CHILD_PID.store(child.as_raw(), Ordering::Release);
+            install_signal_forwarder();
+
+            // Wait for PID 1 in a loop that handles EINTR (from signal
+            // forwarding) and retries.
+            let code = loop {
+                match nix::sys::wait::waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => break code,
+                    Ok(WaitStatus::Signaled(_, signal, _)) => break 128 + signal as i32,
+                    Err(nix::Error::EINTR) => continue,
+                    Err(_) | Ok(_) => break 1,
+                }
             };
             std::process::exit(code);
         }
         nix::unistd::ForkResult::Child => {
             // We are now PID 1 in the new PID namespace.
+            // If the intermediate parent dies, kill us — this tears down
+            // the entire PID namespace (kernel kills all processes when
+            // PID 1 exits).
+            set_pdeathsig(libc::SIGKILL);
             nix::unistd::setsid().map_err(process::ProcessError::PidFork)?;
 
             match supervisor_context {
@@ -789,7 +853,7 @@ fn enter_pid_namespace_supervised(
                     );
                     Ok(())
                 }
-                Some((policy, recv_fd, send_fd)) => {
+                Some((policy, dynamic_allowlist, recv_fd, send_fd)) => {
                     // PID 1 becomes the supervisor. Fork a worker child.
                     //
                     // SAFETY: still single-threaded in the forked child.
@@ -806,7 +870,7 @@ fn enter_pid_namespace_supervised(
                             mount_supervisor_proc();
 
                             // Receive the notifier fd from the worker.
-                            match notifier::recv_fd(&recv_fd) {
+                            match notifier::recv_fd(&recv_fd, worker.as_raw()) {
                                 Ok(notifier_fd) => {
                                     drop(recv_fd);
                                     tracing::info!(
@@ -816,6 +880,7 @@ fn enter_pid_namespace_supervised(
                                     let code = notifier::run_supervisor_with_child(
                                         notifier_fd,
                                         &policy,
+                                        &dynamic_allowlist,
                                         worker,
                                     );
                                     std::process::exit(code);

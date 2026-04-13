@@ -4,17 +4,17 @@
 // - Network namespace creation (CLONE_NEWNET)
 // - Loopback interface setup
 // - pasta integration for selective connectivity
-// - DNS proxy with domain-based filtering
 // - Port forwarding via pasta
+//
+// DNS filtering is handled by the seccomp notifier in can-sandbox,
+// not by a separate DNS proxy. See notifier.rs for details.
 
-pub mod dns;
 pub mod netns;
 pub mod pasta;
 
 use std::net::IpAddr;
 
 use can_policy::config::NetworkConfig;
-use can_policy::whitelist;
 
 /// Errors from network isolation operations.
 #[derive(Debug, thiserror::Error)]
@@ -28,9 +28,6 @@ pub enum NetError {
     #[error("pasta failed: {0}")]
     Pasta(String),
 
-    #[error("DNS proxy error: {0}")]
-    Dns(String),
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -41,8 +38,8 @@ pub enum NetworkMode {
     /// No network at all — empty network namespace with only loopback.
     None,
 
-    /// Filtered network — connectivity via pasta, DNS queries
-    /// filtered through our proxy.
+    /// Filtered network — connectivity via pasta, outbound connections
+    /// and DNS queries filtered by the seccomp notifier.
     Filtered,
 
     /// Full network — no CLONE_NEWNET (when deny_all is false and
@@ -73,14 +70,11 @@ impl NetworkMode {
 
 /// State for the parent side of network isolation.
 ///
-/// Holds handles to child processes (pasta) and the DNS proxy
-/// thread so they can be cleaned up when the sandbox exits.
+/// Holds the pasta child process handle so it can be cleaned up when
+/// the sandbox exits.
 pub struct NetworkState {
     /// The pasta child process, if running.
     pub pasta_child: Option<std::process::Child>,
-
-    /// Handle to the DNS proxy thread.
-    pub dns_shutdown: Option<dns::DnsProxyHandle>,
 }
 
 impl Default for NetworkState {
@@ -92,18 +86,11 @@ impl Default for NetworkState {
 impl NetworkState {
     /// Create a new empty network state.
     pub fn new() -> Self {
-        Self {
-            pasta_child: None,
-            dns_shutdown: None,
-        }
+        Self { pasta_child: None }
     }
 
-    /// Shut down all network infrastructure (pasta, DNS proxy).
+    /// Shut down all network infrastructure (pasta).
     pub fn shutdown(&mut self) {
-        if let Some(handle) = self.dns_shutdown.take() {
-            handle.shutdown();
-        }
-
         if let Some(mut child) = self.pasta_child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -115,19 +102,6 @@ impl Drop for NetworkState {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-/// Check whether a resolved IP address is allowed by the network policy.
-///
-/// This is used by the DNS proxy to validate that resolved IPs are in
-/// the whitelist (if IP-based filtering is enabled).
-pub fn is_ip_allowed(ip: IpAddr, config: &NetworkConfig) -> bool {
-    whitelist::check_ip(&ip.to_string(), config) == whitelist::AccessDecision::Allow
-}
-
-/// Check whether a domain is allowed by the network policy.
-pub fn is_domain_allowed(domain: &str, config: &NetworkConfig) -> bool {
-    whitelist::check_domain(domain, config) == whitelist::AccessDecision::Allow
 }
 
 /// Pre-resolve whitelisted domains to their IP addresses.
