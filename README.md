@@ -34,12 +34,14 @@ discarded.
 
 - **Unprivileged** -- uses user namespaces, no root or suid binary needed
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
+- **Project manifests** -- define named sandboxes in `canister.toml` and run them with `can up`; recipes declared per-sandbox, overrides for filesystem/network/syscalls, dry-run preview
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
-- **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~170 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
+- **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~187 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
 - **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw/netlink), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
+- **Credential protection** -- recipes explicitly deny sensitive paths (`$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`, etc.); cargo credentials excluded from the cargo recipe via deny rules
 - **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
 - **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS instead of EPERM
@@ -103,7 +105,48 @@ The binary is at `target/release/can`.
 
 ## Quick Start
 
-### Run a command in the sandbox
+### Project manifest (`canister.toml`)
+
+The recommended way to use Canister is with a project manifest. Create a
+`canister.toml` in your project root:
+
+```toml
+[sandbox.dev]
+description = "Development shell"
+recipes = ["neovim", "elixir", "nix"]
+command = "nvim"
+
+[sandbox.dev.filesystem]
+allow_write = ["$HOME/.local/share/nvim"]
+
+[sandbox.test]
+description = "Test runner"
+recipes = ["elixir", "nix"]
+command = "mix test"
+
+[sandbox.ci]
+description = "CI — strict mode"
+recipes = ["elixir", "nix", "generic-strict"]
+command = "mix test --cover"
+strict = true
+
+[sandbox.ci.resources]
+memory_mb = 2048
+```
+
+Then run sandboxes by name:
+
+```bash
+can up dev          # run the dev sandbox
+can up test         # run tests
+can up ci           # strict CI mode
+can up              # runs the first sandbox alphabetically (ci)
+can up dev --dry-run  # preview the resolved policy
+```
+
+### Ad-hoc sandboxing (`can run`)
+
+For one-off commands without a manifest:
 
 ```bash
 # Minimal -- default deny-all policy, default seccomp baseline
@@ -163,7 +206,7 @@ Discovered recipes:
                                                       recipes/nix.toml
   ...
 
-Default baseline: ~170 allowed, ~16 denied syscalls
+Default baseline: ~187 allowed, ~18 denied syscalls
   Customize per-recipe with [syscalls] allow_extra / deny_extra
 ```
 
@@ -477,9 +520,9 @@ transitions and permission grants.
 ```
 canister/
 ├── crates/
-│   ├── can-cli/        # CLI binary (clap): commands, recipe resolution, can init/update
+│   ├── can-cli/        # CLI binary (clap): commands, can up, recipe resolution, can init/update
 │   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp, process control
-│   ├── can-policy/     # Config parsing, recipe merge, whitelist logic, env var expansion
+│   ├── can-policy/     # Config parsing, recipe merge, manifest (canister.toml), env var expansion
 │   ├── can-net/        # Network isolation: netns, pasta, DNS proxy
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
@@ -492,17 +535,19 @@ canister/
 │   ├── flatpak.toml    # Flatpak applications (auto-detected)
 │   ├── gnu-store.toml  # GNU Guix (auto-detected)
 │   ├── elixir.toml     # Elixir/Erlang development recipe
+│   ├── opencode.toml   # OpenCode AI coding agent recipe
 │   ├── example.toml    # Example recipe (all options documented)
 │   ├── python-pip.toml # Python pip install recipe
 │   ├── node-build.toml # Node.js build recipe
 │   └── generic-strict.toml # Strict deny-all recipe for CI
 ├── docs/
 │   ├── ARCHITECTURE.md # Design and execution flow
-│   ├── CONFIGURATION.md# Complete config reference
+│   ├── CONFIGURATION.md# Complete config reference (incl. canister.toml)
 │   ├── SECCOMP.md      # Seccomp baseline and filtering docs
 │   └── adr/            # Architecture Decision Records
 │       ├── 0001-recipes-over-profiles.md
-│       └── 0002-recipe-composition-and-lifecycle.md
+│       ├── 0002-recipe-composition-and-lifecycle.md
+│       └── 0005-project-manifest-and-recipe-sources.md
 ├── tests/
 │   └── integration/    # Bash integration tests (15 test files)
 └── .github/

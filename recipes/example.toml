@@ -1,11 +1,14 @@
 # Example Canister recipe — a complete sandbox policy for Python scripts.
 #
-# Usage: can run --recipe recipes/example.toml -- python3 script.py
+# System paths (/usr/lib, /usr/bin, /lib, /tmp, etc.) are provided by
+# base.toml — recipes only need to add application-specific paths.
+#
+# Usage: can run -r example -- python3 script.py
 
 [recipe]
 name = "example"
 description = "Example recipe showing all available options"
-version = "1"
+version = "2"
 
 # Strict mode: abort if any isolation layer cannot be set up.
 # Recommended for CI. Uncomment to enable.
@@ -13,7 +16,8 @@ version = "1"
 
 [filesystem]
 # Paths the sandboxed process can read (mounted read-only).
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp/workspace"]
+# System paths are already provided by base.toml — only add app-specific paths here.
+allow = []
 # Paths the sandboxed process can write to (changes persist on host).
 # The working directory ($PWD) is always writable. Uncomment for additional paths:
 # allow_write = ["/var/data/myapp"]

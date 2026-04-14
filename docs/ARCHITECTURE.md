@@ -54,8 +54,10 @@ canister/
 ├── can-cli        CLI binary. Argument parsing (clap), recipe
 │                  resolution (name-based lookup, auto-detection
 │                  via match_prefix), composition chain assembly,
-│                  `can recipe show` (emit resolved policy as TOML),
-│                  can init / can update lifecycle commands.
+│                  `can up` (manifest-driven sandboxes from
+│                  canister.toml), `can recipe show` (emit resolved
+│                  policy as TOML), can init / can update lifecycle
+│                  commands.
 │
 ├── can-sandbox    Core runtime. Orchestrates the fork/unshare/exec
 │                  sequence. Contains the namespace, overlay, and
@@ -65,7 +67,10 @@ canister/
 │                  merge logic, environment variable expansion
 │                  ($HOME, $USER, etc.), whitelist enforcement
 │                  (path, domain, IP/CIDR), seccomp profile
-│                  definitions. No Linux-specific code.
+│                  definitions. Also contains the project manifest
+│                  module (manifest.rs) for canister.toml parsing,
+│                  validation, and upward directory discovery.
+│                  No Linux-specific code.
 │
 ├── can-net        Network isolation. Network namespace setup,
 │                  loopback interface, pasta integration,
@@ -82,6 +87,39 @@ Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 ---
 
 ## Execution Flow
+
+Canister supports two entry points:
+
+- **`can run -r ... -- command`** — ad-hoc sandboxing with explicit recipe flags
+- **`can up [name]`** — manifest-driven sandboxing from `canister.toml`
+
+Both converge on the same fork/unshare/exec pipeline. The only difference
+is how the recipe chain is assembled in step 1.
+
+### Manifest Discovery (`can up`)
+
+When `can up` is invoked, the CLI discovers `canister.toml` by walking up
+from the current directory (like `.gitignore`). It parses the manifest,
+resolves the named sandbox (or the first defined sandbox alphabetically),
+and assembles the recipe chain from the manifest's `recipes = [...]` list
+plus any `[sandbox.<name>.filesystem]` / `[sandbox.<name>.network]` / etc.
+overrides.
+
+**Composition order for `can up`:**
+
+```
+base.toml
+  → auto-detected recipes (match_prefix against command binary)
+  → recipes listed in manifest (left to right)
+  → manifest overrides ([sandbox.<name>.filesystem], etc.)
+  = final SandboxConfig
+```
+
+This replaces the explicit `--recipe` flags from `can run` with the
+manifest's declarative recipe list. The resolved `SandboxConfig` is
+identical in structure and is passed to the same sandbox runtime.
+
+### `can run` Flow
 
 The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 
@@ -466,7 +504,7 @@ domains. In Full mode, there is no network isolation.
 
 A classic BPF program is loaded right before `execve()`. The filter is
 generated at runtime from the default baseline defined in
-`recipes/default.toml` (~170 allowed, ~16 always-denied) plus any
+`recipes/default.toml` (~187 allowed, ~18 always-denied) plus any
 `[syscalls]` overrides (`allow_extra` / `deny_extra`).
 
 When the USER_NOTIF supervisor is enabled, two BPF filters are installed:

@@ -4,14 +4,17 @@
 # so plugin managers (lazy.nvim), LSP servers (via Mason), tree-sitter
 # parsers, and other tooling work out of the box.
 #
+# System paths (/usr/lib, /usr/bin, /lib, /tmp, etc.) are provided by
+# base.toml — this recipe only adds Neovim-specific paths.
+#
 # Usage:
-#   can run --recipe recipes/neovim.toml -- nvim
-#   can run --recipe recipes/neovim.toml -- nvim src/main.rs
+#   can run -r neovim -- nvim
+#   can run -r neovim -r elixir -r nix -- nvim
 
 [recipe]
 name = "neovim"
 description = "Neovim editor with LSP, tree-sitter, and plugin support"
-version = "1"
+version = "2"
 
 [filesystem]
 allow = [
@@ -20,14 +23,6 @@ allow = [
     "$HOME/.local/share/nvim",
     "$HOME/.local/state/nvim",
     "$HOME/.cache/nvim",
-
-    # System libs (for LSP servers, tree-sitter compilers, etc.)
-    "/usr/lib",
-    "/usr/bin",
-    "/usr/local/lib",
-    "/usr/local/bin",
-    "/lib",
-    "/tmp",
 ]
 deny = ["/etc/shadow", "/root"]
 

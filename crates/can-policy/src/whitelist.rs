@@ -106,6 +106,7 @@ mod tests {
             allow: vec![PathBuf::from("/usr/lib"), PathBuf::from("/tmp/workspace")],
             allow_write: vec![],
             deny: vec![],
+            mask: vec![],
         };
         assert_eq!(
             check_path(Path::new("/usr/lib/python3"), &config),
@@ -127,6 +128,7 @@ mod tests {
             allow: vec![PathBuf::from("/etc")],
             allow_write: vec![],
             deny: vec![PathBuf::from("/etc/shadow")],
+            mask: vec![],
         };
         assert_eq!(
             check_path(Path::new("/etc/hostname"), &config),

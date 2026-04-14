@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use can_policy::profile::baseline_search_dirs;
-use can_policy::{RecipeFile, SandboxConfig, SeccompProfile, resolve_base};
+use can_policy::{
+    Manifest, RecipeFile, SandboxConfig, SandboxDef, SeccompProfile, discover_manifest,
+    resolve_base,
+};
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
 use can_sandbox::mac::{self, PolicyStatus};
@@ -177,6 +180,313 @@ fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile
     Ok(matches)
 }
 
+/// Load recipes for a manifest sandbox definition.
+///
+/// Composition order (same as `load_recipes` but driven by manifest):
+/// 1. `base.toml` — essential OS filesystem mounts (always loaded)
+/// 2. Auto-detected recipes — matched by `match_prefix` against the
+///    resolved command binary path
+/// 3. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
+/// 4. Manifest overrides (filesystem, network, etc. from the sandbox definition)
+fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
+    // 1. Start with base.toml.
+    let mut merged = resolve_base().context("loading base.toml")?;
+    tracing::debug!("loaded base.toml (essential OS mounts)");
+
+    // 2. Auto-detect recipes based on the resolved command path.
+    let parts = def.command_parts();
+    let cmd_name = parts.first().map(|s| s.as_str());
+    if let Some(cmd) = cmd_name {
+        match can_sandbox::resolve_command(cmd) {
+            Ok(command_path) => {
+                let auto_recipes = discover_auto_recipes(&command_path)?;
+                for (path, recipe) in &auto_recipes {
+                    let name = recipe.display_name(
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown"),
+                    );
+                    tracing::info!(
+                        recipe = name,
+                        path = %path.display(),
+                        command = %command_path.display(),
+                        "auto-detected recipe for command"
+                    );
+                }
+                for (_path, recipe) in auto_recipes {
+                    merged = merged.merge(recipe);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(command = cmd, error = %e, "skipping auto-detection (command resolution failed)");
+            }
+        }
+    }
+
+    // 3. Merge recipes listed in the manifest.
+    for recipe_name in &def.recipes {
+        let path = resolve_recipe_path(recipe_name)?;
+        let recipe = RecipeFile::from_file(&path)
+            .with_context(|| format!("loading recipe: {}", path.display()))?;
+
+        tracing::info!(
+            recipe = recipe.display_name(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+            ),
+            path = %path.display(),
+            "loaded recipe (from manifest)"
+        );
+
+        merged = merged.merge(recipe);
+    }
+
+    // 4. Apply manifest-level overrides as the final layer.
+    let overrides = Manifest::sandbox_as_recipe(def);
+    merged = merged.merge(overrides);
+
+    merged
+        .into_sandbox_config()
+        .context("resolving merged manifest recipes")
+}
+
+/// Execute the `can up` command.
+///
+/// Discovers `canister.toml`, resolves the named sandbox (or the first
+/// defined), composes recipes, and runs the command.
+pub fn up(
+    name: Option<&str>,
+    dry_run: bool,
+    monitor: bool,
+    strict: bool,
+    port_args: &[String],
+) -> Result<i32> {
+    // Discover canister.toml by walking up from CWD.
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let manifest_path = discover_manifest(&cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no canister.toml found.\n\
+             Searched from: {}\n\n\
+             Create a canister.toml in your project root, or use `can run` for ad-hoc sandboxing.",
+            cwd.display()
+        )
+    })?;
+
+    tracing::info!(path = %manifest_path.display(), "loading canister.toml");
+    let manifest = Manifest::from_file(&manifest_path)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+    // Resolve sandbox name.
+    let sandbox_names = manifest.sandbox_names();
+    let sandbox_name = match name {
+        Some(n) => {
+            if manifest.get(n).is_none() {
+                anyhow::bail!(
+                    "sandbox '{n}' not found in {}.\nAvailable sandboxes: {}",
+                    manifest_path.display(),
+                    sandbox_names.join(", ")
+                );
+            }
+            n.to_string()
+        }
+        None => {
+            // Default to the first sandbox (alphabetically sorted).
+            let first = sandbox_names
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no sandboxes defined in canister.toml"))?;
+            tracing::info!(sandbox = first, "using default sandbox (first defined)");
+            first.to_string()
+        }
+    };
+
+    let def = manifest.get(&sandbox_name).unwrap();
+
+    // Print sandbox info.
+    if let Some(desc) = &def.description {
+        println!("sandbox: {sandbox_name} — {desc}");
+    } else {
+        println!("sandbox: {sandbox_name}");
+    }
+    println!("command: {}", def.command);
+    println!("recipes: {}", def.recipes.join(", "));
+    println!();
+
+    // Compose recipes.
+    let mut config = load_manifest_recipes(def)?;
+
+    // Auto-mask canister.toml so the sandboxed process cannot read the
+    // security policy. This is the core anti-detection mechanism.
+    config.filesystem.mask.push(manifest_path.clone());
+
+    // Apply CLI --port flags.
+    for port_str in port_args {
+        let mapping = can_policy::PortMapping::parse(port_str)
+            .map_err(|e| anyhow::anyhow!("invalid port spec '{port_str}': {e}"))?;
+        config.network.ports.push(mapping);
+    }
+
+    // CLI --strict overrides (can only tighten).
+    let effective_strict = strict || config.strict;
+
+    // Dry-run: print the resolved config and exit.
+    if dry_run {
+        return print_dry_run(&config, effective_strict);
+    }
+
+    if monitor && effective_strict {
+        anyhow::bail!("--monitor and --strict are mutually exclusive");
+    }
+
+    if effective_strict {
+        tracing::warn!("STRICT MODE: all setup failures are fatal, seccomp uses KILL_PROCESS");
+    }
+
+    if monitor {
+        tracing::warn!(
+            "MONITOR MODE: policy enforcement is relaxed — violations are logged, not enforced"
+        );
+        print_monitor_policy_preview(&config);
+    }
+
+    // Parse command from the sandbox definition.
+    let parts = def.command_parts();
+    let (cmd, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty command in sandbox '{sandbox_name}'"))?;
+
+    let opts = SandboxOpts {
+        command: cmd.clone(),
+        args: args.to_vec(),
+        config,
+        monitor,
+        strict: effective_strict,
+    };
+
+    let exit_code = can_sandbox::run(&opts)?;
+
+    if monitor {
+        print_monitor_exit_summary(exit_code, &opts.config);
+    }
+
+    Ok(exit_code)
+}
+
+/// Print the resolved policy for `can up --dry-run`.
+fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
+    println!("--- Resolved Policy (dry run) ---\n");
+
+    // Strict mode.
+    println!("strict: {strict}");
+    println!();
+
+    // Filesystem.
+    println!("[filesystem]");
+    if !config.filesystem.allow.is_empty() {
+        println!("  allow ({} paths):", config.filesystem.allow.len());
+        for p in &config.filesystem.allow {
+            println!("    {}", p.display());
+        }
+    }
+    if !config.filesystem.allow_write.is_empty() {
+        println!(
+            "  allow_write ({} paths):",
+            config.filesystem.allow_write.len()
+        );
+        for p in &config.filesystem.allow_write {
+            println!("    {}", p.display());
+        }
+    }
+    if !config.filesystem.deny.is_empty() {
+        println!("  deny ({} paths):", config.filesystem.deny.len());
+        for p in &config.filesystem.deny {
+            println!("    {}", p.display());
+        }
+    }
+    if !config.filesystem.mask.is_empty() {
+        println!("  mask ({} paths):", config.filesystem.mask.len());
+        for p in &config.filesystem.mask {
+            println!("    {}", p.display());
+        }
+    }
+    println!();
+
+    // Network.
+    println!("[network]");
+    println!("  deny_all: {}", config.network.deny_all());
+    if !config.network.allow_domains.is_empty() {
+        println!("  allow_domains: {:?}", config.network.allow_domains);
+    }
+    if !config.network.allow_ips.is_empty() {
+        println!("  allow_ips: {:?}", config.network.allow_ips);
+    }
+    if !config.network.ports.is_empty() {
+        println!("  ports:");
+        for p in &config.network.ports {
+            println!("    {p}");
+        }
+    }
+    println!();
+
+    // Process.
+    println!("[process]");
+    if let Some(max) = config.process.max_pids {
+        println!("  max_pids: {max}");
+    }
+    if !config.process.allow_execve.is_empty() {
+        println!(
+            "  allow_execve ({} entries):",
+            config.process.allow_execve.len()
+        );
+        for p in &config.process.allow_execve {
+            println!("    {}", p.display());
+        }
+    }
+    if !config.process.env_passthrough.is_empty() {
+        println!("  env_passthrough: {:?}", config.process.env_passthrough);
+    }
+    println!();
+
+    // Resources.
+    println!("[resources]");
+    if let Some(mb) = config.resources.memory_mb {
+        println!("  memory_mb: {mb}");
+    }
+    if let Some(cpu) = config.resources.cpu_percent {
+        println!("  cpu_percent: {cpu}");
+    }
+    println!();
+
+    // Syscalls.
+    println!("[syscalls]");
+    println!("  seccomp_mode: {}", config.syscalls.seccomp_mode());
+    if !config.syscalls.allow_extra.is_empty() {
+        println!("  allow_extra: {:?}", config.syscalls.allow_extra);
+    }
+    if !config.syscalls.deny_extra.is_empty() {
+        println!("  deny_extra: {:?}", config.syscalls.deny_extra);
+    }
+
+    // Also show the full baseline summary.
+    match SeccompProfile::resolve_baseline() {
+        Ok(resolved) => {
+            let n_allow = resolved.profile.allow_syscalls.len() + config.syscalls.allow_extra.len();
+            let n_deny = resolved.profile.deny_syscalls.len() + config.syscalls.deny_extra.len();
+            println!(
+                "  baseline: {} ({n_allow} allowed, {n_deny} denied)",
+                resolved.source
+            );
+        }
+        Err(e) => {
+            println!("  baseline: ERROR — {e}");
+        }
+    }
+
+    println!("\n--- End Resolved Policy ---");
+
+    Ok(0)
+}
+
 /// Execute the `can recipe show` command.
 ///
 /// Loads and merges all recipes (same as `can run`), resolves to a
@@ -208,6 +518,15 @@ pub fn run(
 ) -> Result<i32> {
     let cmd_name = command.first().map(|s| s.as_str());
     let mut config = load_recipes(recipe_args, cmd_name)?;
+
+    // Auto-mask canister.toml if it exists in CWD, even for ad-hoc runs.
+    // Prevents the sandboxed process from reading the security policy.
+    if let Ok(cwd) = std::env::current_dir() {
+        let manifest_in_cwd = cwd.join(can_policy::MANIFEST_FILENAME);
+        if manifest_in_cwd.is_file() {
+            config.filesystem.mask.push(manifest_in_cwd);
+        }
+    }
 
     // Apply CLI --port flags (merged with any recipe-defined ports).
     for port_str in port_args {

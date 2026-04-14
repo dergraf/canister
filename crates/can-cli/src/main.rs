@@ -24,6 +24,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run a named sandbox from canister.toml.
+    ///
+    /// Discovers canister.toml by walking up from the current directory,
+    /// resolves the named sandbox (or the first-defined one), composes
+    /// its recipes, and runs the command.
+    Up {
+        /// Sandbox name to run (defaults to the first defined in canister.toml).
+        name: Option<String>,
+
+        /// Preview the resolved policy without running the sandbox.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Run in monitor mode: log access attempts without enforcing.
+        #[arg(short, long)]
+        monitor: bool,
+
+        /// Override strict mode from the CLI.
+        #[arg(short, long)]
+        strict: bool,
+
+        /// Publish a container port to the host.
+        ///
+        /// Syntax: [ip:]hostPort:containerPort[/protocol]
+        /// Can be repeated. Implies filtered network mode.
+        #[arg(short = 'p', long = "port")]
+        ports: Vec<String>,
+    },
+
     /// Run a command inside the sandbox.
     Run {
         /// Recipe name or path. Can be repeated for composition.
@@ -148,7 +177,10 @@ fn main() -> ExitCode {
 
     // Initialize logging.
     // In monitor mode, use debug level for full visibility.
-    let is_monitor = matches!(&cli.command, Commands::Run { monitor: true, .. });
+    let is_monitor = matches!(
+        &cli.command,
+        Commands::Run { monitor: true, .. } | Commands::Up { monitor: true, .. }
+    );
     if is_monitor {
         can_log::init_monitor();
     } else if cli.verbose {
@@ -158,6 +190,13 @@ fn main() -> ExitCode {
     }
 
     let result = match cli.command {
+        Commands::Up {
+            name,
+            dry_run,
+            monitor,
+            strict,
+            ports,
+        } => commands::up(name.as_deref(), dry_run, monitor, strict, &ports),
         Commands::Run {
             recipe,
             monitor,

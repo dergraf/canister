@@ -1,17 +1,17 @@
 # Canister recipe for Elixir/Erlang workloads.
 #
 # The BEAM VM needs ptrace for :observer, :dbg, and erlang:trace/3.
-# This recipe adds ptrace to the default baseline via [syscalls].
+# This recipe adds BEAM-specific syscalls, Hex.pm network access, and
+# BEAM environment variables. System paths are provided by base.toml.
 #
 # Usage:
-#   can run --recipe recipes/elixir.toml -- mix test
-#   can run --recipe recipes/elixir.toml -- iex -S mix
-#   can run --recipe recipes/elixir.toml -- mix phx.server
+#   can run -r elixir -- mix test
+#   can run -r elixir -r nix -- iex -S mix
 
 [recipe]
 name = "elixir-dev"
 description = "Elixir/Erlang development: mix tasks, iex, Phoenix server"
-version = "1"
+version = "2"
 
 # Strict mode: abort if any isolation layer cannot be set up.
 # Recommended for CI. Uncomment to enable.
@@ -23,16 +23,6 @@ version = "1"
 allow_extra = ["ptrace", "memfd_create"]
 
 [filesystem]
-# Paths the sandboxed BEAM process can access.
-# The BEAM needs access to the Erlang/OTP installation and Elixir libs.
-allow = [
-    "/usr/lib",
-    "/usr/bin",
-    "/usr/local/lib",
-    "/usr/local/bin",
-    "/lib",
-    "/tmp/workspace",
-]
 deny = ["/etc/shadow", "/root"]
 
 [network]

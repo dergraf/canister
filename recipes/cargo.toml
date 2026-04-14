@@ -14,4 +14,5 @@ match_prefix = ["$HOME/.cargo", "$HOME/.rustup"]
 
 [filesystem]
 allow = ["$HOME/.cargo", "$HOME/.rustup"]
+deny = ["$HOME/.cargo/credentials.toml", "$HOME/.cargo/credentials"]
 

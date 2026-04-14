@@ -8,6 +8,11 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 
 ## Table of Contents
 
+- [Project Manifest (canister.toml)](#project-manifest-canistertoml)
+  - [Manifest Format](#manifest-format)
+  - [can up](#can-up)
+  - [Dry-Run Preview](#dry-run-preview)
+  - [Composition Order (can up)](#composition-order-can-up)
 - [Recipe Composition](#recipe-composition)
   - [Merge Semantics](#merge-semantics)
   - [Name-Based Lookup](#name-based-lookup)
@@ -23,6 +28,140 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 - [Monitor Mode](#monitor-mode)
 - [Inspecting the Resolved Policy](#inspecting-the-resolved-policy)
 - [Examples](#examples)
+
+---
+
+## Project Manifest (`canister.toml`)
+
+A project manifest declares **named sandboxes** for a project. Instead of
+remembering which `-r` flags to pass, you define sandboxes once in
+`canister.toml` and run them with `can up`.
+
+Place `canister.toml` in your project root (next to `.git/`). Canister
+discovers it by walking up from the current directory, similar to `.gitignore`.
+
+### Manifest Format
+
+```toml
+[sandbox.dev]
+description = "Neovim + Elixir development"
+recipes = ["neovim", "elixir", "nix"]
+command = "nvim"
+
+[sandbox.dev.filesystem]
+allow_write = ["$HOME/.local/share/nvim"]
+
+[sandbox.dev.network]
+allow_domains = ["api.myproject.dev"]
+
+[sandbox.test]
+description = "Mix test runner"
+recipes = ["elixir", "nix"]
+command = "mix test"
+
+[sandbox.ci]
+description = "CI — strict, no network"
+recipes = ["elixir", "nix", "generic-strict"]
+command = "mix test --cover"
+strict = true
+
+[sandbox.ci.resources]
+memory_mb = 2048
+cpu_percent = 100
+```
+
+**`[sandbox.<name>]` fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `description` | `string` | No | Human-readable description |
+| `recipes` | `string[]` | **Yes** | Recipe names to compose (resolved via recipe search path) |
+| `command` | `string` | **Yes** | Command to run (may include arguments) |
+| `strict` | `bool` | No | Override strict mode for this sandbox |
+
+**Override sections:**
+
+Each sandbox can include optional override sections that merge on top of the
+composed recipes. These use the same schema as recipe files:
+
+- `[sandbox.<name>.filesystem]` — `allow`, `allow_write`, `deny`
+- `[sandbox.<name>.network]` — `allow_domains`, `allow_ips`, `deny_all`, `ports`
+- `[sandbox.<name>.process]` — `max_pids`, `allow_execve`, `env_passthrough`
+- `[sandbox.<name>.resources]` — `memory_mb`, `cpu_percent`
+- `[sandbox.<name>.syscalls]` — `allow_extra`, `deny_extra`, `seccomp_mode`, `notifier`
+
+Overrides follow the same [merge semantics](#merge-semantics) as recipe
+composition: Vec fields are unioned, scalar fields use last-Some-wins,
+strict uses OR.
+
+**Validation rules:**
+
+- At least one `[sandbox.<name>]` must be defined.
+- Each sandbox must have `recipes = [...]` with at least one entry.
+- Each sandbox must have a non-empty `command`.
+- Unknown fields are rejected (`deny_unknown_fields`).
+- Mixing absolute (`allow`/`deny`) and relative (`allow_extra`/`deny_extra`)
+  syscall fields in a sandbox's `[syscalls]` section is an error.
+
+### `can up`
+
+Run a named sandbox from the manifest:
+
+```bash
+# Run the default sandbox (alphabetically first).
+can up
+
+# Run a specific sandbox by name.
+can up dev
+can up test
+can up ci
+
+# With CLI overrides.
+can up dev --strict
+can up dev --monitor
+can up test -p 4000:4000
+```
+
+**Default sandbox:** When no name is given, `can up` uses the alphabetically
+first sandbox. Use descriptive names so the default is predictable (e.g.,
+`dev` sorts before `test`).
+
+**Error handling:** If `canister.toml` is not found, `can up` prints an error
+suggesting `can run` for ad-hoc use. If the named sandbox doesn't exist, it
+lists available sandbox names.
+
+### Dry-Run Preview
+
+Use `--dry-run` to see the fully resolved policy without running anything:
+
+```bash
+can up dev --dry-run
+can up ci --dry-run
+```
+
+The output shows the merged result of `base.toml` + auto-detected recipes +
+manifest recipes + manifest overrides, including filesystem paths, network
+domains, syscall overrides, and resource limits.
+
+### Composition Order (`can up`)
+
+```
+base.toml
+  → auto-detected recipes (match_prefix against command binary)
+  → recipes listed in manifest (left to right)
+  → manifest overrides ([sandbox.<name>.filesystem], etc.)
+  = final SandboxConfig
+```
+
+This is the same merge chain as `can run`, except the explicit `-r` flags
+are replaced by the manifest's `recipes = [...]` list, and manifest
+overrides act as the final layer.
+
+**Design note:** Package manager recipes (nix, homebrew, etc.) should be
+listed explicitly in `recipes = [...]`. While auto-detection via
+`match_prefix` still works for the command binary, explicit declaration
+preserves the principle of least privilege — auditors can see exactly
+which recipes are composed by reading `canister.toml`.
 
 ---
 
@@ -411,7 +550,7 @@ cpu_percent = 100
 Customizes the seccomp BPF baseline and enforcement mode.
 
 Canister ships a single default seccomp baseline defined in
-`recipes/default.toml` (~170 allowed syscalls, ~16 always-denied). The
+`recipes/default.toml` (~187 allowed syscalls, ~18 always-denied). The
 baseline is embedded in the binary at compile time and can be overridden by
 placing a `default.toml` in the recipe search path (`./recipes/`,
 `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).

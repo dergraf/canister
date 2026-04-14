@@ -1,27 +1,19 @@
 # Canister recipe for Node.js build tasks (npm/yarn/pnpm).
 #
 # Allows network access to the npm registry and common CDNs.
-# Suitable for `npm install`, `npm run build`, and similar tasks.
+# System paths are provided by base.toml — this recipe only adds
+# Node.js-specific network and environment configuration.
 #
 # Usage:
-#   can run --recipe recipes/node-build.toml -- npm install
-#   can run --recipe recipes/node-build.toml -- npm run build
-#   can run --recipe recipes/node-build.toml -- npx tsc
+#   can run -r node-build -- npm install
+#   can run -r node-build -- npm run build
 
 [recipe]
 name = "node-build"
 description = "Node.js build tasks: npm install, build, test"
-version = "1"
+version = "2"
 
 [filesystem]
-allow = [
-    "/usr/lib",
-    "/usr/bin",
-    "/usr/local/lib",
-    "/usr/local/bin",
-    "/lib",
-    "/tmp",
-]
 deny = ["/etc/shadow", "/root"]
 
 [network]

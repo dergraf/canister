@@ -13,12 +13,13 @@
 [recipe]
 name = "base"
 description = "Essential OS paths for any Linux binary"
-version = "1"
+version = "2"
 
 [filesystem]
 # Paths bind-mounted read-only for basic execution. These provide:
 # - Shell utilities and system binaries (/bin, /sbin, /usr/bin, /usr/sbin)
 # - Shared libraries and the dynamic linker (/lib, /lib64, /usr/lib, /usr/lib64)
+# - Locally installed binaries and libraries (/usr/local/bin, /usr/local/lib)
 # - Shared data files (/usr/share)
 # - Dynamic linker cache and configuration (/etc/ld.so.*)
 # - DNS and network resolution (/etc/resolv.conf, /etc/nsswitch.conf, /etc/hosts)
@@ -26,6 +27,7 @@ version = "1"
 # - Timezone data (/etc/localtime)
 # - Alternatives system (/etc/alternatives)
 # - User/group databases (/etc/passwd, /etc/group) — needed by Go, Python, etc.
+# - Temporary file directory (/tmp) — isolated per sandbox via overlay
 allow = [
     "/bin",
     "/sbin",
@@ -35,7 +37,10 @@ allow = [
     "/usr/sbin",
     "/usr/lib",
     "/usr/lib64",
+    "/usr/local/bin",
+    "/usr/local/lib",
     "/usr/share",
+    "/tmp",
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",

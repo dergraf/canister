@@ -17,33 +17,46 @@
 [recipe]
 name = "opencode"
 description = "OpenCode AI coding agent with scoped filesystem and restricted network"
-version = "1"
+version = "2"
 
 [filesystem]
 # OpenCode needs access to:
 # - The project directory (implicitly mounted writable as the working dir)
-# - Its own binary, config, and plugin dirs (read-only)
-# - System libraries and common dev tools (read-only)
-# - The user's global git config and SSH keys (read-only)
+# - Its own config and state dirs
+# System paths (/usr/lib, /usr/bin, /lib, /tmp, etc.) are provided by base.toml.
+# Language toolchains ($HOME/.cargo, $HOME/.rustup, /nix/store, etc.) should
+# be added via recipe composition in canister.toml, NOT baked in here.
+#
+# SECURITY: We intentionally do NOT mount:
+# - $HOME/.ssh        — SSH private keys. Use SSH_AUTH_SOCK (agent) instead.
+# - $HOME/.gitconfig  — may contain credential helpers or tokens. Git identity
+#                       is passed via GIT_AUTHOR_NAME/EMAIL env vars.
+# - $HOME/.cargo      — contains credentials.toml (crates.io tokens). Mount
+#                       via the cargo recipe when needed.
+# - $HOME/.gnupg      — GPG private keys.
+# - $HOME/.aws        — AWS credentials.
+# - $HOME/.kube       — Kubernetes config with tokens.
 allow = [
     "$HOME/.opencode",
     "$HOME/.config/opencode",
-    "$HOME/.gitconfig",
-    "$HOME/.ssh",
-    "$HOME/.cargo",
-    "$HOME/.rustup",
-    "/usr/lib",
-    "/usr/bin",
-    "/usr/local/lib",
-    "/usr/local/bin",
-    "/lib",
-    "/tmp",
 ]
 # OpenCode writes to its state dir (SQLite DB, logs, tool output).
 allow_write = [
     "$HOME/.local/share/opencode",
 ]
-deny = ["/etc/shadow", "/root"]
+deny = [
+    "/etc/shadow",
+    "/root",
+    "$HOME/.ssh",
+    "$HOME/.gnupg",
+    "$HOME/.aws",
+    "$HOME/.kube",
+    "$HOME/.docker",
+    "$HOME/.npmrc",
+    "$HOME/.pypirc",
+    "$HOME/.netrc",
+    "$HOME/.config/gh",
+]
 
 [network]
 # GitHub Copilot auth and API

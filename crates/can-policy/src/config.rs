@@ -60,6 +60,18 @@ pub struct FilesystemConfig {
     /// Paths explicitly denied (checked before allow and allow_write).
     #[serde(default)]
     pub deny: Vec<PathBuf>,
+
+    /// Paths to mask inside the sandbox (bind `/dev/null` over them).
+    ///
+    /// Used to hide files that would otherwise be visible through the
+    /// CWD bind-mount. For example, `canister.toml` is auto-masked
+    /// when running via `can up` to prevent the sandboxed process from
+    /// reading the security policy.
+    ///
+    /// This field is set programmatically by the CLI layer and is not
+    /// expected in recipe TOML files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask: Vec<PathBuf>,
 }
 
 /// Protocol for port forwarding.
@@ -524,6 +536,7 @@ impl RecipeFile {
                     .into_iter()
                     .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
                     .collect(),
+                mask: self.filesystem.mask,
             },
             network: self.network,
             process: ProcessConfig {
@@ -568,6 +581,7 @@ impl RecipeFile {
                     overlay.filesystem.allow_write,
                 ),
                 deny: union_vecs(self.filesystem.deny, overlay.filesystem.deny),
+                mask: union_vecs(self.filesystem.mask, overlay.filesystem.mask),
             },
 
             // Network: union of lists, deny_all is last-Some-wins.

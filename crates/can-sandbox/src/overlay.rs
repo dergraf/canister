@@ -184,6 +184,12 @@ pub fn setup_filesystem(
         );
     }
 
+    // 5c. Mask files that should be hidden inside the sandbox.
+    //     This must happen AFTER the CWD bind-mount so the target files
+    //     exist at their expected paths, but BEFORE pivot_root so we still
+    //     have access to /dev/null on the host.
+    mask_files(&sandbox_root, config)?;
+
     // 6. Mount a fresh /proc for PID namespace.
     mount_proc(&sandbox_root)?;
 
@@ -303,6 +309,69 @@ fn bind_mount_writable_paths(root: &Path, config: &FilesystemConfig) -> Result<(
         bind_mount_rw(source, &target)?;
         tracing::debug!(source = %source.display(), target = %target.display(), "writable path mounted");
     }
+    Ok(())
+}
+
+/// Mask files inside the sandbox by bind-mounting `/dev/null` over them.
+///
+/// This is used for anti-detection: files like `canister.toml` that exist
+/// inside the CWD bind-mount are hidden from the sandboxed process. The
+/// file appears to exist (as an empty special file) but returns EOF on read,
+/// preventing the sandboxed process from discovering the sandbox policy.
+///
+/// Must be called AFTER the CWD bind-mount (so the files exist at their
+/// target paths) and BEFORE `pivot_root`.
+fn mask_files(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
+    if config.mask.is_empty() {
+        return Ok(());
+    }
+
+    let dev_null = root.join("dev/null");
+    // Fall back to host /dev/null if sandbox /dev isn't set up yet.
+    let dev_null = if dev_null.exists() {
+        dev_null
+    } else {
+        PathBuf::from("/dev/null")
+    };
+
+    for path in &config.mask {
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let target = root.join(rel);
+
+        if !target.exists() {
+            tracing::debug!(
+                path = %path.display(),
+                target = %target.display(),
+                "mask target does not exist, skipping"
+            );
+            continue;
+        }
+
+        match mount(
+            Some(&dev_null),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "masked file (bind /dev/null)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    error = %e,
+                    "failed to mask file (non-fatal)"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
