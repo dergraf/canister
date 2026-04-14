@@ -1,0 +1,14 @@
+# DNS-filtered network mode — pasta with domain-based allowlist.
+# Used by: t_dns_filtering.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+
+[network]
+allow_domains = ["example.com", "httpbin.org"]
+deny_all = true
+
+[process]
+env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
+
+[syscalls]
