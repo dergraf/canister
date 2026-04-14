@@ -628,6 +628,14 @@ fn print_monitor_policy_preview(config: &SandboxConfig) {
     let net_mode = can_net::NetworkMode::from_config(&config.network);
     eprintln!("  network:         {net_mode:?}");
 
+    // Writable paths.
+    if !config.filesystem.allow_write.is_empty() {
+        eprintln!(
+            "  allow_write:     {} writable paths",
+            config.filesystem.allow_write.len()
+        );
+    }
+
     eprintln!("---\n");
 }
 

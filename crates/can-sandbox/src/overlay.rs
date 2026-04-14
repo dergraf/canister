@@ -158,6 +158,11 @@ pub fn setup_filesystem(
     //    config.allow via recipe composition.
     bind_mount_whitelist(&sandbox_root, config)?;
 
+    // 4b. Bind-mount writable paths.
+    //     These are paths the sandboxed process must write to (e.g., database
+    //     files, caches, state directories). Changes persist on the host.
+    bind_mount_writable_paths(&sandbox_root, config)?;
+
     // 5. Create a writable /tmp inside the sandbox.
     let sandbox_tmp = sandbox_root.join("tmp");
     mount_tmpfs(&sandbox_tmp)?;
@@ -259,6 +264,44 @@ fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), Ov
 
         bind_mount_ro(source, &target)?;
         tracing::debug!(source = %source.display(), target = %target.display(), "whitelisted path mounted");
+    }
+    Ok(())
+}
+
+/// Bind-mount writable paths from `config.allow_write`.
+///
+/// These paths are mounted read-write so the sandboxed process can
+/// persist changes (e.g., databases, caches, state directories).
+/// Denied paths are still checked and skipped.
+fn bind_mount_writable_paths(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
+    for source in &config.allow_write {
+        if !source.exists() {
+            tracing::warn!(path = %source.display(), "writable path not found, skipping");
+            continue;
+        }
+
+        // Check if this path is denied.
+        let denied = config.deny.iter().any(|d| source.starts_with(d));
+        if denied {
+            tracing::warn!(path = %source.display(), "writable path is also in deny list, skipping");
+            continue;
+        }
+
+        let rel = source.strip_prefix("/").unwrap_or(source);
+        let target = root.join(rel);
+
+        if let Some(parent) = target.parent() {
+            mkdir_p(parent)?;
+        }
+
+        if source.is_dir() {
+            mkdir_p(&target)?;
+        } else {
+            touch(&target)?;
+        }
+
+        bind_mount_rw(source, &target)?;
+        tracing::debug!(source = %source.display(), target = %target.display(), "writable path mounted");
     }
     Ok(())
 }

@@ -45,11 +45,19 @@ pub struct SandboxConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
-    /// Paths the sandboxed process is allowed to access.
+    /// Paths the sandboxed process is allowed to access (read-only).
     #[serde(default)]
     pub allow: Vec<PathBuf>,
 
-    /// Paths explicitly denied (checked before allow).
+    /// Paths bind-mounted writable into the sandbox.
+    ///
+    /// Use this for directories the sandboxed process must write to
+    /// (e.g., database files, caches, state directories). These paths
+    /// are mounted writable — changes persist on the host.
+    #[serde(default)]
+    pub allow_write: Vec<PathBuf>,
+
+    /// Paths explicitly denied (checked before allow and allow_write).
     #[serde(default)]
     pub deny: Vec<PathBuf>,
 }
@@ -492,7 +500,7 @@ impl RecipeFile {
     /// - `seccomp_mode` → `AllowList`
     ///
     /// Expands environment variables (`$HOME`, `$USER`, etc.) in:
-    /// - `filesystem.allow` / `filesystem.deny`
+    /// - `filesystem.allow` / `filesystem.allow_write` / `filesystem.deny`
     /// - `process.allow_execve`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
@@ -501,6 +509,12 @@ impl RecipeFile {
                 allow: self
                     .filesystem
                     .allow
+                    .into_iter()
+                    .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
+                    .collect(),
+                allow_write: self
+                    .filesystem
+                    .allow_write
                     .into_iter()
                     .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
                     .collect(),
@@ -549,6 +563,10 @@ impl RecipeFile {
             // Filesystem: union of paths.
             filesystem: FilesystemConfig {
                 allow: union_vecs(self.filesystem.allow, overlay.filesystem.allow),
+                allow_write: union_vecs(
+                    self.filesystem.allow_write,
+                    overlay.filesystem.allow_write,
+                ),
                 deny: union_vecs(self.filesystem.deny, overlay.filesystem.deny),
             },
 
@@ -732,6 +750,7 @@ allow_domains = ["pypi.org"]
         let toml = r#"
 [filesystem]
 allow = ["/usr/lib"]
+allow_write = ["/var/data"]
 deny = ["/etc/shadow"]
 
 [network]
@@ -758,6 +777,10 @@ allow_extra = ["ptrace"]
         assert_eq!(config.process.max_pids, Some(64));
         assert_eq!(config.syscalls.allow_extra, vec!["ptrace"]);
         assert_eq!(config.syscalls.seccomp_mode(), SeccompMode::AllowList);
+        assert_eq!(
+            config.filesystem.allow_write,
+            vec![PathBuf::from("/var/data")]
+        );
     }
 
     #[test]
@@ -978,6 +1001,7 @@ deny_extra = ["ptrace"]
             r#"
 [filesystem]
 allow = ["/usr/lib", "/usr/bin"]
+allow_write = ["/tmp/state"]
 deny = ["/etc/shadow"]
 "#,
         );
@@ -985,6 +1009,7 @@ deny = ["/etc/shadow"]
             r#"
 [filesystem]
 allow = ["/usr/bin", "/tmp/workspace"]
+allow_write = ["/tmp/state", "/var/cache/app"]
 deny = ["/root"]
 "#,
         );
@@ -996,6 +1021,10 @@ deny = ["/root"]
                 PathBuf::from("/usr/bin"),
                 PathBuf::from("/tmp/workspace"),
             ]
+        );
+        assert_eq!(
+            merged.filesystem.allow_write,
+            vec![PathBuf::from("/tmp/state"), PathBuf::from("/var/cache/app"),]
         );
         assert_eq!(
             merged.filesystem.deny,
@@ -1332,6 +1361,7 @@ name = "elixir"
             r#"
 [filesystem]
 allow = ["$_CANISTER_TEST_HOME2/.cargo"]
+allow_write = ["$_CANISTER_TEST_HOME2/.local/share/app"]
 deny = ["$_CANISTER_TEST_HOME2/.ssh"]
 
 [process]
@@ -1342,6 +1372,10 @@ allow_execve = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
         assert_eq!(
             config.filesystem.allow,
             vec![PathBuf::from("/home/bob/.cargo")]
+        );
+        assert_eq!(
+            config.filesystem.allow_write,
+            vec![PathBuf::from("/home/bob/.local/share/app")]
         );
         assert_eq!(
             config.filesystem.deny,

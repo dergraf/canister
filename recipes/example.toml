@@ -12,9 +12,12 @@ version = "1"
 # strict = true
 
 [filesystem]
-# Paths the sandboxed process can access.
+# Paths the sandboxed process can read (mounted read-only).
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp/workspace"]
-# Paths explicitly denied (checked before allow).
+# Paths the sandboxed process can write to (changes persist on host).
+# The working directory ($PWD) is always writable. Uncomment for additional paths:
+# allow_write = ["/var/data/myapp"]
+# Paths explicitly denied (checked before allow and allow_write).
 deny = ["/etc/shadow", "/root"]
 
 [network]

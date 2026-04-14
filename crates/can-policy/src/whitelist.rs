@@ -17,7 +17,7 @@ pub enum AccessDecision {
 
 /// Check whether a filesystem path is allowed by the given policy.
 ///
-/// Deny rules are checked first. Then allow rules.
+/// Deny rules are checked first. Then allow and allow_write rules.
 /// If neither matches, access is denied (default-deny).
 pub fn check_path(path: &Path, config: &FilesystemConfig) -> AccessDecision {
     // Check deny list first.
@@ -27,8 +27,15 @@ pub fn check_path(path: &Path, config: &FilesystemConfig) -> AccessDecision {
         }
     }
 
-    // Check allow list.
+    // Check allow list (read-only).
     for allowed in &config.allow {
+        if path.starts_with(allowed) {
+            return AccessDecision::Allow;
+        }
+    }
+
+    // Check allow_write list (writable).
+    for allowed in &config.allow_write {
         if path.starts_with(allowed) {
             return AccessDecision::Allow;
         }
@@ -97,6 +104,7 @@ mod tests {
     fn path_allowed() {
         let config = FilesystemConfig {
             allow: vec![PathBuf::from("/usr/lib"), PathBuf::from("/tmp/workspace")],
+            allow_write: vec![],
             deny: vec![],
         };
         assert_eq!(
@@ -117,6 +125,7 @@ mod tests {
     fn path_deny_overrides_allow() {
         let config = FilesystemConfig {
             allow: vec![PathBuf::from("/etc")],
+            allow_write: vec![],
             deny: vec![PathBuf::from("/etc/shadow")],
         };
         assert_eq!(
