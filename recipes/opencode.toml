@@ -1,0 +1,105 @@
+# Canister recipe for OpenCode — AI coding agent.
+#
+# OpenCode is a Go binary that talks to LLM providers (GitHub Copilot,
+# Anthropic, OpenAI, etc.) and runs developer tools (git, cargo, npm,
+# ripgrep, etc.) to assist with coding tasks.
+#
+# This recipe scopes filesystem access to the project working directory,
+# OpenCode's own state/config dirs, and common tool locations. Network
+# is restricted to known LLM API domains.
+#
+# Usage:
+#   can run --recipe recipes/opencode.toml -- opencode
+#
+# Note: Run from the project directory you want OpenCode to work on.
+# The $PWD will be bind-mounted into the sandbox.
+
+[recipe]
+name = "opencode"
+description = "OpenCode AI coding agent with scoped filesystem and restricted network"
+version = "1"
+
+[filesystem]
+# OpenCode needs access to:
+# - The project directory (implicitly mounted writable as the working dir)
+# - Its own binary, config, and plugin dirs (read-only)
+# - System libraries and common dev tools (read-only)
+# - The user's global git config and SSH keys (read-only)
+allow = [
+    "$HOME/.opencode",
+    "$HOME/.config/opencode",
+    "$HOME/.gitconfig",
+    "$HOME/.ssh",
+    "$HOME/.cargo",
+    "$HOME/.rustup",
+    "/usr/lib",
+    "/usr/bin",
+    "/usr/local/lib",
+    "/usr/local/bin",
+    "/lib",
+    "/tmp",
+]
+# OpenCode writes to its state dir (SQLite DB, logs, tool output).
+allow_write = [
+    "$HOME/.local/share/opencode",
+]
+deny = ["/etc/shadow", "/root"]
+
+[network]
+# GitHub Copilot auth and API
+# - github.com: OAuth device flow
+# - api.github.com: token exchange and user info
+# - api.githubcopilot.com: chat completions endpoint
+# - copilot-proxy.githubusercontent.com: Copilot proxy
+#
+# Anthropic API (Claude models)
+# - api.anthropic.com
+#
+# OpenAI API
+# - api.openai.com
+#
+# OpenCode's own services (Zen, auth, sharing)
+# - opencode.ai
+#
+# WebFetch tool — OpenCode fetches arbitrary URLs for research.
+# If you need unrestricted web access, set deny_all = false.
+allow_domains = [
+    "github.com",
+    "api.github.com",
+    "api.githubcopilot.com",
+    "copilot-proxy.githubusercontent.com",
+    "api.anthropic.com",
+    "api.openai.com",
+    "opencode.ai",
+]
+deny_all = true
+
+[process]
+# OpenCode spawns subprocesses for tools (git, cargo, rg, etc.)
+max_pids = 256
+# Environment variables OpenCode and its tools need.
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "EDITOR",
+    "SHELL",
+    "USER",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "SSH_AUTH_SOCK",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "NODE_PATH",
+]
