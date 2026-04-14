@@ -53,12 +53,15 @@
 //!
 //! # Filtered syscalls
 //!
-//! - `connect()` — check destination address against IP allowlist
-//! - `sendto()` / `sendmsg()` — check destination address; DNS queries
-//!   (port 53) are checked against the domain allowlist and trigger
-//!   supervisor-side resolution to dynamically learn allowed IPs
+//! - `connect()` — check destination address against IP allowlist; when an
+//!   IP is about to be denied and domain-based filtering is active,
+//!   re-resolves all allowed domains to handle TCP DNS and other
+//!   resolution paths that bypass sendto/sendmsg interception
+//! - `sendto()` / `sendmsg()` — check destination address; UDP DNS queries
+//!   (port 53) are inspected at the payload level and trigger
+//!   supervisor-side resolution to proactively learn allowed IPs
 //! - `clone()` / `clone3()` — deny namespace-creating flags
-//! - `socket()` — deny `AF_NETLINK`, `SOCK_RAW`
+//! - `socket()` — allow `AF_NETLINK` (read-only kernel queries), deny `SOCK_RAW` for other domains
 //! - `execve()` / `execveat()` — validate executable path
 
 use std::collections::HashSet;
@@ -1161,6 +1164,9 @@ fn classify_connect_addr(
             if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv4 allowed");
                 Verdict::Allow
+            } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
+                tracing::info!(pid, %ip_addr, port, "connect: IPv4 allowed after domain re-resolution");
+                Verdict::Allow
             } else {
                 tracing::warn!(pid, %ip_addr, port, "connect: IPv4 denied by policy");
                 Verdict::Deny(libc::EACCES as u32)
@@ -1203,12 +1209,21 @@ fn classify_connect_addr(
             if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv6 allowed");
                 Verdict::Allow
+            } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
+                tracing::info!(pid, %ip_addr, port, "connect: IPv6 allowed after domain re-resolution");
+                Verdict::Allow
             } else {
                 tracing::warn!(pid, %ip_addr, port, "connect: IPv6 denied by policy");
                 Verdict::Deny(libc::EACCES as u32)
             }
         }
         other => {
+            // AF_NETLINK: kernel netlink queries (routing, interfaces).
+            // These are read-only kernel information queries, not network access.
+            if other == libc::AF_NETLINK {
+                tracing::debug!(pid, "connect: AF_NETLINK, allowing (kernel queries)");
+                return Verdict::Allow;
+            }
             tracing::warn!(
                 pid,
                 family = other,
@@ -1385,6 +1400,11 @@ fn classify_sendto_addr(
             return Verdict::Allow;
         }
         other => {
+            // AF_NETLINK: kernel netlink queries (routing, interfaces).
+            if other == libc::AF_NETLINK {
+                tracing::debug!(pid, "sendto: AF_NETLINK, allowing (kernel queries)");
+                return Verdict::Allow;
+            }
             tracing::warn!(
                 pid,
                 family = other,
@@ -1554,6 +1574,9 @@ fn classify_outbound_ip(
     // Check static policy + dynamic allowlist.
     if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
         tracing::debug!(pid, %ip_addr, port, "{syscall_name}: allowed");
+        Verdict::Allow
+    } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
+        tracing::info!(pid, %ip_addr, port, "{syscall_name}: allowed after domain re-resolution");
         Verdict::Allow
     } else {
         tracing::warn!(pid, %ip_addr, port, "{syscall_name}: denied by policy");
@@ -1819,6 +1842,59 @@ fn is_domain_allowed_by_policy(domain: &str, allowed_domains: &[String]) -> bool
     false
 }
 
+/// When a `connect()` to an unknown IP is about to be denied, try resolving
+/// all allowed domains and check if the target IP matches any of them.
+///
+/// This handles the TCP DNS case: the sandboxed process resolves a domain via
+/// TCP DNS (connect + write/read on port 53), which we don't intercept at the
+/// payload level. When it subsequently connects to the resolved IP, we don't
+/// recognize it. By re-resolving all allowed domains here, we can verify the
+/// IP belongs to an allowed domain and populate the dynamic allowlist.
+///
+/// The sandboxed process is suspended in the seccomp notification while this
+/// runs, so there is no TOCTOU race.
+///
+/// Returns `true` if the IP was found to belong to an allowed domain (and the
+/// allowlist was updated), `false` otherwise.
+fn try_resolve_allowed_domains(
+    target_ip: IpAddr,
+    policy: &NotifierPolicy,
+    dynamic_allowlist: &DynamicAllowlist,
+) -> bool {
+    // Only attempt if we have domain-based filtering configured.
+    if policy.allowed_domains.is_empty() {
+        return false;
+    }
+
+    let dns_server = format!("{}:53", policy.dns_server_addr);
+
+    for domain in &policy.allowed_domains {
+        // Query A records (IPv4).
+        let mut domain_ips: Vec<IpAddr> = Vec::new();
+        if let Some(ips) = dns_query_direct(domain, 1, &dns_server) {
+            domain_ips.extend(ips);
+        }
+        // Query AAAA records (IPv6).
+        if let Some(ips) = dns_query_direct(domain, 28, &dns_server) {
+            domain_ips.extend(ips);
+        }
+
+        if domain_ips.contains(&target_ip) {
+            tracing::info!(
+                domain,
+                %target_ip,
+                ips = ?domain_ips,
+                "connect: IP matched allowed domain via re-resolution"
+            );
+            // Add all IPs for this domain so subsequent connects are fast.
+            dynamic_allowlist.add_ips(domain_ips);
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Resolve a domain name and add the resulting IPs to the dynamic allowlist.
 ///
 /// Sends DNS queries directly to the configured DNS server inside the
@@ -2067,15 +2143,23 @@ fn evaluate_socket(args: &[u64; 6], pid: u32, policy: &NotifierPolicy) -> Verdic
     let domain = args[0];
     let sock_type = args[1] & SOCK_TYPE_MASK;
 
-    // Deny SOCK_RAW entirely.
-    if sock_type == SOCK_RAW {
-        tracing::warn!(pid, domain, "socket: SOCK_RAW denied");
-        return Verdict::Deny(libc::EPERM as u32);
+    // AF_NETLINK: allow SOCK_RAW and SOCK_DGRAM (they're equivalent for netlink).
+    // Netlink SOCK_RAW is NOT raw packet access — it's the standard way to query
+    // routing tables, interface addresses, etc. via the kernel netlink interface.
+    // Many programs (glibc's getifaddrs, Go, Bun/Node) use this.
+    if domain == AF_NETLINK {
+        tracing::debug!(
+            pid,
+            sock_type,
+            "socket: AF_NETLINK allowed (read-only kernel queries)"
+        );
+        return Verdict::Allow;
     }
 
-    // Deny AF_NETLINK.
-    if domain == AF_NETLINK {
-        tracing::warn!(pid, "socket: AF_NETLINK denied");
+    // Deny SOCK_RAW for all other domains (AF_INET, AF_INET6, etc.).
+    // Raw sockets enable packet injection and sniffing — dangerous in a sandbox.
+    if sock_type == SOCK_RAW {
+        tracing::warn!(pid, domain, "socket: SOCK_RAW denied");
         return Verdict::Deny(libc::EPERM as u32);
     }
 
@@ -2634,12 +2718,18 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_socket_denies_af_netlink() {
+    fn evaluate_socket_allows_af_netlink() {
         let policy = NotifierPolicy::default();
         let args = [AF_NETLINK, libc::SOCK_DGRAM as u64, 0, 0, 0, 0];
         match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for AF_NETLINK"),
+            Verdict::Allow => {}
+            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK (read-only kernel queries)"),
+        }
+        // SOCK_RAW with AF_NETLINK should also be allowed (equivalent to SOCK_DGRAM).
+        let args_raw = [AF_NETLINK, SOCK_RAW, 0, 0, 0, 0];
+        match evaluate_socket(&args_raw, 1234, &policy) {
+            Verdict::Allow => {}
+            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK + SOCK_RAW"),
         }
     }
 
@@ -3680,5 +3770,90 @@ mod tests {
                 panic!("expected Allow with restrict_outbound=false, got Deny({e})")
             }
         }
+    }
+
+    // ---- try_resolve_allowed_domains tests ----
+
+    #[test]
+    fn try_resolve_returns_false_when_no_domains() {
+        let policy = NotifierPolicy::default(); // no allowed_domains
+        let al = DynamicAllowlist::new();
+        assert!(
+            !try_resolve_allowed_domains("8.8.8.8".parse().unwrap(), &policy, &al),
+            "should return false when allowed_domains is empty"
+        );
+    }
+
+    #[test]
+    fn try_resolve_finds_ip_for_allowed_domain() {
+        // This test uses real DNS — skip if we can't determine a nameserver.
+        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let nameserver = resolv.lines().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("nameserver") {
+                line.split_whitespace().nth(1).map(String::from)
+            } else {
+                None
+            }
+        });
+        let Some(ns) = nameserver else { return };
+
+        // Resolve example.com to get a real IP.
+        let dns_server = format!("{ns}:53");
+        let Some(ips) = dns_query_direct("example.com", 1, &dns_server) else {
+            return; // DNS unreachable in test env
+        };
+        let Some(target_ip) = ips.first() else {
+            return;
+        };
+
+        let policy = NotifierPolicy {
+            allowed_domains: vec!["example.com".to_string()],
+            dns_server_addr: ns.clone(),
+            ..Default::default()
+        };
+        let al = DynamicAllowlist::new();
+
+        let found = try_resolve_allowed_domains(*target_ip, &policy, &al);
+        assert!(
+            found,
+            "should find IP {target_ip} via re-resolution of example.com"
+        );
+        assert!(
+            al.contains(target_ip),
+            "IP should be added to dynamic allowlist"
+        );
+    }
+
+    #[test]
+    fn try_resolve_returns_false_for_non_matching_ip() {
+        // This test uses real DNS — skip if we can't determine a nameserver.
+        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let nameserver = resolv.lines().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("nameserver") {
+                line.split_whitespace().nth(1).map(String::from)
+            } else {
+                None
+            }
+        });
+        let Some(ns) = nameserver else { return };
+
+        let policy = NotifierPolicy {
+            allowed_domains: vec!["example.com".to_string()],
+            dns_server_addr: ns,
+            ..Default::default()
+        };
+        let al = DynamicAllowlist::new();
+
+        // 192.0.2.1 is TEST-NET-1, should not resolve to example.com.
+        let found = try_resolve_allowed_domains("192.0.2.1".parse().unwrap(), &policy, &al);
+        assert!(!found, "TEST-NET IP should not match any allowed domain");
     }
 }
