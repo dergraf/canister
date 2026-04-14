@@ -25,6 +25,7 @@ version = "1"
 # - TLS certificates (/etc/ssl, /etc/ca-certificates)
 # - Timezone data (/etc/localtime)
 # - Alternatives system (/etc/alternatives)
+# - User/group databases (/etc/passwd, /etc/group) — needed by Go, Python, etc.
 allow = [
     "/bin",
     "/sbin",
@@ -45,6 +46,8 @@ allow = [
     "/etc/ca-certificates",
     "/etc/localtime",
     "/etc/alternatives",
+    "/etc/passwd",
+    "/etc/group",
 ]
 
 deny = [
