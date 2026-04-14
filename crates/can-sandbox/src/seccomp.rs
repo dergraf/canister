@@ -420,6 +420,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "openat2" => libc::SYS_openat2,
         "creat" => libc::SYS_creat,
         "close" => libc::SYS_close,
+        "close_range" => libc::SYS_close_range,
         "read" => libc::SYS_read,
         "write" => libc::SYS_write,
         "readv" => libc::SYS_readv,
@@ -436,12 +437,14 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "fdatasync" => libc::SYS_fdatasync,
         "truncate" => libc::SYS_truncate,
         "ftruncate" => libc::SYS_ftruncate,
+        "fallocate" => libc::SYS_fallocate,
 
         // File metadata
         "stat" => libc::SYS_stat,
         "fstat" => libc::SYS_fstat,
         "lstat" => libc::SYS_lstat,
         "newfstatat" => libc::SYS_newfstatat,
+        "statx" => libc::SYS_statx,
         "access" => libc::SYS_access,
         "faccessat" => libc::SYS_faccessat,
         "faccessat2" => libc::SYS_faccessat2,
@@ -477,6 +480,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "munmap" => libc::SYS_munmap,
         "mremap" => libc::SYS_mremap,
         "madvise" => libc::SYS_madvise,
+        "msync" => libc::SYS_msync,
         "brk" => libc::SYS_brk,
         "sbrk" => {
             return Err(SeccompError::UnknownSyscall(
@@ -499,6 +503,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "sendto" => libc::SYS_sendto,
         "recvfrom" => libc::SYS_recvfrom,
         "sendmsg" => libc::SYS_sendmsg,
+        "sendmmsg" => libc::SYS_sendmmsg,
         "recvmsg" => libc::SYS_recvmsg,
         "shutdown" => libc::SYS_shutdown,
         "getsockopt" => libc::SYS_getsockopt,
@@ -511,6 +516,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "rt_sigaction" => libc::SYS_rt_sigaction,
         "rt_sigprocmask" => libc::SYS_rt_sigprocmask,
         "rt_sigreturn" => libc::SYS_rt_sigreturn,
+        "rt_sigsuspend" => libc::SYS_rt_sigsuspend,
         "sigaltstack" => libc::SYS_sigaltstack,
 
         // Time
@@ -531,11 +537,18 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "epoll_ctl" => libc::SYS_epoll_ctl,
         "epoll_wait" => libc::SYS_epoll_wait,
         "epoll_pwait" => libc::SYS_epoll_pwait,
+        "epoll_pwait2" => libc::SYS_epoll_pwait2,
         "eventfd" => libc::SYS_eventfd,
         "eventfd2" => libc::SYS_eventfd2,
         "timerfd_create" => libc::SYS_timerfd_create,
         "timerfd_settime" => libc::SYS_timerfd_settime,
         "timerfd_gettime" => libc::SYS_timerfd_gettime,
+
+        // File monitoring
+        "inotify_init" => libc::SYS_inotify_init,
+        "inotify_init1" => libc::SYS_inotify_init1,
+        "inotify_add_watch" => libc::SYS_inotify_add_watch,
+        "inotify_rm_watch" => libc::SYS_inotify_rm_watch,
 
         // IPC
         "pipe" => libc::SYS_pipe,
@@ -612,13 +625,19 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "sched_yield" => libc::SYS_sched_yield,
         "sched_getaffinity" => libc::SYS_sched_getaffinity,
         "sched_setaffinity" => libc::SYS_sched_setaffinity,
+        "sched_setscheduler" => libc::SYS_sched_setscheduler,
+        "sched_getscheduler" => libc::SYS_sched_getscheduler,
+        "rseq" => libc::SYS_rseq,
         "getcwd" => libc::SYS_getcwd,
         "chdir" => libc::SYS_chdir,
         "fchdir" => libc::SYS_fchdir,
         "umask" => libc::SYS_umask,
         "uname" => libc::SYS_uname,
         "sysinfo" => libc::SYS_sysinfo,
+        "getrusage" => libc::SYS_getrusage,
         "getrandom" => libc::SYS_getrandom,
+        "prlimit64" => libc::SYS_prlimit64,
+        "pidfd_open" => libc::SYS_pidfd_open,
         "memfd_create" => libc::SYS_memfd_create,
         "copy_file_range" => libc::SYS_copy_file_range,
         "sendfile" => libc::SYS_sendfile,
