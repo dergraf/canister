@@ -10,11 +10,11 @@
 # Use --no-verify to skip verification (e.g., for custom/forked repos).
 
 [checksums]
-"base.toml" = "ced42166fb559b931f6c256dc4913e68d2b3c13c1996746b8506e7eb646f5256"
+"base.toml" = "aafdd6389e99d5e5a3bc519e5dd5f62942997893f59004c80feffb5cb53be506"
 "cargo.toml" = "4e942d7d0db5f9d55fb0e65ee1d4b4a3d37165cb5cb1de4438eee4807caf3dd8"
-"default.toml" = "dbda70d56a964b9dbc99b2b4077fe3222e385372c9521bb68f898fe8aa6b8700"
+"default.toml" = "d360bedb857c4117ca6efae5e760e5fb056489b82b598ae4723d1d7d6581752a"
 "elixir.toml" = "4a6f43c05e47b7f3ae10faeda43650c7f3af88d807ceec32b5439ceef8da4209"
-"example.toml" = "00081459620348b4901d70de25b5a6a56f3da18d6f14e93116361c4b36d4549e"
+"example.toml" = "1458c9b6c2880c952514bc8556365bab1602df1367184296c111bffc540e53c9"
 "flatpak.toml" = "7fc56bbb779ae0031dfcd6b89b3347f7d2115fef0f0cf7bc4bcbe253d196e78b"
 "generic-strict.toml" = "e3cef015efcc7202822155900f90ca3a5b53ba88d60bb756da1af9e4790a7ca8"
 "gnu-store.toml" = "b5700ccf123cc8aca8ab073e3e88c74bb8161be49070744944312347ea57c991"
@@ -22,5 +22,6 @@
 "neovim.toml" = "d1543f1f217abec4e920dd7b9c5ca8852ece253207bbe5fbb10a88a87cc671dc"
 "nix.toml" = "c44874854ff8ac09c6cfd63a2f7202be4767d86919d6ddf1d42674407cbadb3c"
 "node-build.toml" = "b930cc63ae31515ba8991ede305b2bb1a20f2b1bfc26ae00bdfd3e2323d4fd92"
+"opencode.toml" = "be8e3590ded9380ee6112254e75df1a40b3f8d0f0620ca5abcc12225096a15c6"
 "python-pip.toml" = "4a0295073933268d54e36a2157470280b07923973750ebd62136d50a609b3e94"
 "snap.toml" = "65781fa9fdb2d6686976db6587cf43977f2647b37a063b4ef700d058a5bccca4"
