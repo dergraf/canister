@@ -201,8 +201,16 @@ pub fn apply_default_resource_limits() {
     set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE");
 }
 
+/// The resource parameter type for `setrlimit` differs between glibc
+/// (`__rlimit_resource_t`, a `c_uint` typedef) and musl (`c_int`).
+/// We define a target-specific alias so the rest of the code stays DRY.
+#[cfg(target_env = "musl")]
+type RlimitResource = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type RlimitResource = libc::__rlimit_resource_t;
+
 /// Set a resource limit, logging success or failure.
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) {
+fn set_rlimit(resource: RlimitResource, value: u64, name: &str) {
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
