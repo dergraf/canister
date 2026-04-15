@@ -2047,7 +2047,7 @@ fn dns_query_direct(domain: &str, qtype: u16, dns_server: &str) -> Option<Vec<Ip
     };
     let socket = UdpSocket::bind(bind_addr).ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    socket.send_to(&packet, &server_addr).ok()?;
+    socket.send_to(&packet, server_addr).ok()?;
 
     // Read the response.
     let mut buf = [0u8; 512];
