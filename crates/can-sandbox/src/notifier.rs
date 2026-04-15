@@ -1461,21 +1461,51 @@ fn evaluate_sendmsg(
     let msg_name_ptr = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
     let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize;
 
-    // Defense-in-depth: block ancillary data (msg_control) to prevent SCM_RIGHTS
-    // FD-passing attacks. A sandboxed process could attempt to inject file descriptors
-    // into the supervisor or other processes via Unix socket ancillary messages.
+    // Defense-in-depth: block ancillary data (msg_control) on AF_INET/AF_INET6
+    // to prevent potential fd-injection attacks via SCM_RIGHTS. In practice the
+    // kernel already rejects SCM_RIGHTS on non-AF_UNIX sockets, but we block
+    // it anyway as belt-and-suspenders.
+    //
+    // Ancillary data on AF_UNIX sockets (or connected sockets with NULL msg_name)
+    // is permitted because it's used legitimately by runtimes like BEAM/Erlang
+    // (erl_child_setup receives fds from the emulator via SCM_RIGHTS over Unix
+    // sockets). All AF_UNIX sockets inside the sandbox are between sandbox-
+    // internal processes at the same privilege level — the supervisor does not
+    // expose any Unix socket endpoint.
     //
     // IMPORTANT: This check runs BEFORE the restrict_outbound early-return so
-    // that SCM_RIGHTS is always blocked regardless of outbound policy. Even in
-    // unrestricted mode, FD injection must be prevented.
+    // that inet SCM_RIGHTS is always blocked regardless of outbound policy.
     let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap());
     if msg_controllen > 0 {
-        tracing::warn!(
+        // Determine the socket address family to decide whether to allow.
+        // NULL msg_name → connected socket (previously checked at connect time),
+        // which is safe for ancillary data (most likely AF_UNIX between internal
+        // processes).
+        if msg_name_ptr != 0 && msg_namelen >= 2 {
+            let addr_bytes = match read_proc_mem(pid, msg_name_ptr, msg_namelen) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(pid, error = %e, "sendmsg: failed to read msg_name for SCM_RIGHTS check, denying");
+                    return Verdict::Deny(libc::EPERM as u32);
+                }
+            };
+            let sa_family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+            if sa_family != libc::AF_UNIX as u16 {
+                tracing::warn!(
+                    pid,
+                    msg_controllen,
+                    sa_family,
+                    "sendmsg: ancillary data on non-AF_UNIX socket, denying"
+                );
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+        }
+        tracing::debug!(
             pid,
             msg_controllen,
-            "sendmsg: ancillary data (msg_control) present, denying to prevent SCM_RIGHTS"
+            "sendmsg: ancillary data on AF_UNIX/connected socket, allowing"
         );
-        return Verdict::Deny(libc::EPERM as u32);
+        return Verdict::Allow;
     }
 
     // When outbound restrictions are disabled (port-forwarding-only config),
