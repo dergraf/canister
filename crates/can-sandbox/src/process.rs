@@ -169,6 +169,58 @@ pub fn set_max_pids(max: u32) -> Result<(), ProcessError> {
     Ok(())
 }
 
+/// Apply sensible default resource limits for sandboxed processes.
+///
+/// These limits provide defense against fork bombs, memory exhaustion, and
+/// file descriptor exhaustion. They are applied unconditionally — even when
+/// no explicit resource config is provided — as a safety net.
+///
+/// If the user has configured explicit limits (e.g., `max_pids` in the recipe),
+/// those override the defaults set here (because they're applied separately
+/// and RLIMIT can be lowered but not raised after this point).
+///
+/// Defaults:
+/// - `RLIMIT_NPROC`:  4096 processes (prevents fork bombs)
+/// - `RLIMIT_AS`:     8 GB virtual address space (prevents OOM)
+/// - `RLIMIT_NOFILE`: 4096 file descriptors (prevents FD exhaustion)
+/// - `RLIMIT_FSIZE`:  4 GB max file size (prevents disk exhaustion)
+/// - `RLIMIT_CORE`:   0 (no core dumps, prevents data leakage)
+pub fn apply_default_resource_limits() {
+    set_rlimit(libc::RLIMIT_NPROC, 4096, "RLIMIT_NPROC");
+    set_rlimit(
+        libc::RLIMIT_AS,
+        8 * 1024 * 1024 * 1024, // 8 GB
+        "RLIMIT_AS",
+    );
+    set_rlimit(libc::RLIMIT_NOFILE, 4096, "RLIMIT_NOFILE");
+    set_rlimit(
+        libc::RLIMIT_FSIZE,
+        4 * 1024 * 1024 * 1024, // 4 GB
+        "RLIMIT_FSIZE",
+    );
+    set_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE");
+}
+
+/// Set a resource limit, logging success or failure.
+fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    // SAFETY: setrlimit is safe with valid resource and limit values.
+    let ret = unsafe { libc::setrlimit(resource, &limit) };
+    if ret != 0 {
+        tracing::warn!(
+            name,
+            value,
+            error = %std::io::Error::last_os_error(),
+            "failed to set resource limit"
+        );
+    } else {
+        tracing::debug!(name, value, "resource limit set");
+    }
+}
+
 /// Build the list of extra syscalls to deny based on process config.
 ///
 /// When `allow_execve` is non-empty, we want to prevent the sandboxed process's

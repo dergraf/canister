@@ -403,12 +403,18 @@ fn mount_proc(root: &Path) -> Result<(), OverlayError> {
     // These paths can leak host kernel state even from inside a PID namespace.
     let masked_files = &[
         "kcore",         // physical memory — trivially exploitable
-        "keys",          // kernel keyring (encryption keys)
+        "keys",          // kernel keyring (encryption keys, session keys)
+        "key-users",     // keyring per-user usage statistics
+        "kallsyms",      // kernel symbol names (KASLR bypass aid)
         "sysrq-trigger", // can force kernel crash, reboot, etc.
         "timer_list",    // high-res timer info, side-channel risk
         "latency_stats", // scheduler internals
+        "schedstat",     // scheduler statistics per CPU
     ];
-    let dev_null = root.join("dev/null");
+    // Use the host's /dev/null as the bind-mount source. The sandbox's
+    // /dev hasn't been set up yet (setup_minimal_dev runs after mount_proc),
+    // so root.join("dev/null") doesn't exist at this point.
+    let dev_null = PathBuf::from("/dev/null");
     for entry in masked_files {
         let target = proc_path.join(entry);
         if target.exists() {
@@ -445,6 +451,33 @@ fn mount_proc(root: &Path) -> Result<(), OverlayError> {
                 Ok(()) => tracing::debug!(path = %target.display(), "masked /proc directory"),
                 Err(e) => {
                     tracing::debug!(path = %target.display(), error = %e, "could not mask /proc dir (non-fatal)");
+                }
+            }
+        }
+    }
+
+    // Mask /proc/self/mountinfo (and /proc/1/mountinfo) to prevent the
+    // sandboxed process from enumerating host mount topology. This file
+    // reveals host device names (e.g., /dev/nvme0n1p2), filesystem types,
+    // host paths, and the full mount hierarchy — useful for intelligence
+    // gathering in an escape attempt.
+    for mountinfo in &["self/mountinfo", "1/mountinfo"] {
+        let target = proc_path.join(mountinfo);
+        if target.exists() {
+            match mount(
+                Some(&dev_null),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                Ok(()) => tracing::debug!(path = %target.display(), "masked mountinfo"),
+                Err(e) => {
+                    tracing::debug!(
+                        path = %target.display(),
+                        error = %e,
+                        "could not mask mountinfo (non-fatal)"
+                    );
                 }
             }
         }

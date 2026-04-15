@@ -110,6 +110,16 @@ require_python3() {
     fi
 }
 
+has_passwordless_sudo() {
+    sudo -n true 2>/dev/null
+}
+
+require_sudo() {
+    if ! has_passwordless_sudo; then
+        skip_all "passwordless sudo not available"
+    fi
+}
+
 # Skip the entire test file with a reason.
 skip_all() {
     local reason="$1"

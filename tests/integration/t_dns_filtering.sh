@@ -7,7 +7,7 @@
 #   2. Outbound connection to allowed domain succeeds
 #   3. Outbound connection to denied domain is blocked
 #   4. Connected-socket DNS pattern (Erlang-style) works
-#   5. Diagnostic: network namespace routing to 169.254.0.1
+#   5. Diagnostic: network namespace routing to DNS server
 #
 # Requires: pasta, python3
 # ============================================================================
@@ -36,12 +36,28 @@ echo "  stdout: $(echo "$RUN_STDOUT" | head -30)"
 echo "  stderr (last 20 lines): $(echo "$RUN_STDERR" | tail -20)"
 assert_exit_code 0 "$RUN_EXIT"
 
-# ---- Test 2: DNS resolution via raw UDP to pasta DNS forwarder ----
-begin_test "DNS resolution via raw UDP to 169.254.0.1:53"
+# ---- Test 2: DNS resolution via raw UDP to sandbox DNS server ----
+begin_test "DNS resolution via raw UDP to sandbox DNS server"
 run_can --verbose run --recipe "$CONFIG" -- python3 -c "
-import socket, struct, sys
+import re, socket, struct, sys
 
-def dns_query(domain, server='169.254.0.1', port=53, qtype=1):
+# Discover the DNS server from the sandbox's resolv.conf (set by pasta).
+dns_server = None
+try:
+    with open('/etc/resolv.conf') as f:
+        for line in f:
+            m = re.match(r'nameserver\s+(\S+)', line)
+            if m:
+                dns_server = m.group(1)
+                break
+except Exception:
+    pass
+if not dns_server:
+    print('DNS_FAIL reason=no_nameserver_in_resolv_conf')
+    sys.exit(1)
+print(f'DNS_SERVER={dns_server}')
+
+def dns_query(domain, server, port=53, qtype=1):
     \"\"\"Send a raw DNS A query and return parsed IPs.\"\"\"
     # Build query packet
     # Header: ID=0xBEEF, RD=1, QDCOUNT=1
@@ -117,26 +133,12 @@ def dns_query(domain, server='169.254.0.1', port=53, qtype=1):
 
     return ips
 
-# Test DNS resolution to pasta's forwarder
-ips = dns_query('example.com')
+# Test DNS resolution to the sandbox's nameserver
+ips = dns_query('example.com', dns_server)
 if ips:
     print(f'DNS_OK domain=example.com ips={ips}')
 else:
     print('DNS_FAIL domain=example.com')
-    # Also test: can we reach 169.254.0.1 at all?
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2)
-        sock.sendto(b'hello', ('169.254.0.1', 53))
-        print('UDP_SEND_OK target=169.254.0.1:53')
-        try:
-            data, _ = sock.recvfrom(512)
-            print(f'UDP_RECV_OK len={len(data)}')
-        except socket.timeout:
-            print('UDP_RECV_TIMEOUT target=169.254.0.1:53')
-        sock.close()
-    except Exception as e:
-        print(f'UDP_SEND_FAIL target=169.254.0.1:53 error={e}')
 "
 echo "  stdout: $RUN_STDOUT"
 echo "  stderr (last 20 lines): $(echo "$RUN_STDERR" | tail -20)"
@@ -216,7 +218,7 @@ assert_contains "$RUN_STDOUT" "CONNECT_DENIED"
 # ---- Test 5: Erlang-style connected-socket DNS pattern ----
 begin_test "connected-socket DNS (Erlang pattern): connect(dns_server) then sendto(NULL)"
 run_can --verbose run --recipe "$CONFIG" -- python3 -c "
-import socket, struct, sys
+import re, socket, struct, sys
 
 # Replicate the Erlang BEAM pattern:
 # 1. connect(fd, dns_server:53)
@@ -224,7 +226,21 @@ import socket, struct, sys
 # 3. recv response
 # 4. connect to resolved IP
 
-dns_server = '169.254.0.1'
+# Discover the DNS server from the sandbox's resolv.conf (set by pasta).
+dns_server = None
+try:
+    with open('/etc/resolv.conf') as f:
+        for line in f:
+            m = re.match(r'nameserver\s+(\S+)', line)
+            if m:
+                dns_server = m.group(1)
+                break
+except Exception:
+    pass
+if not dns_server:
+    print('DNS_FAIL reason=no_nameserver_in_resolv_conf')
+    sys.exit(1)
+print(f'DNS_SERVER={dns_server}')
 
 # Step 1: Create a UDP socket and connect() to DNS server
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -332,7 +348,7 @@ assert_contains "$RUN_STDOUT" "CONNECTED_DNS_OK"
 
 # ---- Test 6: Supervisor-side DNS resolution diagnostic ----
 # This tests what the supervisor sees. The key question: can the supervisor
-# process (which calls resolve_and_add) actually reach 169.254.0.1:53?
+# process (which calls resolve_and_add) actually reach the DNS server?
 # We test this indirectly: if the dynamic allowlist is populated, the
 # connect() to the resolved IP will succeed.
 begin_test "supervisor dynamic allowlist populated (end-to-end)"
@@ -343,7 +359,7 @@ import socket, struct, sys, time
 # reading /etc/resolv.conf in the sandbox). This will trigger:
 # 1. Worker calls sendto() to DNS server on port 53
 # 2. Seccomp notifier intercepts -> supervisor inspects DNS query
-# 3. Supervisor calls resolve_and_add() -> direct UDP to 169.254.0.1:53
+# 3. Supervisor calls resolve_and_add() -> direct UDP to upstream DNS
 # 4. Resolved IPs added to dynamic allowlist
 # 5. Worker's sendto is allowed, gets DNS response
 # 6. Worker calls connect() to resolved IP -> allowed by dynamic allowlist

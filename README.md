@@ -38,7 +38,7 @@ discarded.
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
 - **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~187 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
-- **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw/netlink), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
+- **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `sendmsg()` (blocks SCM_RIGHTS fd passing), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw sockets, restrict AF_NETLINK to NETLINK_ROUTE only), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
 - **Credential protection** -- recipes explicitly deny sensitive paths (`$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`, etc.); cargo credentials excluded from the cargo recipe via deny rules
@@ -48,7 +48,9 @@ discarded.
 - **Fail-by-default** -- sandbox aborts when isolation cannot be established; all setup failures are fatal
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
 - **Recipe inspection** -- `can recipe show` emits the fully resolved policy as valid TOML for auditing or creating standalone recipes
-- **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger hidden; /proc/sys read-only
+- **Proc hardening** -- Docker-style /proc masking: /proc/kcore, /proc/keys, /proc/sysrq-trigger, /proc/key-users, /proc/kallsyms, /proc/schedstat hidden; /proc/self/mountinfo masked; /proc/sys read-only
+- **Capability dropping** -- all 41 Linux capabilities dropped from the bounding set before exec; inheritable and ambient sets cleared; sandboxed processes run with completely empty capability state
+- **Default resource limits** -- RLIMIT_NPROC=4096, RLIMIT_AS=8GB, RLIMIT_NOFILE=4096, RLIMIT_FSIZE=4GB, RLIMIT_CORE=0 applied before exec; overridable via recipe `[resources]` section
 - **Single binary** -- pure Rust, no external library dependencies
 - **MAC detection** -- detects AppArmor (Ubuntu) and SELinux (Fedora/RHEL) restrictions; auto-installs the correct security policy via `can setup`
 - **TOML recipes** -- strict schema with `deny_unknown_fields`, optional `[recipe]` metadata, `[syscalls]` section for per-recipe baseline customization
@@ -223,7 +225,7 @@ can run -r my-custom.toml -- mix test
 
 ## How It Works
 
-Canister combines eight Linux isolation mechanisms:
+Canister combines ten Linux isolation mechanisms:
 
 ```
                           can run -- python3 script.py
@@ -274,10 +276,11 @@ Canister combines eight Linux isolation mechanisms:
    returns `EPERM` for unlisted syscalls (or `KILL_PROCESS` in strict mode).
 
 6. **Seccomp USER_NOTIF supervisor** -- a parent-process supervisor thread
-   intercepts `connect()`, `clone()`/`clone3()`, `socket()`, `execve()`, and
-   `execveat()` syscalls via `SECCOMP_RET_USER_NOTIF`. It reads the actual
-   arguments from `/proc/<pid>/mem` and enforces IP allowlists, namespace
-   creation blocks, raw socket denial, and `allow_execve` path validation.
+   intercepts `connect()`, `sendto()`, `sendmsg()`, `clone()`/`clone3()`,
+   `socket()`, `execve()`, and `execveat()` syscalls via `SECCOMP_RET_USER_NOTIF`.
+   It reads the actual arguments from `/proc/<pid>/mem` and enforces IP allowlists,
+   SCM_RIGHTS fd passing blocks, namespace creation blocks, raw socket denial,
+   AF_NETLINK protocol restrictions, and `allow_execve` path validation.
    Auto-detected on Linux 5.9+.
 
 7. **Cgroups v2** -- memory and CPU limits are enforced via the cgroup
@@ -287,7 +290,21 @@ Canister combines eight Linux isolation mechanisms:
 
 8. **/proc hardening** -- sensitive paths under `/proc` are masked (bind-mount
    `/dev/null` over files, empty tmpfs over directories) and `/proc/sys` is
-   remounted read-only, matching Docker's default behavior.
+   remounted read-only, matching Docker's default behavior. Additionally,
+   `/proc/self/mountinfo` and `/proc/1/mountinfo` are masked to prevent
+   sandbox topology leakage, and `/proc/key-users`, `/proc/kallsyms`, and
+   `/proc/schedstat` are masked to reduce information exposure.
+
+9. **Capability dropping** -- all 41 Linux capabilities are dropped from the
+   bounding set using `prctl(PR_CAPBSET_DROP)` before exec. The inheritable
+   and ambient capability sets are also cleared. After exec with
+   `NO_NEW_PRIVS`, the sandboxed process runs with completely empty capability
+   state (`CapEff=0, CapPrm=0, CapBnd=0, CapAmb=0, CapInh=0`).
+
+10. **Default resource limits** -- conservative rlimits are applied before exec:
+    RLIMIT_NPROC=4096, RLIMIT_AS=8GB, RLIMIT_NOFILE=4096, RLIMIT_FSIZE=4GB,
+    RLIMIT_CORE=0. These provide defense against fork bombs, memory exhaustion,
+    and core dump leakage even without explicit `[resources]` in the recipe.
 
 For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -429,10 +446,12 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 | Mount namespace | Filesystem view | Mount escape (blocked by seccomp) |
 | Network namespace | Network access | Namespace escape (blocked by seccomp) |
 | Seccomp BPF (allow-list) | Syscall access (default deny) | Filter bypass (architecture-validated) |
-| USER_NOTIF supervisor | connect() IPs, clone() flags, socket() types, execve() paths | Kernel exploit or TOCTOU race |
+| USER_NOTIF supervisor | connect() IPs, sendmsg() SCM_RIGHTS, clone() flags, socket() types, execve() paths | Kernel exploit or TOCTOU race |
 | PID namespace | Process visibility | Namespace escape (blocked by seccomp) |
 | Cgroups v2 | Memory and CPU usage | Cgroup escape (requires root) |
-| /proc hardening | Sensitive kernel info | Remount (blocked by seccomp) |
+| /proc hardening | Sensitive kernel info, mountinfo topology | Remount (blocked by seccomp) |
+| Capability dropping | All 41 capabilities dropped from bounding set | Kernel exploit |
+| Default resource limits | Fork bombs, memory exhaustion, core dumps | Kernel exploit |
 | Environment filtering | Host env leakage | N/A (applied at exec) |
 | RLIMIT_NPROC | Fork bombs | Kernel exploit |
 | Read-only bind mounts | Write access | Remount (blocked by seccomp) |

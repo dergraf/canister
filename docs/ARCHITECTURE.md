@@ -17,8 +17,10 @@ of a sandboxed process, and the security properties of each isolation layer.
   - [Process Control](#5-process-control)
   - [Cgroups v2](#6-cgroups-v2)
   - [/proc Hardening](#7-proc-hardening)
-  - [Monitor Mode](#8-monitor-mode)
-  - [Strict Mode](#9-strict-mode)
+  - [Capability Dropping](#8-capability-dropping)
+  - [Default Resource Limits](#9-default-resource-limits)
+  - [Monitor Mode](#10-monitor-mode)
+  - [Strict Mode](#11-strict-mode)
 - [Parent-Child Protocol](#parent-child-protocol)
 - [Mandatory Access Control (MAC)](#mandatory-access-control-mac)
 - [Known Limitations](#known-limitations)
@@ -30,7 +32,7 @@ of a sandboxed process, and the security properties of each isolation layer.
 1. **Unprivileged by default.** No root, no suid, no capabilities. Everything
    runs as the calling user using unprivileged user namespaces.
 
-2. **Defense in depth.** Seven independent isolation mechanisms. Bypassing one
+2. **Defense in depth.** Multiple independent isolation mechanisms. Bypassing one
    layer does not compromise the others.
 
 3. **Fail closed.** When a feature cannot be set up (e.g., a MAC system blocks
@@ -511,8 +513,8 @@ When the USER_NOTIF supervisor is enabled, two BPF filters are installed:
 
 1. **Notifier filter** (installed first, via `seccomp()` with
    `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for
-   six intercepted syscalls (`connect`, `clone`, `clone3`, `socket`, `execve`,
-   `execveat`). All others return `SECCOMP_RET_ALLOW`.
+   eight intercepted syscalls (`connect`, `sendto`, `sendmsg`, `clone`, `clone3`,
+   `socket`, `execve`, `execveat`). All others return `SECCOMP_RET_ALLOW`.
 
 2. **Main filter** (installed second, via `prctl(PR_SET_SECCOMP)`): The
    standard allow-list or deny-list filter described below.
@@ -650,9 +652,11 @@ terminates.
 | Syscall | What is inspected | Policy enforcement |
 |---------|------------------|--------------------|
 | `connect()` | `sockaddr` struct (IP + port) | Must match resolved `allow_domains` IPs, `allow_ips` CIDRs, or loopback |
-| `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWUSER`, etc.) denied |
+| `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution; connected sockets (NULL addr) allowed |
+| `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing |
+| `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`) denied |
 | `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/<pid>/mem` |
-| `socket()` | `domain` + `type` registers | `AF_NETLINK` and `SOCK_RAW` denied |
+| `socket()` | `domain` + `type` + `protocol` registers | `SOCK_RAW` denied; `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only |
 | `execve()` | Pathname string in userspace memory | Must match `allow_execve` paths (empty = allow all) |
 | `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
 
@@ -682,8 +686,9 @@ via `[syscalls] notifier` in recipe config.
 
 **Security property:** Even syscalls that pass the main BPF filter are
 subject to argument-level inspection. A sandboxed process cannot connect to
-unauthorized IPs, create new namespaces via clone flags, open raw/netlink
-sockets, or exec binaries outside the `allow_execve` whitelist.
+unauthorized IPs, pass file descriptors via SCM_RIGHTS, create new namespaces
+via clone flags, open raw sockets, open AF_NETLINK sockets beyond NETLINK_ROUTE,
+or exec binaries outside the `allow_execve` whitelist.
 
 ### 5. Process Control
 
@@ -841,14 +846,21 @@ cgroup filesystem after seccomp is loaded).
 **Files:** `overlay.rs` (mount_proc function)
 
 After mounting `/proc` inside the sandbox, Canister masks sensitive paths
-following Docker's default behavior:
+following Docker's default behavior, plus additional hardening:
 
 **Masked files** (bind-mount `/dev/null` over them):
 - `/proc/kcore` — physical memory access
 - `/proc/keys` — kernel keyring contents
+- `/proc/key-users` — keyring user counts (information leak)
 - `/proc/sysrq-trigger` — kernel SysRq commands
 - `/proc/timer_list` — timer details (information leak)
 - `/proc/latency_stats` — latency statistics
+- `/proc/kallsyms` — kernel symbol addresses (KASLR bypass)
+- `/proc/schedstat` — scheduler statistics (information leak)
+
+**Masked per-process files** (bind-mount `/dev/null` over them):
+- `/proc/self/mountinfo` — mount topology (reveals sandbox structure)
+- `/proc/1/mountinfo` — same, for PID 1
 
 **Masked directories** (mount empty read-only tmpfs over them):
 - `/proc/acpi` — ACPI interface
@@ -861,9 +873,75 @@ following Docker's default behavior:
 are non-fatal. The sandbox continues with whatever masking succeeded.
 
 **Security property:** The sandboxed process cannot read sensitive kernel
-information from /proc, trigger SysRq commands, or modify sysctl values.
+information from /proc, trigger SysRq commands, modify sysctl values, or
+inspect the sandbox's mount topology via mountinfo.
 
-### 8. Monitor Mode
+### 8. Capability Dropping
+
+**Module:** `namespace.rs` (`drop_capabilities()`)
+
+After all namespace setup is complete and before `execve()`, Canister drops
+all Linux capabilities from the bounding set and clears the inheritable and
+ambient sets.
+
+**Setup sequence:**
+
+1. Read `CAP_LAST_CAP` from `/proc/sys/kernel/cap_last_cap` to discover the
+   number of capabilities on the running kernel (currently 41).
+2. Drop each capability from the bounding set using
+   `prctl(PR_CAPBSET_DROP, cap)`.
+3. Clear the inheritable capability set using `capset()`.
+4. Clear the ambient capability set using
+   `prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL)`.
+
+**Result after exec with `NO_NEW_PRIVS`:**
+
+```
+CapEff: 0000000000000000
+CapPrm: 0000000000000000
+CapBnd: 0000000000000000
+CapAmb: 0000000000000000
+CapInh: 0000000000000000
+```
+
+**Why this matters:** Inside a user namespace, the sandboxed process has
+`CAP_SYS_ADMIN` and other capabilities that allow namespace operations. While
+seccomp blocks the dangerous syscalls (mount, unshare, etc.), dropping
+capabilities provides defense-in-depth. Even if a seccomp bypass were found,
+the empty capability set prevents privilege escalation.
+
+**AppArmor interaction:** The `canister` AppArmor profile requires
+`allow capability setpcap,` to permit `PR_CAPBSET_DROP` calls. This is
+included in the shipped profile and installed via `sudo can setup`.
+
+**Security property:** The sandboxed process executes with no capabilities
+in any set. It cannot gain capabilities through any mechanism (exec of
+setuid binaries is also blocked by `NO_NEW_PRIVS`).
+
+### 9. Default Resource Limits
+
+**Module:** `process.rs` (`apply_default_resource_limits()`)
+
+Before `execve()`, Canister applies conservative resource limits that
+provide baseline protection even when no `[resources]` section is present
+in the recipe:
+
+| Limit | Value | Purpose |
+|-------|-------|---------|
+| `RLIMIT_NPROC` | 4096 | Limits total processes (fork bomb defense) |
+| `RLIMIT_AS` | 8 GB | Limits virtual address space |
+| `RLIMIT_NOFILE` | 4096 | Limits open file descriptors |
+| `RLIMIT_FSIZE` | 4 GB | Limits maximum file size |
+| `RLIMIT_CORE` | 0 | Disables core dumps (prevents data leakage) |
+
+These defaults are applied first, then any explicit limits from the recipe's
+`[resources]` section override them. The `RLIMIT_NPROC` from
+`[process].max_pids` takes precedence over the default if specified.
+
+**Security property:** Fork bombs are bounded, memory-hungry processes are
+capped, and core dumps cannot leak sandbox state to disk.
+
+### 10. Monitor Mode
 
 **Flag:** `--monitor`
 
@@ -929,7 +1007,7 @@ a development/debugging tool for iterating on sandbox policies.
 attempting a denied syscall and observing it succeeds) and behave
 differently. Always validate policies with enforcement enabled.
 
-### 9. Strict Mode
+### 11. Strict Mode
 
 **Flag:** `--strict` (or `strict = true` in config)
 

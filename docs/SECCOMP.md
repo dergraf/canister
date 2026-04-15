@@ -293,8 +293,8 @@ The worker installs two seccomp filters:
 
 1. **Notifier filter** (installed first via `seccomp()` syscall with
    `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for the
-   six intercepted syscalls (`connect`, `clone`, `clone3`, `socket`, `execve`,
-   `execveat`). All other syscalls return `SECCOMP_RET_ALLOW`.
+   eight intercepted syscalls (`connect`, `sendto`, `sendmsg`, `clone`, `clone3`,
+   `socket`, `execve`, `execveat`). All other syscalls return `SECCOMP_RET_ALLOW`.
 
 2. **Main filter** (installed second via `prctl(PR_SET_SECCOMP)`): The existing
    allow-list or deny-list BPF filter. Returns `SECCOMP_RET_ERRNO`,
@@ -309,9 +309,11 @@ delivers the notification to the supervisor, regardless of what other filters re
 | Syscall | Argument inspected | Policy |
 |---------|-------------------|--------|
 | `connect()` | `sockaddr` (destination address) | Allow only IPs from pre-resolved `allow_domains` and explicit `allow_ips`. Loopback and Unix domain sockets always allowed. |
+| `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution and dynamic allowlist population. Connected sockets (NULL dest_addr) allowed. |
+| `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing regardless of outbound restriction settings. |
 | `clone()` | `flags` (register value) | Deny namespace-creating flags: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` |
 | `clone3()` | `clone_args.flags` (read from userspace struct) | Same flag check as `clone()`, read from the `clone_args` struct via `/proc/<pid>/mem` |
-| `socket()` | `domain`, `type` (register values) | Deny `AF_NETLINK` (domain 16) and `SOCK_RAW` (type 3). Normal TCP/UDP/Unix sockets allowed. |
+| `socket()` | `domain`, `type`, `protocol` (register values) | `SOCK_RAW` denied. `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only — all other netlink protocols denied. Normal TCP/UDP/Unix sockets allowed. |
 | `execve()` | `pathname` (read from userspace string) | Validate against `allow_execve` paths. If `allow_execve` is empty, allow all. |
 | `execveat()` | `pathname` (read from userspace string) | Same as `execve()`. Resolves the path relative to the `dirfd` argument. |
 

@@ -47,6 +47,7 @@ profile canister {bin_path} flags=(attach_disconnected) {
   allow capability sys_ptrace,
   allow capability dac_override,
   allow capability dac_read_search,
+  allow capability setpcap,
 
   allow file rwlkm /{**,},
   allow network,

@@ -61,7 +61,7 @@
 //!   (port 53) are inspected at the payload level and trigger
 //!   supervisor-side resolution to proactively learn allowed IPs
 //! - `clone()` / `clone3()` — deny namespace-creating flags
-//! - `socket()` — allow `AF_NETLINK` (read-only kernel queries), deny `SOCK_RAW` for other domains
+//! - `socket()` — allow `AF_NETLINK` only for `NETLINK_ROUTE` (protocol 0), deny `SOCK_RAW` for other domains
 //! - `execve()` / `execveat()` — validate executable path
 
 use std::collections::HashSet;
@@ -1440,20 +1440,17 @@ fn evaluate_sendmsg(
 ) -> Verdict {
     let pid = notif.pid;
 
-    // When outbound restrictions are disabled (port-forwarding-only config),
-    // allow all sendmsg calls without inspecting the destination.
-    if !policy.restrict_outbound {
-        tracing::debug!(pid, "sendmsg: outbound unrestricted, allowing");
-        return Verdict::Allow;
-    }
-
     let msghdr_ptr = notif.data.args[1];
 
-    // Read the first 2 fields of struct msghdr:
-    //   void *msg_name;       // 8 bytes on x86_64
-    //   socklen_t msg_namelen; // 4 bytes (but aligned to 8 on x86_64)
-    // Total: 16 bytes (pointer + padded socklen_t)
-    let hdr_bytes = match read_proc_mem(pid, msghdr_ptr, 16) {
+    // Read the first 4 fields of struct msghdr (x86_64 layout):
+    //   void         *msg_name;       // offset  0, 8 bytes
+    //   socklen_t     msg_namelen;     // offset  8, 4 bytes (+4 padding)
+    //   struct iovec *msg_iov;         // offset 16, 8 bytes
+    //   size_t        msg_iovlen;      // offset 24, 8 bytes
+    //   void         *msg_control;     // offset 32, 8 bytes
+    //   size_t        msg_controllen;  // offset 40, 8 bytes
+    // Total: 48 bytes to reach through msg_controllen.
+    let hdr_bytes = match read_proc_mem(pid, msghdr_ptr, 48) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(pid, error = %e, "sendmsg: failed to read msghdr, denying");
@@ -1463,6 +1460,31 @@ fn evaluate_sendmsg(
 
     let msg_name_ptr = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
     let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize;
+
+    // Defense-in-depth: block ancillary data (msg_control) to prevent SCM_RIGHTS
+    // FD-passing attacks. A sandboxed process could attempt to inject file descriptors
+    // into the supervisor or other processes via Unix socket ancillary messages.
+    //
+    // IMPORTANT: This check runs BEFORE the restrict_outbound early-return so
+    // that SCM_RIGHTS is always blocked regardless of outbound policy. Even in
+    // unrestricted mode, FD injection must be prevented.
+    let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap());
+    if msg_controllen > 0 {
+        tracing::warn!(
+            pid,
+            msg_controllen,
+            "sendmsg: ancillary data (msg_control) present, denying to prevent SCM_RIGHTS"
+        );
+        return Verdict::Deny(libc::EPERM as u32);
+    }
+
+    // When outbound restrictions are disabled (port-forwarding-only config),
+    // allow all sendmsg calls without inspecting the destination.
+    // Checked AFTER the SCM_RIGHTS block above.
+    if !policy.restrict_outbound {
+        tracing::debug!(pid, "sendmsg: outbound unrestricted, allowing");
+        return Verdict::Allow;
+    }
 
     // NULL msg_name → connected socket, destination was checked at connect() time.
     if msg_name_ptr == 0 {
@@ -2169,17 +2191,44 @@ fn evaluate_socket(args: &[u64; 6], pid: u32, policy: &NotifierPolicy) -> Verdic
     let domain = args[0];
     let sock_type = args[1] & SOCK_TYPE_MASK;
 
-    // AF_NETLINK: allow SOCK_RAW and SOCK_DGRAM (they're equivalent for netlink).
+    // AF_NETLINK: only allow NETLINK_ROUTE (protocol 0).
+    //
+    // Netlink sockets use SOCK_RAW or SOCK_DGRAM (they're equivalent for netlink).
     // Netlink SOCK_RAW is NOT raw packet access — it's the standard way to query
     // routing tables, interface addresses, etc. via the kernel netlink interface.
-    // Many programs (glibc's getifaddrs, Go, Bun/Node) use this.
+    // Many programs (glibc's getifaddrs, Go, Bun/Node) use NETLINK_ROUTE.
+    //
+    // Other netlink protocols are dangerous or leak host information:
+    //   NETLINK_AUDIT (9)        — security audit subsystem
+    //   NETLINK_KOBJECT_UEVENT (15) — device hotplug events
+    //   NETLINK_CONNECTOR (11)   — kernel connector interface
+    //   NETLINK_SELINUX (7)      — SELinux event notifications
+    //   NETLINK_FIREWALL (3)     — iptables (deprecated)
+    //
+    // We restrict to NETLINK_ROUTE (0) which covers:
+    //   - Interface enumeration (getifaddrs)
+    //   - Routing table queries
+    //   - Address resolution
     if domain == AF_NETLINK {
-        tracing::debug!(
-            pid,
-            sock_type,
-            "socket: AF_NETLINK allowed (read-only kernel queries)"
-        );
-        return Verdict::Allow;
+        let protocol = args[2];
+        const NETLINK_ROUTE: u64 = 0;
+        if protocol == NETLINK_ROUTE {
+            tracing::debug!(
+                pid,
+                sock_type,
+                protocol,
+                "socket: AF_NETLINK NETLINK_ROUTE allowed"
+            );
+            return Verdict::Allow;
+        } else {
+            tracing::warn!(
+                pid,
+                sock_type,
+                protocol,
+                "socket: AF_NETLINK non-ROUTE protocol denied"
+            );
+            return Verdict::Deny(libc::EPERM as u32);
+        }
     }
 
     // Deny SOCK_RAW for all other domains (AF_INET, AF_INET6, etc.).
@@ -2744,18 +2793,42 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_socket_allows_af_netlink() {
+    fn evaluate_socket_allows_af_netlink_route() {
         let policy = NotifierPolicy::default();
+        // NETLINK_ROUTE (protocol 0) should be allowed with SOCK_DGRAM.
         let args = [AF_NETLINK, libc::SOCK_DGRAM as u64, 0, 0, 0, 0];
         match evaluate_socket(&args, 1234, &policy) {
             Verdict::Allow => {}
-            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK (read-only kernel queries)"),
+            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK NETLINK_ROUTE + SOCK_DGRAM"),
         }
-        // SOCK_RAW with AF_NETLINK should also be allowed (equivalent to SOCK_DGRAM).
+        // SOCK_RAW with AF_NETLINK + NETLINK_ROUTE should also be allowed.
         let args_raw = [AF_NETLINK, SOCK_RAW, 0, 0, 0, 0];
         match evaluate_socket(&args_raw, 1234, &policy) {
             Verdict::Allow => {}
-            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK + SOCK_RAW"),
+            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK NETLINK_ROUTE + SOCK_RAW"),
+        }
+    }
+
+    #[test]
+    fn evaluate_socket_denies_af_netlink_non_route() {
+        let policy = NotifierPolicy::default();
+        // NETLINK_AUDIT (protocol 9) should be denied.
+        let args_audit = [AF_NETLINK, libc::SOCK_DGRAM as u64, 9, 0, 0, 0];
+        match evaluate_socket(&args_audit, 1234, &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_AUDIT"),
+        }
+        // NETLINK_KOBJECT_UEVENT (protocol 15) should be denied.
+        let args_uevent = [AF_NETLINK, libc::SOCK_DGRAM as u64, 15, 0, 0, 0];
+        match evaluate_socket(&args_uevent, 1234, &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_KOBJECT_UEVENT"),
+        }
+        // NETLINK_CONNECTOR (protocol 11) should be denied.
+        let args_connector = [AF_NETLINK, libc::SOCK_DGRAM as u64, 11, 0, 0, 0];
+        match evaluate_socket(&args_connector, 1234, &policy) {
+            Verdict::Deny(_) => {}
+            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_CONNECTOR"),
         }
     }
 

@@ -15,6 +15,7 @@
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
+require_sudo
 header "SELinux MAC integration"
 
 # ---- Prerequisite: SELinux must be active ----
@@ -33,7 +34,7 @@ run_sudo_can() {
     tmpout=$(mktemp)
     tmperr=$(mktemp)
     RUN_EXIT=0
-    sudo "$CAN" "$@" >"$tmpout" 2>"$tmperr" || RUN_EXIT=$?
+    sudo -n "$CAN" "$@" >"$tmpout" 2>"$tmperr" || RUN_EXIT=$?
     RUN_STDOUT=$(cat "$tmpout")
     RUN_STDERR=$(cat "$tmperr")
     rm -f "$tmpout" "$tmperr"

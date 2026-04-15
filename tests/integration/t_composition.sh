@@ -46,14 +46,12 @@ assert_exit_code 0 "$RUN_EXIT"
 assert_eq "merged" "$RUN_STDOUT"
 
 # ---- Test 2: Name-based recipe lookup ----
-# The elixir recipe has allow_execve restrictions, so echo won't work.
-# We verify name resolution by checking that the error is about allow_execve
-# (meaning the recipe WAS found and loaded), not about "not found".
+# Verify name-based resolution by checking that the recipe was found and
+# loaded (recipe name appears in log output), and the command succeeds.
 begin_test "-r elixir resolves to recipes/elixir.toml"
 run_can run --recipe elixir -- echo "test"
-# We expect failure (allow_execve blocks echo), but the error should NOT
-# be "recipe not found" — it should be about the command whitelist.
-assert_contains "$RUN_STDERR" "allow_execve"
+assert_exit_code 0 "$RUN_EXIT"
+assert_contains "$RUN_STDERR" "elixir-dev"
 
 # ---- Test 3: Mixed name and path arguments ----
 begin_test "mixed name and path recipe arguments"
@@ -64,9 +62,10 @@ EOF
 )
 _TMPFILES+=("$RECIPE_EXTRA")
 # elixir recipe (by name) + extra overrides (by path). Both load and merge.
-# Still fails on allow_execve, but that proves both loaded.
+# The command succeeds, proving both recipes were resolved.
 run_can run --recipe elixir --recipe "$RECIPE_EXTRA" -- echo "test"
-assert_contains "$RUN_STDERR" "allow_execve"
+assert_exit_code 0 "$RUN_EXIT"
+assert_contains "$RUN_STDERR" "elixir-dev"
 
 # ---- Test 4: Unknown recipe name fails ----
 begin_test "unknown recipe name fails with helpful error"

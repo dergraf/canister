@@ -562,6 +562,31 @@ fn child_entry(
         }
     }
 
+    // Drop capabilities from the bounding set and clear effective/permitted.
+    //
+    // Inside a user namespace the process starts with ALL capabilities
+    // (CapEff=000001ffffffffff). While mitigated by seccomp and the user
+    // namespace boundary, defense-in-depth demands we drop everything we
+    // don't need. If any seccomp bypass is found, having no capabilities
+    // makes exploitation significantly harder.
+    //
+    // Must happen AFTER filesystem setup (needs CAP_SYS_ADMIN for mounts)
+    // and BEFORE seccomp filter installation. The worker only needs a
+    // minimal set after this point (the exec will reset caps anyway due to
+    // NO_NEW_PRIVS, but the bounding set limits what future children can
+    // acquire).
+    drop_capabilities();
+
+    // Apply default resource limits as a safety net.
+    //
+    // These provide baseline protection against fork bombs, memory exhaustion,
+    // and file descriptor exhaustion even when no explicit resource config is
+    // provided. Explicit config (e.g., max_pids) applied below can further
+    // tighten these limits.
+    if !monitor {
+        process::apply_default_resource_limits();
+    }
+
     // Apply process resource limits.
     if let Some(max_pids) = config.process.max_pids {
         if monitor {
@@ -742,6 +767,130 @@ fn set_pdeathsig(sig: libc::c_int) {
             error = %std::io::Error::last_os_error(),
             "failed to set PR_SET_PDEATHSIG"
         );
+    }
+}
+
+/// Drop all capabilities except the minimal set needed for sandbox operation.
+///
+/// Inside a user namespace the kernel grants ALL capabilities (CapEff has all
+/// bits set). This is by design — user namespaces grant "root" inside the
+/// namespace. However, once sandbox setup is complete (filesystem mounted,
+/// network configured), the worker process doesn't need these powers.
+///
+/// We drop capabilities in three layers:
+/// 1. **Bounding set**: `PR_CAPBSET_DROP` removes each capability from the
+///    bounding set. This limits what can be gained through `execve()`.
+/// 2. **Inheritable set**: cleared so children don't inherit capabilities.
+/// 3. **Ambient set**: cleared (PR_CAP_AMBIENT_CLEAR_ALL) so exec'd
+///    processes start with empty capabilities.
+///
+/// The effective and permitted sets are NOT explicitly cleared because
+/// `NO_NEW_PRIVS` is set and `execve()` will reset them based on the
+/// (now-empty) bounding set. Clearing them before exec would break
+/// the remaining setup steps (seccomp installation needs to work).
+fn drop_capabilities() {
+    // The last capability number as of Linux 6.x. We iterate up to this
+    // and ignore errors for caps the kernel doesn't know about.
+    // CAP_LAST_CAP can be read from /proc/sys/kernel/cap_last_cap but
+    // using a generous upper bound is simpler and safe (unknown caps just
+    // return EINVAL).
+    let cap_last = read_cap_last().unwrap_or(40);
+
+    let mut dropped = 0u32;
+    for cap in 0..=cap_last {
+        // SAFETY: PR_CAPBSET_DROP is safe with a valid capability number.
+        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        if ret == 0 {
+            dropped += 1;
+        }
+        // EINVAL means this cap doesn't exist on this kernel — ignore.
+    }
+
+    // Clear the ambient capability set (prevents capabilities from being
+    // inherited across execve without file capabilities).
+    // PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_CLEAR_ALL = 4
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+    unsafe {
+        libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    }
+
+    // Clear the inheritable set via capset(). The inheritable set controls
+    // which capabilities are preserved across execve for processes with
+    // matching file capabilities.
+    clear_inheritable_caps();
+
+    tracing::info!(dropped, cap_last, "dropped capabilities from bounding set");
+}
+
+/// Read the last valid capability number from the kernel.
+fn read_cap_last() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Clear the inheritable capability set using capset(2).
+///
+/// This prevents capabilities from being passed to child processes
+/// through the inheritable mechanism.
+fn clear_inheritable_caps() {
+    // Linux capability v3 structures (64-bit capability sets).
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // _LINUX_CAPABILITY_VERSION_3 = 0x20080522
+    let mut hdr = CapHeader {
+        version: 0x2008_0522,
+        pid: 0, // current process
+    };
+
+    // Two CapData structs for the v3 format (caps 0-31 and 32-63).
+    let mut data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+
+    // First read current caps.
+    let ret = unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) };
+    if ret != 0 {
+        tracing::debug!("capget failed, skipping inheritable clear");
+        return;
+    }
+
+    // Zero the inheritable sets but keep effective/permitted for now
+    // (the process still needs them for seccomp setup etc.).
+    data[0].inheritable = 0;
+    data[1].inheritable = 0;
+
+    let ret = unsafe { libc::syscall(libc::SYS_capset, &hdr as *const _, data.as_ptr()) };
+    if ret != 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "capset (clear inheritable) failed"
+        );
+    } else {
+        tracing::debug!("cleared inheritable capability set");
     }
 }
 
