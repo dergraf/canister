@@ -1842,6 +1842,21 @@ fn is_domain_allowed_by_policy(domain: &str, allowed_domains: &[String]) -> bool
     false
 }
 
+/// Format a DNS server IP address as a socket address string with port 53.
+///
+/// IPv6 addresses are wrapped in brackets per RFC 2732 so that
+/// `SocketAddr::from_str` and `UdpSocket::send_to` parse them correctly:
+///   - IPv4: `"10.0.0.1"` → `"10.0.0.1:53"`
+///   - IPv6: `"2001:db8::1"` → `"[2001:db8::1]:53"`
+fn dns_socket_addr(addr: &str) -> String {
+    if addr.contains(':') {
+        // IPv6 — must bracket to form a valid socket address.
+        format!("[{}]:53", addr)
+    } else {
+        format!("{}:53", addr)
+    }
+}
+
 /// When a `connect()` to an unknown IP is about to be denied, try resolving
 /// all allowed domains and check if the target IP matches any of them.
 ///
@@ -1866,7 +1881,7 @@ fn try_resolve_allowed_domains(
         return false;
     }
 
-    let dns_server = format!("{}:53", policy.dns_server_addr);
+    let dns_server = dns_socket_addr(&policy.dns_server_addr);
 
     for domain in &policy.allowed_domains {
         // Query A records (IPv4).
@@ -1906,7 +1921,7 @@ fn try_resolve_allowed_domains(
 /// Sends both A (IPv4) and AAAA (IPv6) queries and adds all resolved IPs
 /// to the dynamic allowlist.
 fn resolve_and_add(domain: &str, dynamic_allowlist: &DynamicAllowlist, dns_server_addr: &str) {
-    let dns_server = format!("{dns_server_addr}:53");
+    let dns_server = dns_socket_addr(dns_server_addr);
 
     let mut all_ips: Vec<IpAddr> = Vec::new();
 
@@ -1931,9 +1946,11 @@ fn resolve_and_add(domain: &str, dynamic_allowlist: &DynamicAllowlist, dns_serve
 /// Send a direct DNS query and parse the response.
 ///
 /// `qtype`: 1 = A (IPv4), 28 = AAAA (IPv6).
+/// `dns_server`: socket address in "ip:port" format (e.g., "10.0.0.1:53"
+/// or "[2001:db8::1]:53").
 /// Returns `None` on any error (timeout, parse failure, etc.).
 fn dns_query_direct(domain: &str, qtype: u16, dns_server: &str) -> Option<Vec<IpAddr>> {
-    use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
     use std::time::Duration;
 
     // Build the DNS query packet.
@@ -1967,9 +1984,18 @@ fn dns_query_direct(domain: &str, qtype: u16, dns_server: &str) -> Option<Vec<Ip
     packet.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
 
     // Send the query via UDP.
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Parse the server address to determine whether to bind an IPv4 or IPv6 socket.
+    // The dns_server string is already formatted by `dns_socket_addr()` — e.g.,
+    // "10.0.0.1:53" or "[2001:db8::1]:53".
+    let server_addr: SocketAddr = dns_server.parse().ok()?;
+    let bind_addr: SocketAddr = if server_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let socket = UdpSocket::bind(bind_addr).ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    socket.send_to(&packet, dns_server).ok()?;
+    socket.send_to(&packet, &server_addr).ok()?;
 
     // Read the response.
     let mut buf = [0u8; 512];
@@ -3855,5 +3881,36 @@ mod tests {
         // 192.0.2.1 is TEST-NET-1, should not resolve to example.com.
         let found = try_resolve_allowed_domains("192.0.2.1".parse().unwrap(), &policy, &al);
         assert!(!found, "TEST-NET IP should not match any allowed domain");
+    }
+
+    #[test]
+    fn dns_socket_addr_ipv4() {
+        assert_eq!(dns_socket_addr("10.0.0.1"), "10.0.0.1:53");
+        assert_eq!(dns_socket_addr("169.254.0.1"), "169.254.0.1:53");
+        assert_eq!(dns_socket_addr("8.8.8.8"), "8.8.8.8:53");
+    }
+
+    #[test]
+    fn dns_socket_addr_ipv6() {
+        assert_eq!(dns_socket_addr("2001:db8::1"), "[2001:db8::1]:53");
+        assert_eq!(dns_socket_addr("::1"), "[::1]:53");
+        assert_eq!(dns_socket_addr("fe80::1%eth0"), "[fe80::1%eth0]:53");
+    }
+
+    #[test]
+    fn dns_socket_addr_parses_as_socketaddr() {
+        use std::net::SocketAddr;
+
+        // IPv4 result must parse as a valid SocketAddr.
+        let v4 = dns_socket_addr("10.0.0.1");
+        let parsed: SocketAddr = v4.parse().expect("IPv4 dns_socket_addr should parse");
+        assert_eq!(parsed.port(), 53);
+        assert!(parsed.is_ipv4());
+
+        // IPv6 result must parse as a valid SocketAddr.
+        let v6 = dns_socket_addr("2001:db8::1");
+        let parsed: SocketAddr = v6.parse().expect("IPv6 dns_socket_addr should parse");
+        assert_eq!(parsed.port(), 53);
+        assert!(parsed.is_ipv6());
     }
 }

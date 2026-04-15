@@ -54,6 +54,18 @@ pub fn is_available() -> bool {
     which_pasta().is_some()
 }
 
+/// Detect whether IPv6 is disabled on the host.
+///
+/// Checks the kernel sysctl `net.ipv6.conf.all.disable_ipv6`.
+/// Returns `true` if IPv6 is explicitly disabled (value = "1").
+/// Returns `false` if IPv6 is enabled, the sysctl doesn't exist
+/// (very old kernels), or the file can't be read.
+pub fn is_ipv6_disabled() -> bool {
+    std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
 /// Find the pasta binary path.
 fn which_pasta() -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
@@ -231,6 +243,26 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
 
     // Auto-configure addresses, routes, and bring up the tap device.
     cmd.arg("--config-net");
+
+    // If the host has IPv6 disabled, tell pasta to skip IPv6 configuration.
+    // Without this, pasta may fail or emit errors when it tries to configure
+    // IPv6 addresses/routes on a kernel with net.ipv6.conf.all.disable_ipv6=1.
+    // Common on corporate RHEL/CentOS VMs with restrictive network policies.
+    //
+    // Guard behind pasta_supports_option() because older pasta versions
+    // (e.g., those shipped with RHEL8) don't recognize --ipv4-only and
+    // would exit immediately with an unknown-option error.
+    if is_ipv6_disabled() {
+        if pasta_supports_option("--ipv4-only") {
+            tracing::info!("IPv6 disabled on host, passing --ipv4-only to pasta");
+            cmd.arg("--ipv4-only");
+        } else {
+            tracing::warn!(
+                "IPv6 disabled on host but pasta does not support --ipv4-only; \
+                 pasta may fail to configure networking"
+            );
+        }
+    }
 
     // Set MTU for optimal performance.
     cmd.arg("--mtu").arg("65520");
@@ -488,5 +520,12 @@ mod tests {
             build_port_spec(&ports, PortProtocol::Tcp),
             Some("8080:80,8443:443".to_string())
         );
+    }
+
+    #[test]
+    fn is_ipv6_disabled_returns_bool() {
+        // Smoke test: just verify it doesn't panic and returns a bool.
+        // The actual value depends on the host's sysctl configuration.
+        let _result: bool = is_ipv6_disabled();
     }
 }
