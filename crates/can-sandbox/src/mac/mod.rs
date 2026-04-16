@@ -106,13 +106,16 @@ pub trait MACBackend {
 
     /// Generate the policy content for the given binary path.
     ///
-    /// Returns the primary policy file content (for display/review).
-    fn generate_policy(&self, bin_path: &str) -> String;
+    /// `pasta_path` is an optional explicit path to the pasta binary, used
+    /// to generate correct AppArmor `ux` rules for non-standard installations
+    /// (Nix, Homebrew, custom builds).
+    fn generate_policy(&self, bin_path: &str, pasta_path: Option<&str>) -> String;
 
     /// Install the canister policy.
     ///
     /// Must be run as root (typically via `sudo can setup`).
-    fn install_policy(&self, bin_path: &str) -> Result<(), SetupError>;
+    /// `pasta_path` is forwarded to `generate_policy`.
+    fn install_policy(&self, bin_path: &str, pasta_path: Option<&str>) -> Result<(), SetupError>;
 
     /// Remove the canister policy.
     ///

@@ -101,6 +101,14 @@ enum Commands {
         /// Useful after upgrading canister to pick up policy changes.
         #[arg(long, short)]
         force: bool,
+
+        /// Explicit path to the pasta binary for non-standard installations.
+        ///
+        /// When pasta is installed via Nix, Homebrew, or custom builds, sudo
+        /// may not find it in PATH. Use this to generate correct AppArmor rules:
+        ///   sudo can setup --pasta-path $(which pasta)
+        #[arg(long)]
+        pasta_path: Option<String>,
     },
 
     /// Manage and inspect recipes.
@@ -205,7 +213,11 @@ fn main() -> ExitCode {
             command,
         } => commands::run(&recipe, monitor, strict, &ports, command),
         Commands::Check => commands::check(),
-        Commands::Setup { remove, force } => commands::setup(remove, force),
+        Commands::Setup {
+            remove,
+            force,
+            pasta_path,
+        } => commands::setup(remove, force, pasta_path.as_deref()),
         Commands::Recipe { action } => match action {
             RecipeAction::List => recipes::list(),
             RecipeAction::Show { recipe, command } => commands::show(&recipe, command),

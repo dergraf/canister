@@ -680,7 +680,7 @@ pub fn check() -> Result<i32> {
 }
 
 /// Execute the `can setup` command.
-pub fn setup(remove: bool, force: bool) -> Result<i32> {
+pub fn setup(remove: bool, force: bool, pasta_path: Option<&str>) -> Result<i32> {
     if remove {
         return setup_remove();
     }
@@ -746,7 +746,7 @@ pub fn setup(remove: bool, force: bool) -> Result<i32> {
     println!("Binary path: {bin_path}");
 
     // Generate the policy for review.
-    let new_policy = backend.generate_policy(&bin_path);
+    let new_policy = backend.generate_policy(&bin_path, pasta_path);
 
     // Interactive mode: show the policy and ask for confirmation.
     let interactive = std::io::stdout().is_terminal();
@@ -771,7 +771,7 @@ pub fn setup(remove: bool, force: bool) -> Result<i32> {
     }
 
     // Install the policy.
-    match backend.install_policy(&bin_path) {
+    match backend.install_policy(&bin_path, pasta_path) {
         Ok(()) => {
             println!("\n{mac_name} policy installed successfully.");
             println!("Filesystem isolation is now enabled.");

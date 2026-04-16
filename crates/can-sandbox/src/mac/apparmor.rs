@@ -76,10 +76,10 @@ profile canister {bin_path} flags=(attach_disconnected) {
   #
   # pasta dispatches to an AVX2-optimized variant (pasta.avx2) on supported
   # CPUs, so both paths need unconfined exec rules.
-  allow ux /usr/bin/pasta,
-  allow ux /usr/bin/pasta.avx2,
-  allow ux /bin/pasta,
-  allow ux /bin/pasta.avx2,
+  #
+  # Rules are generated dynamically at install time to support pasta from
+  # non-standard paths (Nix, Homebrew, custom builds).
+{pasta_rules}
 
   include if exists <local/canister>
 }
@@ -137,12 +137,12 @@ impl MACBackend for AppArmorBackend {
         detect_profile_status()
     }
 
-    fn generate_policy(&self, bin_path: &str) -> String {
-        generate_profile(bin_path)
+    fn generate_policy(&self, bin_path: &str, pasta_path: Option<&str>) -> String {
+        generate_profile(bin_path, pasta_path)
     }
 
-    fn install_policy(&self, bin_path: &str) -> Result<(), SetupError> {
-        install_profile(bin_path)
+    fn install_policy(&self, bin_path: &str, pasta_path: Option<&str>) -> Result<(), SetupError> {
+        install_profile(bin_path, pasta_path)
     }
 
     fn remove_policy(&self) -> Result<(), SetupError> {
@@ -201,7 +201,10 @@ pub fn detect_profile_status() -> PolicyStatus {
             }
 
             // Check if the installed content matches what we'd generate.
-            let expected = generate_profile(&installed);
+            // Use None for pasta_path since we're just checking staleness
+            // against the currently installed profile — the exact pasta rules
+            // may vary between installs but that's handled by --force.
+            let expected = generate_profile(&installed, None);
             if content.trim() != expected.trim() {
                 return PolicyStatus::Stale {
                     bin_path: installed,
@@ -221,8 +224,85 @@ pub fn detect_profile_status() -> PolicyStatus {
 }
 
 /// Generate the AppArmor profile content for the given binary path.
-pub fn generate_profile(bin_path: &str) -> String {
-    PROFILE_TEMPLATE.replace("{bin_path}", bin_path)
+///
+/// If `pasta_path` is provided, it is used to generate AppArmor `ux` rules
+/// for pasta and its AVX2 variants. Standard system paths are always included.
+pub fn generate_profile(bin_path: &str, pasta_path: Option<&str>) -> String {
+    let pasta_rules = generate_pasta_rules(pasta_path);
+    PROFILE_TEMPLATE
+        .replace("{bin_path}", bin_path)
+        .replace("{pasta_rules}", &pasta_rules)
+}
+
+/// Well-known system paths where pasta may be installed.
+const STANDARD_PASTA_PATHS: &[&str] = &[
+    "/usr/bin/pasta",
+    "/usr/bin/pasta.avx2",
+    "/bin/pasta",
+    "/bin/pasta.avx2",
+];
+
+/// Generate AppArmor `ux` rules for pasta binaries.
+///
+/// When `pasta_path` is provided (via `--pasta-path`), resolves symlinks to
+/// find the real binary directory and adds `ux` rules for pasta, passt, and
+/// their AVX2 variants. Standard system paths are always included as fallback.
+///
+/// Usage: `sudo can setup --pasta-path $(which pasta)`
+fn generate_pasta_rules(pasta_path: Option<&str>) -> String {
+    let mut paths: Vec<String> = Vec::new();
+
+    // If the user provided an explicit pasta path, resolve it and discover
+    // all related binaries (pasta, passt, *.avx2) in the same directory.
+    if let Some(user_path) = pasta_path {
+        let candidate = std::path::Path::new(user_path);
+
+        // Add the path as given.
+        paths.push(user_path.to_string());
+
+        // Resolve symlinks to find the real binary and its directory.
+        // pasta → passt (symlink), and passt.avx2 lives alongside it.
+        if let Ok(resolved) = candidate.canonicalize() {
+            if let Some(real_dir) = resolved.parent() {
+                // Add all pasta/passt variants in the resolved directory.
+                if let Ok(entries) = std::fs::read_dir(real_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.starts_with("pasta")
+                            || name_str == "passt"
+                            || name_str == "passt.avx2"
+                        {
+                            if let Some(p) = entry.path().to_str() {
+                                paths.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also add the resolved path itself.
+            if let Some(s) = resolved.to_str() {
+                paths.push(s.to_string());
+            }
+        }
+    }
+
+    // Always include standard system paths as fallback.
+    for path in STANDARD_PASTA_PATHS {
+        paths.push((*path).to_string());
+    }
+
+    // Deduplicate and sort for deterministic output.
+    paths.sort();
+    paths.dedup();
+
+    // Generate `allow ux` rules.
+    paths
+        .iter()
+        .map(|p| format!("  allow ux {p},"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Check if the canister profile is loaded in the kernel.
@@ -269,8 +349,8 @@ fn extract_bin_path(content: &str) -> Option<String> {
 ///
 /// Writes the profile to `/etc/apparmor.d/canister` and loads it.
 /// Must be run as root (typically via `sudo can setup`).
-fn install_profile(bin_path: &str) -> Result<(), SetupError> {
-    let content = generate_profile(bin_path);
+fn install_profile(bin_path: &str, pasta_path: Option<&str>) -> Result<(), SetupError> {
+    let content = generate_profile(bin_path, pasta_path);
 
     // Try to write the profile directly.
     match std::fs::write(PROFILE_PATH, &content) {
@@ -383,7 +463,7 @@ mod tests {
 
     #[test]
     fn generate_profile_contains_binary_path() {
-        let profile = generate_profile("/usr/local/bin/can");
+        let profile = generate_profile("/usr/local/bin/can", None);
         assert!(profile.contains("profile canister /usr/local/bin/can flags="));
         assert!(profile.contains("allow mount,"));
         assert!(profile.contains("allow pivot_root,"));
@@ -393,7 +473,7 @@ mod tests {
 
     #[test]
     fn generate_profile_has_sandboxed_subprofile() {
-        let profile = generate_profile("/usr/bin/can");
+        let profile = generate_profile("/usr/bin/can", None);
         assert!(profile.contains("profile canister_sandboxed"));
         assert!(profile.contains("audit deny capability,"));
         assert!(profile.contains("audit deny mount,"));
@@ -403,15 +483,34 @@ mod tests {
         assert!(profile.contains("allow ptrace (readby tracedby) peer=canister,"));
         assert!(profile.contains("audit deny ptrace (read trace),"));
         assert!(profile.contains("deny dbus,"));
-        // Verify ux rules for pasta and apparmor_parser
+        // Verify ux rules for apparmor_parser
+        assert!(profile.contains("allow ux /usr/sbin/apparmor_parser,"));
+        // Standard pasta paths are always included as fallback
         assert!(profile.contains("allow ux /usr/bin/pasta,"));
         assert!(profile.contains("allow ux /usr/bin/pasta.avx2,"));
-        assert!(profile.contains("allow ux /usr/sbin/apparmor_parser,"));
+    }
+
+    #[test]
+    fn generate_pasta_rules_includes_standard_paths() {
+        let rules = generate_pasta_rules(None);
+        assert!(rules.contains("allow ux /usr/bin/pasta,"));
+        assert!(rules.contains("allow ux /usr/bin/pasta.avx2,"));
+        assert!(rules.contains("allow ux /bin/pasta,"));
+        assert!(rules.contains("allow ux /bin/pasta.avx2,"));
+    }
+
+    #[test]
+    fn generate_pasta_rules_with_explicit_path() {
+        // When an explicit path is provided, it should appear in the rules
+        // alongside the standard paths.
+        let rules = generate_pasta_rules(Some("/usr/bin/pasta"));
+        assert!(rules.contains("allow ux /usr/bin/pasta,"));
+        assert!(rules.contains("allow ux /bin/pasta,"));
     }
 
     #[test]
     fn extract_bin_path_from_generated_profile() {
-        let profile = generate_profile("/opt/canister/bin/can");
+        let profile = generate_profile("/opt/canister/bin/can", None);
         let extracted = extract_bin_path(&profile);
         assert_eq!(extracted.as_deref(), Some("/opt/canister/bin/can"));
     }
@@ -430,7 +529,7 @@ mod tests {
 
     #[test]
     fn generate_profile_braces_are_valid_apparmor() {
-        let profile = generate_profile("/usr/bin/can");
+        let profile = generate_profile("/usr/bin/can", None);
         assert!(!profile.contains("{{"));
         assert!(!profile.contains("}}"));
         assert!(profile.contains('{'));

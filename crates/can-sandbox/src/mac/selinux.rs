@@ -200,11 +200,11 @@ impl MACBackend for SELinuxBackend {
         detect_module_status()
     }
 
-    fn generate_policy(&self, bin_path: &str) -> String {
+    fn generate_policy(&self, bin_path: &str, _pasta_path: Option<&str>) -> String {
         generate_te(bin_path)
     }
 
-    fn install_policy(&self, bin_path: &str) -> Result<(), SetupError> {
+    fn install_policy(&self, bin_path: &str, _pasta_path: Option<&str>) -> Result<(), SetupError> {
         install_module(bin_path)
     }
 
