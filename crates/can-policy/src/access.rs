@@ -6,7 +6,7 @@ use ipnet::IpNet;
 
 use crate::config::{FilesystemConfig, NetworkConfig};
 
-/// Result of a whitelist check.
+/// Result of an access policy check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessDecision {
     /// Access is allowed by policy.

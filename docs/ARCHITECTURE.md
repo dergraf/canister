@@ -67,7 +67,7 @@ canister/
 │
 ├── can-policy     Policy engine. TOML config parsing, RecipeFile
 │                  merge logic, environment variable expansion
-│                  ($HOME, $USER, etc.), whitelist enforcement
+│                  ($HOME, $USER, etc.), access control enforcement
 │                  (path, domain, IP/CIDR), seccomp profile
 │                  definitions. Also contains the project manifest
 │                  module (manifest.rs) for canister.toml parsing,
@@ -375,11 +375,11 @@ namespace.
 The child gets its own mount table. The setup sequence:
 
 ```
-1.  mount("", "/", MS_SLAVE | MS_REC)     # stop propagation to host
+1.  mount("", "/", MS_SLAVE | MS_REC)     # break propagation to host
 2.  mount("tmpfs", new_root)               # empty tmpfs as new root
 3.  mkdir skeleton dirs                     # /bin, /lib, /usr, /proc, /dev, /tmp, ...
 4.  bind-mount essentials (read-only)       # from base.toml: /bin, /sbin, /usr/bin, ...
-5.  bind-mount whitelisted paths (RO)       # from merged [filesystem].allow (all recipes)
+5.  bind-mount allowed paths (RO)           # from merged [filesystem].allow (all recipes)
 5b. bind-mount CWD (read-write)            # host working directory, always mounted
 6.  mount /tmp (read-write)                 # ephemeral writable space
 7.  mount /proc                             # needed by many programs
@@ -477,12 +477,12 @@ host's real IP addresses, routes, and gateway into the namespace:
 └──────────────────────────────────┘
 ```
 
-Whitelisted domains are pre-resolved to IP addresses at startup (from the
+Allowed domains are pre-resolved to IP addresses at startup (from the
 parent, which still has host DNS access). These resolved IPs are passed to
 the USER_NOTIF supervisor, which intercepts `connect()` syscalls and validates
-the destination IP against the allowlist. A DNS proxy runs in the **parent
+the destination IP against the allow list. A DNS proxy runs in the **parent
 process** on an ephemeral port, filtering DNS queries to only resolve
-whitelisted domains. The sandbox's `/etc/resolv.conf` is configured to use
+allowed domains. The sandbox's `/etc/resolv.conf` is configured to use
 pasta's DNS address (`169.254.0.1:53`, set via `--dns`), which routes
 queries to the parent's DNS proxy via `--dns-forward`. This prevents
 DNS-based information exfiltration.
@@ -497,7 +497,7 @@ the specified ports are forwarded.
 **Security property:** In None mode, the process has zero network access.
 In Filtered mode, connectivity is routed through pasta, and the
 USER_NOTIF supervisor enforces IP-level connect() filtering against the
-allowed domain/IP whitelist. DNS queries are restricted to whitelisted
+allowed domain/IP list. DNS queries are restricted to allowed
 domains. In Full mode, there is no network isolation.
 
 ### 4. Seccomp BPF
@@ -529,7 +529,7 @@ only the main filter is installed.
 
 The baseline is embedded in the binary via `include_str!()` so it works
 standalone. At runtime, Canister searches for an external `default.toml` in
-`./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
+`./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
 `/etc/canister/recipes/`. If found, the external file takes precedence over
 the embedded copy. This lets users pin, audit, or version-control the
 baseline without recompiling.
@@ -688,7 +688,7 @@ via `[syscalls] notifier` in recipe config.
 subject to argument-level inspection. A sandboxed process cannot connect to
 unauthorized IPs, pass file descriptors via SCM_RIGHTS, create new namespaces
 via clone flags, open raw sockets, open AF_NETLINK sockets beyond NETLINK_ROUTE,
-or exec binaries outside the `allow_execve` whitelist.
+or exec binaries outside the `allow_execve` list.
 
 ### 5. Process Control
 
@@ -769,7 +769,7 @@ explicitly.
 
 **Security property:** Sensitive environment variables (API keys, tokens,
 credentials in `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, etc.) are never
-leaked to the sandbox unless explicitly whitelisted.
+leaked to the sandbox unless explicitly listed in `env_passthrough`.
 
 **`max_pids`** (`RLIMIT_NPROC`):
 
@@ -782,7 +782,7 @@ gets `EAGAIN` from `fork()`.
 
 **`allow_execve`** (pre-exec validation):
 
-The resolved command path is checked against the `allow_execve` whitelist
+The resolved command path is checked against the `allow_execve` list
 before forking. If the command is not in the list (and the list is non-empty),
 execution is rejected immediately.
 
@@ -798,7 +798,7 @@ level. Ongoing enforcement of every `execve()` call inside the sandbox is
 provided by the USER_NOTIF supervisor (see
 [Seccomp USER_NOTIF Supervisor](#4b-seccomp-user_notif-supervisor)), which
 intercepts `execve()` and `execveat()` syscalls and validates the pathname
-against the `allow_execve` whitelist. When the notifier is disabled (kernel
+against the `allow_execve` list. When the notifier is disabled (kernel
 < 5.9 or `notifier = false`), only the initial command is validated.
 
 ### 6. Cgroups v2

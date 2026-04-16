@@ -54,7 +54,7 @@ Canister ships a single default seccomp baseline defined in
 time via `include_str!()`, so it always works standalone. At runtime, the
 search path is checked for an external override:
 
-1. `./recipes/default.toml` (project-local)
+1. `./.canister/default.toml` (project-local)
 2. `$XDG_CONFIG_HOME/canister/recipes/default.toml` (per-user)
 3. `/etc/canister/recipes/default.toml` (system-wide)
 4. Embedded fallback (compiled into the binary)
@@ -352,7 +352,7 @@ DNS address (`169.254.0.1:53`), which is configured via `--dns-forward`
 to forward queries to the parent's DNS proxy. The proxy
 only resolves domains in the `allow_domains` list — all other queries receive
 an NXDOMAIN response. This prevents DNS-based information exfiltration and
-ensures the sandbox can only resolve whitelisted domains.
+ensures the sandbox can only resolve allowed domains.
 
 ### Configuration
 
@@ -411,7 +411,7 @@ To see exactly which syscalls the baseline allows/blocks, open
 `[syscalls] deny` is the deny set. The file is the single source of truth —
 it is embedded into the binary at compile time via `include_str!()` and can
 be overridden by placing a `default.toml` in the recipe search path
-(`./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
+(`./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
 
 `SeccompProfile::apply_overrides()` merges per-recipe `allow_extra` /
 `deny_extra` customizations on top of this baseline.

@@ -27,7 +27,7 @@ and syscall number. It **cannot**:
 
 This created three security gaps:
 
-- **connect() filtering**: Whitelisted domains were pre-resolved to IPs at
+- **connect() filtering**: Allowed domains were pre-resolved to IPs at
   startup, but the resolved IPs were never used to filter actual `connect()`
   calls. The sandbox in filtered network mode could connect to any IP
   reachable via pasta.
@@ -188,7 +188,7 @@ suspends the syscall, the latter allows it through).
 - `socket()` cannot create `AF_NETLINK` or `SOCK_RAW` sockets (prevents
   netlink-based configuration manipulation and raw packet injection)
 - DNS proxy integration ensures sandboxed processes can only resolve
-  whitelisted domains
+  allowed domains
 
 ### Negative
 - Adds a supervisor thread and fd passing protocol (increased complexity)

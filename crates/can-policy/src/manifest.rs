@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::config::{
@@ -34,7 +35,7 @@ use crate::config::{
 ///
 /// Contains a map of named sandbox definitions. The first-defined
 /// sandbox is the default when `can up` is invoked without a name.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Named sandbox definitions.
@@ -48,7 +49,7 @@ pub struct Manifest {
 ///
 /// Each sandbox declares which recipes to compose and the command to run,
 /// with optional overrides that merge on top of the composed recipes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxDef {
     /// Human-readable description.

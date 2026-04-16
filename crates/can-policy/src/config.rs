@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Top-level sandbox configuration.
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// This is the resolved, validated form used by the sandbox runtime.
 /// All `Option` fields are guaranteed to be `Some` after resolution
 /// via `RecipeFile::into_sandbox_config()`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// Strict mode: fail hard instead of degrading gracefully.
@@ -42,7 +43,7 @@ pub struct SandboxConfig {
     pub syscalls: SyscallConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
     /// Paths the sandboxed process is allowed to access (read-only).
@@ -75,7 +76,7 @@ pub struct FilesystemConfig {
 }
 
 /// Protocol for port forwarding.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PortProtocol {
     #[default]
@@ -101,7 +102,7 @@ impl fmt::Display for PortProtocol {
 /// - `8080:80/udp` — UDP, host 8080 → container 80
 /// - `127.0.0.1:8080:80` — TCP, bind to 127.0.0.1, host 8080 → container 80
 /// - `8080:8080` or just `8080` (shorthand) — TCP, same port both sides
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PortMapping {
     /// Optional IP address to bind on the host side.
@@ -206,14 +207,14 @@ impl PortMapping {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Whitelisted domain names (resolved via internal DNS proxy).
+    /// Allowed domain names (resolved via internal DNS proxy).
     #[serde(default)]
     pub allow_domains: Vec<String>,
 
-    /// Whitelisted IP addresses or CIDR ranges.
+    /// Allowed IP addresses or CIDR ranges.
     #[serde(default)]
     pub allow_ips: Vec<String>,
 
@@ -241,7 +242,7 @@ impl NetworkConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Maximum number of child PIDs allowed.
@@ -257,7 +258,7 @@ pub struct ProcessConfig {
     pub env_passthrough: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceConfig {
     /// Memory limit in megabytes.
@@ -274,7 +275,7 @@ pub struct ResourceConfig {
 ///   syscalls are allowed. This is the secure choice for production/CI.
 /// - **DenyList**: default action is ALLOW. Only explicitly listed syscalls
 ///   are blocked. More permissive, useful when compatibility is paramount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeccompMode {
     /// Default deny — only allow-listed syscalls are permitted.
@@ -305,7 +306,7 @@ impl fmt::Display for SeccompMode {
 ///
 /// A recipe MUST NOT mix absolute and relative fields. If both are present,
 /// parsing succeeds but `validate()` returns an error.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SyscallConfig {
     /// Seccomp enforcement mode: "allow-list" (default) or "deny-list".
@@ -421,7 +422,7 @@ pub enum ConfigError {
 /// Recipes are the primary user-facing policy format. They compose a
 /// complete sandbox policy by layering filesystem, network, process,
 /// resource, and syscall rules on top of the single built-in baseline.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeMeta {
     /// Human-readable recipe name. Defaults to the filename stem when omitted.
@@ -454,7 +455,7 @@ pub struct RecipeMeta {
 /// Recipes support composition via `merge()` — multiple recipes are
 /// layered left-to-right with `Option` fields using last-wins-if-set
 /// semantics and `Vec` fields using union semantics.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeFile {
     /// Recipe metadata (optional).

@@ -174,12 +174,12 @@ declare dependencies.
 Recipe names in `recipes = [...]` resolve through the existing search path
 (ADR-0002):
 
-1. `./recipes/` — project-local recipes (a project can ship custom recipes)
+1. `./.canister/` — project-local recipes (a project can ship custom recipes)
 2. `$XDG_CONFIG_HOME/canister/recipes/` — user-installed recipes
 3. Embedded fallbacks in the binary (base.toml, default.toml)
 
 This means a project can override a shipped recipe by placing a modified
-version in its `./recipes/` directory — useful for security-hardened variants.
+version in its `./.canister/` directory — useful for security-hardened variants.
 
 **Manifest discovery:**
 

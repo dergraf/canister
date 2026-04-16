@@ -76,7 +76,7 @@ policies on top.
 2. `--profile NAME` overrides the baseline from the file
 3. No `--recipe` flag: default deny-all policy with generic baseline
 
-**Recipe discovery:** `can recipes` searches `./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`,
+**Recipe discovery:** `can recipes` searches `./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`,
 and `/etc/canister/recipes/`. The `--recipe` flag takes a file path (not a name). Name-based
 lookup is deferred to Phase 2.
 
@@ -166,7 +166,7 @@ The single default baseline was originally defined as Rust constants (`ALLOW_BAS
 **What changed:**
 - `recipes/default.toml` is the single source of truth for the baseline (~130 allow, 16 deny)
 - The file is embedded in the binary via `include_str!()` as a compile-time fallback
-- At runtime, Canister searches `./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
+- At runtime, Canister searches `./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`, and
   `/etc/canister/recipes/` for an external `default.toml`. External file takes precedence.
 - `SyscallConfig` now has absolute `allow`/`deny` fields (used only by `default.toml`) in
   addition to the relative `allow_extra`/`deny_extra` (used by regular recipes). The two

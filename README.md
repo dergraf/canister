@@ -25,8 +25,8 @@ runtime dependencies.
 $ can run --recipe recipes/example.toml -- python3 untrusted_script.py
 ```
 
-The script sees an empty filesystem (except explicitly whitelisted paths), can
-only reach whitelisted domains, and is blocked from dangerous syscalls like
+The script sees an empty filesystem (except explicitly allowed paths), can
+only reach allowed domains, and is blocked from dangerous syscalls like
 `mount`, `ptrace`, and `reboot`. When it exits, all filesystem writes are
 discarded.
 
@@ -36,10 +36,10 @@ discarded.
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Project manifests** -- define named sandboxes in `canister.toml` and run them with `can up`; recipes declared per-sandbox, overrides for filesystem/network/syscalls, dry-run preview
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
-- **Network isolation** -- three modes: no network, filtered (domain/IP whitelist via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
+- **Network isolation** -- three modes: no network, filtered (domain/IP allow list via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~187 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
 - **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `sendmsg()` (blocks SCM_RIGHTS fd passing), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw sockets, restrict AF_NETLINK to NETLINK_ROUTE only), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
-- **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve whitelisting with prefix rules (`/nix/store/*`)
+- **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve allow list with prefix rules (`/nix/store/*`)
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
 - **Credential protection** -- recipes explicitly deny sensitive paths (`$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`, etc.); cargo credentials excluded from the cargo recipe via deny rules
 - **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
@@ -157,7 +157,7 @@ can run -- echo "hello from the sandbox"
 # With a recipe file (path)
 can run --recipe recipes/example.toml -- python3 script.py
 
-# With a recipe by name (searches ./recipes/, $XDG_CONFIG_HOME/canister/recipes/, /etc/canister/recipes/)
+# With a recipe by name (searches ./.canister/, $XDG_CONFIG_HOME/canister/recipes/, /etc/canister/recipes/)
 can run -r elixir -- mix test
 
 # Compose multiple recipes -- merged left-to-right
@@ -266,7 +266,7 @@ Canister combines ten Linux isolation mechanisms:
 
 4. **Network namespace + pasta** -- in filtered mode, the sandbox gets
    its own network stack. `pasta` (from passt) provides user-mode TCP/IP by
-   mirroring the host's network configuration into the namespace. Whitelisted
+   mirroring the host's network configuration into the namespace. Allowed
    domains are pre-resolved to IPs at startup.
 
 5. **Seccomp BPF** -- a Berkeley Packet Filter program is loaded right before
@@ -321,7 +321,7 @@ can run -r nix -r elixir -- mix test
 **Composition order:** `base.toml` → auto-detected recipes → explicit `--recipe` args.
 
 **Name-based lookup:** `-r nix` resolves to `nix.toml` in the recipe search path
-(`./recipes/`, `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
+(`./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
 If the argument contains `/` or `.toml`, it's treated as a file path.
 
 **Auto-detection:** Recipes declare `match_prefix` patterns in `[recipe]` metadata.
@@ -460,7 +460,7 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 
 - Kernel exploits (no sandbox can)
 - Side-channel attacks (timing, cache)
-- Attacks within the allowed surface (if you whitelist `/`, there's no filesystem isolation)
+- Attacks within the allowed surface (if you allow `/`, there's no filesystem isolation)
 
 ## Threat Model
 

@@ -60,8 +60,8 @@ pub enum NamespaceError {
 ///
 /// The protocol between parent, child, and grandchild:
 ///
-/// 1. Parent validates command against `allow_execve` whitelist
-/// 2. Parent pre-resolves DNS for whitelisted domains (if filtered network)
+/// 1. Parent validates command against `allow_execve` list
+/// 2. Parent pre-resolves DNS for allowed domains (if filtered network)
 /// 3. Parent forks → child
 /// 4. Child calls `unshare(CLONE_NEWUSER | CLONE_NEWPID [| CLONE_NEWNET])` atomically
 /// 5. Child signals parent via pipe that namespaces are created
@@ -84,7 +84,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let command_path =
         resolve_command(&opts.command).map_err(|_| NamespaceError::Exec(nix::Error::ENOENT))?;
 
-    // Validate the command against the allow_execve whitelist before forking.
+    // Validate the command against the allow_execve list before forking.
     // In monitor mode, log the violation but allow it through.
     if opts.monitor {
         if let Err(e) = process::validate_execve(&command_path, &opts.config.process) {
@@ -115,7 +115,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     // Determine whether to enable the seccomp notifier.
     let notifier_enabled = resolve_notifier_enabled(&opts.config.syscalls, opts.monitor);
 
-    // Pre-resolve whitelisted domains to IPs BEFORE forking.
+    // Pre-resolve allowed domains to IPs BEFORE forking.
     // Both parent and child need the resolved IPs: the parent for reference,
     // the child to build the NotifierPolicy for the supervisor.
     // Done here (before fork) so the child inherits the results.
@@ -123,11 +123,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
             let resolved = can_net::resolve_allowed_domains(&opts.config.network);
             if resolved.is_empty() {
-                tracing::warn!("could not resolve any whitelisted domains to IPs");
+                tracing::warn!("could not resolve any allowed domains to IPs");
             } else {
                 tracing::info!(
                     count = resolved.len(),
-                    "pre-resolved whitelisted domains to IPs"
+                    "pre-resolved allowed domains to IPs"
                 );
                 for (domain, ips) in &resolved {
                     tracing::debug!(domain, ips = ?ips, "resolved");

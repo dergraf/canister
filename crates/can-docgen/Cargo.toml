@@ -1,0 +1,20 @@
+[package]
+name = "can-docgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Documentation generator for Canister — extracts CLI, config schema, recipes, and merge semantics"
+
+[[bin]]
+name = "can-docgen"
+path = "src/main.rs"
+
+[dependencies]
+can-policy.workspace = true
+clap.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json = "1"
+toml.workspace = true
+anyhow.workspace = true

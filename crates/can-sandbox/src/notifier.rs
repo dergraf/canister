@@ -1043,7 +1043,7 @@ fn evaluate_connect(
     let addr_ptr = notif.data.args[1];
     let addr_len = notif.data.args[2] as usize;
 
-    // Sanity check addr_len.
+    // Validate addr_len.
     if !(2..=128).contains(&addr_len) {
         tracing::warn!(pid, addr_len, "connect: suspicious addr_len, denying");
         return Verdict::Deny(libc::EPERM as u32);
@@ -1295,7 +1295,7 @@ fn evaluate_sendto(
         return Verdict::Allow;
     }
 
-    // Sanity check addr_len.
+    // Validate addr_len.
     if !(2..=128).contains(&addr_len) {
         tracing::warn!(pid, addr_len, "sendto: suspicious addr_len, denying");
         return Verdict::Deny(libc::EPERM as u32);
@@ -1522,7 +1522,7 @@ fn evaluate_sendmsg(
         return Verdict::Allow;
     }
 
-    // Sanity check.
+    // Validate.
     if !(2..=128).contains(&msg_namelen) {
         tracing::warn!(pid, msg_namelen, "sendmsg: suspicious msg_namelen, denying");
         return Verdict::Deny(libc::EPERM as u32);
@@ -2461,7 +2461,7 @@ pub fn policy_from_config(
     let mut allowed_ips: HashSet<IpAddr> = HashSet::new();
     let mut allowed_cidrs: Vec<(IpAddr, u8)> = Vec::new();
 
-    // Add pre-resolved IPs from whitelisted domains.
+    // Add pre-resolved IPs from allowed domains.
     for (_domain, ips) in resolved_ips {
         for ip in ips {
             allowed_ips.insert(*ip);

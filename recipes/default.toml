@@ -5,7 +5,7 @@
 # include_str!() as a fallback, but can be overridden by placing a
 # default.toml in the recipe search path:
 #
-#   1. ./recipes/default.toml              (project-local)
+#   1. ./.canister/default.toml              (project-local)
 #   2. $XDG_CONFIG_HOME/canister/recipes/  (per-user)
 #   3. /etc/canister/recipes/              (system-wide)
 #

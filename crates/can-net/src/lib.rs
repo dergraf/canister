@@ -104,7 +104,7 @@ impl Drop for NetworkState {
     }
 }
 
-/// Pre-resolve whitelisted domains to their IP addresses.
+/// Pre-resolve allowed domains to their IP addresses.
 ///
 /// This is done in the parent process before sandboxing, so the results
 /// can be used to build an IP allow-set for seccomp filtering.
@@ -121,14 +121,14 @@ pub fn resolve_allowed_domains(config: &NetworkConfig) -> Vec<(String, Vec<IpAdd
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
                 if !ips.is_empty() {
-                    tracing::debug!(domain, ips = ?ips, "resolved whitelisted domain");
+                    tracing::debug!(domain, ips = ?ips, "resolved allowed domain");
                     results.push((domain.clone(), ips));
                 } else {
-                    tracing::warn!(domain, "whitelisted domain resolved to no addresses");
+                    tracing::warn!(domain, "allowed domain resolved to no addresses");
                 }
             }
             Err(e) => {
-                tracing::warn!(domain, error = %e, "failed to resolve whitelisted domain");
+                tracing::warn!(domain, error = %e, "failed to resolve allowed domain");
             }
         }
     }

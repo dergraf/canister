@@ -1,7 +1,7 @@
 //! Filesystem isolation for the sandbox.
 //!
 //! Creates an ephemeral root filesystem using tmpfs and bind mounts.
-//! The sandboxed process gets a minimal filesystem with only whitelisted
+//! The sandboxed process gets a minimal filesystem with only explicitly allowed
 //! paths visible. All writes go to tmpfs and are discarded on exit.
 //!
 //! # Approach
@@ -12,14 +12,14 @@
 //!
 //! 1. Mount a tmpfs as the new root
 //! 2. Create a minimal directory skeleton (`/bin`, `/lib`, `/usr`, `/tmp`, etc.)
-//! 3. Bind-mount whitelisted host paths read-only into the new root
+//! 3. Bind-mount allowed host paths read-only into the new root
 //! 4. Mount a fresh `/proc` (for PID namespace)
 //! 5. `pivot_root` to swap to the new root
 //! 6. Unmount the old root
 //!
 //! This gives us:
 //! - **Ephemeral writes**: anything written to tmpfs vanishes on exit
-//! - **Minimal surface**: only whitelisted paths are visible
+//! - **Minimal surface**: only allowed paths are visible
 //! - **No root required**: works in unprivileged user namespaces
 
 use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ fn is_permission_error(err: nix::Error) -> bool {
 /// This must be called from within the child process, after namespaces
 /// have been created and UID/GID maps written.
 ///
-/// Creates a tmpfs root, bind-mounts whitelisted paths (which now include
+/// Creates a tmpfs root, bind-mounts allowed paths (which now include
 /// essential OS paths from base.toml), mounts /proc, and does pivot_root.
 /// If `host_cwd` is provided, it is bind-mounted writable into the sandbox
 /// and the process chdir's there after pivot_root.
@@ -128,8 +128,8 @@ pub fn setup_filesystem(
 ) -> Result<(), OverlayError> {
     let sandbox_root = PathBuf::from("/tmp/canister-root");
 
-    // 0. Break mount propagation. First make slave (allowed from shared),
-    //    then make private. This prevents mounts from propagating back to
+    // 0. Break mount propagation. Make the mount tree subordinate (MS_SLAVE)
+    //    then private. This prevents mounts from propagating back to
     //    the host and is required for mount operations in a user namespace.
     mount(
         None::<&str>,
@@ -139,7 +139,7 @@ pub fn setup_filesystem(
         None::<&str>,
     )
     .map_err(|source| OverlayError::Mount {
-        path: "/ (make slave)".to_string(),
+        path: "/ (subordinate)".to_string(),
         source,
     })?;
 
@@ -152,11 +152,11 @@ pub fn setup_filesystem(
     // 3. Create the directory skeleton.
     create_skeleton(&sandbox_root)?;
 
-    // 4. Bind-mount all whitelisted paths (read-only).
+    // 4. Bind-mount all allowed paths (read-only).
     //    This includes essential OS paths (from base.toml), auto-detected
     //    package manager paths, and user-specified paths — all merged into
     //    config.allow via recipe composition.
-    bind_mount_whitelist(&sandbox_root, config)?;
+    bind_mount_allowed(&sandbox_root, config)?;
 
     // 4b. Bind-mount writable paths.
     //     These are paths the sandboxed process must write to (e.g., database
@@ -233,7 +233,7 @@ fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
     Ok(())
 }
 
-/// Bind-mount whitelisted paths into the sandbox.
+/// Bind-mount allowed paths into the sandbox.
 ///
 /// This handles all paths in `config.allow`, which includes:
 /// - Essential OS paths (from base.toml)
@@ -241,17 +241,17 @@ fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
 /// - User-specified paths (from explicit recipe arguments)
 ///
 /// All are merged into a single list via recipe composition.
-fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
+fn bind_mount_allowed(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
     for source in &config.allow {
         if !source.exists() {
-            tracing::warn!(path = %source.display(), "whitelist path not found, skipping");
+            tracing::warn!(path = %source.display(), "allowed path not found, skipping");
             continue;
         }
 
         // Check if this path is denied.
         let denied = config.deny.iter().any(|d| source.starts_with(d));
         if denied {
-            tracing::warn!(path = %source.display(), "whitelist path is also in deny list, skipping");
+            tracing::warn!(path = %source.display(), "allowed path is also in deny list, skipping");
             continue;
         }
 
@@ -269,7 +269,7 @@ fn bind_mount_whitelist(root: &Path, config: &FilesystemConfig) -> Result<(), Ov
         }
 
         bind_mount_ro(source, &target)?;
-        tracing::debug!(source = %source.display(), target = %target.display(), "whitelisted path mounted");
+        tracing::debug!(source = %source.display(), target = %target.display(), "allowed path mounted");
     }
     Ok(())
 }
@@ -347,27 +347,55 @@ fn mask_files(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError
             continue;
         }
 
-        match mount(
-            Some(&dev_null),
-            &target,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        ) {
-            Ok(()) => {
-                tracing::info!(
-                    path = %path.display(),
-                    target = %target.display(),
-                    "masked file (bind /dev/null)"
-                );
+        if target.is_dir() {
+            // Mask directories by mounting an empty tmpfs over them, making
+            // the contents invisible to the sandboxed process.
+            match mount(
+                None::<&str>,
+                &target,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                Some("size=0"),
+            ) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        target = %target.display(),
+                        "masked directory (empty tmpfs)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        target = %target.display(),
+                        error = %e,
+                        "failed to mask directory (non-fatal)"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    target = %target.display(),
-                    error = %e,
-                    "failed to mask file (non-fatal)"
-                );
+        } else {
+            match mount(
+                Some(&dev_null),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        target = %target.display(),
+                        "masked file (bind /dev/null)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        target = %target.display(),
+                        error = %e,
+                        "failed to mask file (non-fatal)"
+                    );
+                }
             }
         }
     }

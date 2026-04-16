@@ -8,7 +8,7 @@
 # auto-detected recipes, and explicit --recipe arguments.
 #
 # Override: Place a base.toml in $XDG_CONFIG_HOME/canister/recipes/ or
-# ./recipes/ to customize. The embedded copy is used as fallback.
+# ./.canister/ to customize. The embedded copy is used as fallback.
 
 [recipe]
 name = "base"

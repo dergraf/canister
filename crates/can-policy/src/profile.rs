@@ -81,7 +81,7 @@ impl SeccompProfile {
     /// Resolve and return the default baseline.
     ///
     /// Search order:
-    /// 1. `./recipes/default.toml` (project-local)
+    /// 1. `./.canister/default.toml` (project-local)
     /// 2. `$XDG_CONFIG_HOME/canister/recipes/default.toml` (per-user)
     /// 3. `/etc/canister/recipes/default.toml` (system-wide)
     /// 4. Embedded fallback (compiled into the binary)
@@ -184,7 +184,7 @@ impl SeccompProfile {
 /// Resolve the base recipe (essential OS mounts).
 ///
 /// Search order (same as `default.toml`):
-/// 1. `./recipes/base.toml` (project-local)
+/// 1. `./.canister/base.toml` (project-local)
 /// 2. `$XDG_CONFIG_HOME/canister/recipes/base.toml` (per-user)
 /// 3. `/etc/canister/recipes/base.toml` (system-wide)
 /// 4. Embedded fallback (compiled into the binary)
@@ -207,7 +207,7 @@ pub fn resolve_base() -> Result<RecipeFile, ConfigError> {
 ///
 /// This is also used by `can-cli` for recipe discovery.
 pub fn baseline_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("recipes")];
+    let mut dirs = vec![PathBuf::from(".canister")];
 
     // XDG_CONFIG_HOME, defaulting to ~/.config
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn resolve_baseline_returns_embedded_when_no_external() {
-        // In test environment, there may or may not be a ./recipes/default.toml.
+        // In test environment, there may or may not be a ./.canister/default.toml.
         // We just verify it doesn't error.
         let resolved = SeccompProfile::resolve_baseline().unwrap();
         assert!(resolved.profile.allow_syscalls.len() > 100);

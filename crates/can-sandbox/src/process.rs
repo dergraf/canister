@@ -8,8 +8,8 @@
 //! - **PID namespace**: enter a new PID namespace via inner fork so the
 //!   sandboxed process tree is isolated (child becomes PID 1).
 //! - **`max_pids`**: set `RLIMIT_NPROC` to cap the number of processes.
-//! - **`allow_execve`**: validate the initial command path against the whitelist.
-//!   When the whitelist is non-empty, also block `execve`/`execveat` via seccomp
+//! - **`allow_execve`**: validate the initial command path against the allow list.
+//!   When the allow list is non-empty, also block `execve`/`execveat` via seccomp
 //!   for child processes (the initial exec is allowed after validation).
 
 use std::ffi::CString;
@@ -20,7 +20,7 @@ use can_policy::config::ProcessConfig;
 /// Errors from process control operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
-    #[error("command not in allow_execve whitelist: {0}")]
+    #[error("command not in allow_execve list: {0}")]
     ExecNotAllowed(String),
 
     #[error("failed to set RLIMIT_NPROC: {0}")]
@@ -93,7 +93,7 @@ pub fn filter_environment(config: &ProcessConfig) -> Vec<CString> {
     env
 }
 
-/// Validate that the resolved command path is in the `allow_execve` whitelist.
+/// Validate that the resolved command path is in the `allow_execve` list.
 ///
 /// If `allow_execve` is empty, all commands are allowed (no restriction).
 /// If non-empty, the command's canonical path must match one of the entries.
@@ -133,7 +133,7 @@ pub fn validate_execve(command_path: &Path, config: &ProcessConfig) -> Result<()
             if canonical == allowed_canonical {
                 tracing::debug!(
                     path = %canonical.display(),
-                    "command allowed by allow_execve whitelist"
+                    "command allowed by allow_execve list"
                 );
                 return Ok(());
             }
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_execve_empty_whitelist_allows_all() {
+    fn validate_execve_empty_allow_list_permits_all() {
         let config = ProcessConfig {
             max_pids: None,
             allow_execve: vec![],

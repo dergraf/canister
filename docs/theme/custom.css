@@ -1,0 +1,18 @@
+/* Custom theme for Canister docs */
+
+:root {
+    --content-max-width: 900px;
+}
+
+/* Improve table readability */
+table {
+    font-size: 0.9em;
+}
+
+table th {
+    background-color: var(--table-header-bg);
+}
+
+table td code {
+    white-space: nowrap;
+}

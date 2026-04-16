@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Policy engine: config parsing, whitelist enforcement, seccomp profiles"
+description = "Policy engine: config parsing, access control enforcement, seccomp profiles"
 
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+schemars.workspace = true
 toml.workspace = true
 tracing.workspace = true
 ipnet.workspace = true

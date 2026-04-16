@@ -319,6 +319,16 @@ pub fn up(
     // security policy. This is the core anti-detection mechanism.
     config.filesystem.mask.push(manifest_path.clone());
 
+    // Auto-mask .canister/ directory so local recipes are not visible
+    // inside the sandbox.
+    let canister_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(".canister");
+    if canister_dir.is_dir() {
+        config.filesystem.mask.push(canister_dir);
+    }
+
     // Apply CLI --port flags.
     for port_str in port_args {
         let mapping = can_policy::PortMapping::parse(port_str)
@@ -525,6 +535,13 @@ pub fn run(
         let manifest_in_cwd = cwd.join(can_policy::MANIFEST_FILENAME);
         if manifest_in_cwd.is_file() {
             config.filesystem.mask.push(manifest_in_cwd);
+        }
+
+        // Auto-mask .canister/ directory so local recipes are not visible
+        // inside the sandbox.
+        let canister_dir = cwd.join(".canister");
+        if canister_dir.is_dir() {
+            config.filesystem.mask.push(canister_dir);
         }
     }
 

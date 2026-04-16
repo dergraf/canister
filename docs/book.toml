@@ -1,0 +1,19 @@
+[book]
+title = "Canister Documentation"
+description = "Linux sandboxing made practical"
+authors = ["Canister Contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/dergraf/canister"
+additional-css = ["theme/custom.css"]
+
+[output.html.search]
+enable = true

@@ -209,7 +209,7 @@ The `-r` argument is resolved as follows:
 
 1. If the argument contains `/` or ends with `.toml`, treat as a **file path**.
 2. Otherwise, search for `<name>.toml` in the recipe search path:
-   - `./recipes/`
+   - `./.canister/`
    - `$XDG_CONFIG_HOME/canister/recipes/`
    - `/etc/canister/recipes/`
 3. First match wins (project-local takes precedence over user-global).
@@ -340,7 +340,7 @@ sandbox. Each package manager has a recipe with `match_prefix` patterns:
 
 **Security note:** Auto-detection makes the prefix *visible* inside the
 sandbox but does not grant execution permission. The `[process] allow_execve`
-whitelist independently controls what binaries can be executed. Package
+list independently controls what binaries can be executed. Package
 manager recipes include `allow_execve` prefix rules (e.g., `/nix/store/*`)
 to authorize execution within the mounted tree.
 
@@ -357,8 +357,8 @@ explicitly allowed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allow_domains` | `string[]` | `[]` | Whitelisted domain names |
-| `allow_ips` | `string[]` | `[]` | Whitelisted IPs or CIDR ranges (IPv4 and IPv6) |
+| `allow_domains` | `string[]` | `[]` | Allowed domain names |
+| `allow_ips` | `string[]` | `[]` | Allowed IPs or CIDR ranges (IPv4 and IPv6) |
 | `deny_all` | `bool` | `true` | Deny all network except explicitly allowed |
 | `ports` | `string[]` | `[]` | Port forwarding specs (`[ip:]hostPort:containerPort[/protocol]`) |
 
@@ -483,7 +483,7 @@ user).
 **`allow_execve` validation:**
 
 When non-empty, the resolved command path must match one of the listed paths.
-If the command is not whitelisted, execution is rejected before forking.
+If the command is not in the allow list, execution is rejected before forking.
 
 **Prefix rules:** Entries ending in `/*` match any binary under that
 directory tree. For example, `/nix/store/*` allows any binary whose resolved
@@ -552,7 +552,7 @@ Customizes the seccomp BPF baseline and enforcement mode.
 Canister ships a single default seccomp baseline defined in
 `recipes/default.toml` (~187 allowed syscalls, ~18 always-denied). The
 baseline is embedded in the binary at compile time and can be overridden by
-placing a `default.toml` in the recipe search path (`./recipes/`,
+placing a `default.toml` in the recipe search path (`./.canister/`,
 `$XDG_CONFIG_HOME/canister/recipes/`, `/etc/canister/recipes/`).
 
 Regular recipes customize the baseline by adding or removing syscalls with

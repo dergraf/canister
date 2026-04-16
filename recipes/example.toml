@@ -25,9 +25,9 @@ allow = []
 deny = ["/etc/shadow", "/root"]
 
 [network]
-# Whitelisted domains (resolved via internal DNS proxy).
+# Allowed domains (resolved via internal DNS proxy).
 allow_domains = ["pypi.org", "files.pythonhosted.org"]
-# Whitelisted IPs or CIDRs.
+# Allowed IPs or CIDRs.
 allow_ips = []
 # Default-deny all network access except listed above.
 deny_all = true

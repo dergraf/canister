@@ -10,11 +10,11 @@
 # Use --no-verify to skip verification (e.g., for custom/forked repos).
 
 [checksums]
-"base.toml" = "e3b2d22b0e7a1ab8feb392c4285edf8c0c33d185f97f9915a6a9ff47dd9e385e"
+"base.toml" = "f0dd7e4740cc895c1990d2a5d45abc1327dec338b4e36daab091bc40459e4612"
 "cargo.toml" = "2bda8ae25d342a05eaf9d47e04d332ed17c4759ef4fe371b8cd0a16d04d194b7"
-"default.toml" = "d360bedb857c4117ca6efae5e760e5fb056489b82b598ae4723d1d7d6581752a"
+"default.toml" = "0105254642eee65f85e5d1589c67e77ea19e1c451f9b74340bfd5a544863d7e5"
 "elixir.toml" = "71d08b9581fc00a565da57e49dd8a18401b68ac064064b2232118cd99dba98dc"
-"example.toml" = "353cfa26761595fd9f9ca06e48eb839b20d4399ad747cfce6344dea10325a61f"
+"example.toml" = "4c7c3e482cf93d8ca985cab40369ac409492b5c3fdfac0b11ef914b70ced0464"
 "flatpak.toml" = "7fc56bbb779ae0031dfcd6b89b3347f7d2115fef0f0cf7bc4bcbe253d196e78b"
 "generic-strict.toml" = "540078b0f219468181d37173d3bc39741a385f805f5ef1557f26b96ecef4acaa"
 "gnu-store.toml" = "b5700ccf123cc8aca8ab073e3e88c74bb8161be49070744944312347ea57c991"

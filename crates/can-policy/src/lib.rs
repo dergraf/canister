@@ -1,7 +1,7 @@
+pub mod access;
 pub mod config;
 pub mod manifest;
 pub mod profile;
-pub mod whitelist;
 
 pub use config::{
     ConfigError, FilesystemConfig, NetworkConfig, PortMapping, PortProtocol, ProcessConfig,
