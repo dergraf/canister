@@ -39,9 +39,11 @@ jobs:
           restore-keys: docs-${{ runner.os }}-
 
       - name: Install mdbook
+        env:
+          MDBOOK_VERSION: "0.5.2"
         run: |
           mkdir -p ~/.local/bin
-          curl -fsSL https://github.com/rust-lang/mdBook/releases/latest/download/mdbook-x86_64-unknown-linux-gnu.tar.gz \
+          curl -fsSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar xz -C ~/.local/bin
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 

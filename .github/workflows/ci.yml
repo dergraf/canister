@@ -219,6 +219,14 @@ jobs:
           match = re.search(r'const PROFILE_TEMPLATE:.*?= r#\"(.*?)\"#;', src, re.DOTALL)
           if match:
               profile = match.group(1).replace('{bin_path}', '$BIN_PATH')
+              # Generate standard pasta ux rules (same paths as STANDARD_PASTA_PATHS).
+              pasta_rules = '\n'.join([
+                  '  allow ux /usr/bin/pasta,',
+                  '  allow ux /usr/bin/pasta.avx2,',
+                  '  allow ux /bin/pasta,',
+                  '  allow ux /bin/pasta.avx2,',
+              ])
+              profile = profile.replace('{pasta_rules}', pasta_rules)
               open('/tmp/canister-apparmor-test', 'w').write(profile)
           "
 
