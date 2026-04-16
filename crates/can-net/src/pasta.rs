@@ -238,8 +238,13 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
     // ptrace_scope=1, but this only works when pasta runs as the same uid.
     // Since pasta is already running unprivileged (no capabilities),
     // staying as the current user has no security implications.
+    //
+    // Pass UID:GID explicitly. When only UID is given, pasta tries to
+    // auto-resolve the GID which fails in enterprise environments where
+    // UID != GID (e.g., Active Directory/SSSD domain users).
     let uid = nix::unistd::getuid();
-    cmd.arg("--runas").arg(uid.to_string());
+    let gid = nix::unistd::getgid();
+    cmd.arg("--runas").arg(format!("{}:{}", uid, gid));
 
     // Auto-configure addresses, routes, and bring up the tap device.
     cmd.arg("--config-net");
