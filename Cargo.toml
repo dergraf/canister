@@ -6,7 +6,7 @@ members = [
     "crates/can-policy",
     "crates/can-net",
     "crates/can-log",
-    "crates/can-docgen",
+    "crates/can-docgen", "crates/can-proxy",
 ]
 
 [workspace.package]

@@ -60,3 +60,6 @@ env_passthrough = [
     "PHX_SERVER",
     "PORT",
 ]
+
+[proxy]
+enabled = true

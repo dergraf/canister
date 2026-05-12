@@ -75,6 +75,8 @@ impl NetworkMode {
 pub struct NetworkState {
     /// The pasta child process, if running.
     pub pasta_child: Option<std::process::Child>,
+    /// The proxy process PID, if running.
+    pub proxy_pid: Option<nix::unistd::Pid>,
 }
 
 impl Default for NetworkState {
@@ -86,7 +88,10 @@ impl Default for NetworkState {
 impl NetworkState {
     /// Create a new empty network state.
     pub fn new() -> Self {
-        Self { pasta_child: None }
+        Self {
+            pasta_child: None,
+            proxy_pid: None,
+        }
     }
 
     /// Shut down all network infrastructure (pasta).
@@ -94,6 +99,10 @@ impl NetworkState {
         if let Some(mut child) = self.pasta_child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(pid) = self.proxy_pid.take() {
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(pid, None);
         }
     }
 }

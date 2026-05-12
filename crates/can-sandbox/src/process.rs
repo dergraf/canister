@@ -75,6 +75,16 @@ pub fn filter_environment(config: &ProcessConfig) -> Vec<CString> {
         }
     }
 
+    // Inject explicit environment variables from the policy
+    for (key, val) in &config.env {
+        if key == "PATH" {
+            has_path = true;
+        }
+        if let Ok(entry) = CString::new(format!("{key}={val}")) {
+            env.push(entry);
+        }
+    }
+
     // Ensure PATH exists so the sandboxed process can find executables.
     // Use a minimal safe default if not passed through.
     if !has_path {
@@ -268,6 +278,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         let env = filter_environment(&config);
         assert!(env.is_empty(), "empty passthrough should clear all env");
@@ -285,6 +296,7 @@ mod tests {
                 "CANISTER_TEST_VAR".to_string(),
                 "NONEXISTENT_VAR".to_string(),
             ],
+            env: std::collections::HashMap::new(),
         };
         let env = filter_environment(&config);
 
@@ -320,6 +332,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![],
             env_passthrough: vec!["PATH".to_string()],
+            env: std::collections::HashMap::new(),
         };
         let env = filter_environment(&config);
 
@@ -340,6 +353,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         assert!(validate_execve(Path::new("/usr/bin/anything"), &config).is_ok());
     }
@@ -350,6 +364,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/bin/echo")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         // /bin/echo should exist on any Linux system.
         assert!(validate_execve(Path::new("/bin/echo"), &config).is_ok());
@@ -361,6 +376,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/bin/echo")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         let result = validate_execve(Path::new("/bin/ls"), &config);
         assert!(result.is_err());
@@ -373,6 +389,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/nix/store/*")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         // A deeply nested nix store binary should match the prefix rule.
         let result = validate_execve(Path::new("/nix/store/abc123-elixir-1.18/bin/mix"), &config);
@@ -385,6 +402,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/nix/store/*")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         let result = validate_execve(Path::new("/usr/bin/echo"), &config);
         assert!(result.is_err(), "prefix rule should not match outside path");
@@ -398,6 +416,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/nix/store/*")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         let result = validate_execve(Path::new("/nix/store-extra/bin/foo"), &config);
         assert!(
@@ -412,6 +431,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/nix/store/*"), PathBuf::from("/bin/echo")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         // Both should work.
         assert!(
@@ -434,6 +454,7 @@ mod tests {
             max_pids: None,
             allow_execve: vec![PathBuf::from("/usr/bin/python3")],
             env_passthrough: vec![],
+            env: std::collections::HashMap::new(),
         };
         let extra = extra_denied_syscalls(&config);
         assert!(extra.is_empty(), "deferred to SECCOMP_RET_USER_NOTIF phase");

@@ -89,6 +89,10 @@ pub struct SandboxDef {
     /// Syscall overrides (allow_extra / deny_extra).
     #[serde(default)]
     pub syscalls: SyscallConfig,
+
+    /// L7 Proxy configuration overrides.
+    #[serde(default)]
+    pub proxy: crate::config::ProxyConfig,
 }
 
 /// The manifest filename searched for by `can up`.
@@ -159,6 +163,7 @@ impl Manifest {
             process: def.process.clone(),
             resources: def.resources.clone(),
             syscalls: def.syscalls.clone(),
+            proxy: def.proxy.clone(),
         }
     }
 }

@@ -107,6 +107,7 @@ fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<Sandbox
             path = %path.display(),
             "loaded recipe"
         );
+        tracing::debug!("RECIPE {:?} PROXY ENABLED: {:?}", arg, recipe.proxy.enabled);
 
         merged = merged.merge(recipe);
     }
@@ -573,6 +574,8 @@ pub fn run(
     let (cmd, args) = command
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
+
+    tracing::debug!("PROXY ENABLED IN CONFIG: {:?}", config.proxy.enabled());
 
     let opts = SandboxOpts {
         command: cmd.clone(),

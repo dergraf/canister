@@ -41,6 +41,10 @@ pub struct SandboxConfig {
     /// Seccomp syscall overrides and enforcement mode.
     #[serde(default)]
     pub syscalls: SyscallConfig,
+
+    /// L7 Proxy and interception configuration.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
@@ -244,6 +248,25 @@ impl NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Enable the L7 HTTP/HTTPS proxy.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Map of target domains to intercept -> path to Wasm plugin.
+    #[serde(default)]
+    pub interceptors: std::collections::HashMap<String, PathBuf>,
+}
+
+impl ProxyConfig {
+    /// Return the effective proxy enabled state.
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Maximum number of child PIDs allowed.
     pub max_pids: Option<u32>,
@@ -256,6 +279,11 @@ pub struct ProcessConfig {
     /// All others are stripped.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+
+    /// Environment variables to set in the sandbox.
+    /// These are evaluated after passthrough.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
@@ -396,6 +424,7 @@ impl SandboxConfig {
             process: ProcessConfig::default(),
             resources: ResourceConfig::default(),
             syscalls: SyscallConfig::default(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -489,6 +518,10 @@ pub struct RecipeFile {
     /// Syscall overrides on top of the default baseline.
     #[serde(default)]
     pub syscalls: SyscallConfig,
+
+    /// L7 Proxy configuration.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 impl RecipeFile {
@@ -516,6 +549,9 @@ impl RecipeFile {
     /// - `filesystem.allow` / `filesystem.allow_write` / `filesystem.deny`
     /// - `process.allow_execve`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
+        let is_filtered = self.network.deny_all();
+        let has_allow_domains = !self.network.allow_domains.is_empty();
+
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
             filesystem: FilesystemConfig {
@@ -549,9 +585,25 @@ impl RecipeFile {
                     .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
                     .collect(),
                 env_passthrough: self.process.env_passthrough,
+                env: self.process.env,
             },
             resources: self.resources,
             syscalls: self.syscalls,
+            proxy: ProxyConfig {
+                enabled: self.proxy.enabled.or({
+                    if has_allow_domains && is_filtered {
+                        Some(true)
+                    } else {
+                        Some(false)
+                    }
+                }),
+                interceptors: self
+                    .proxy
+                    .interceptors
+                    .into_iter()
+                    .map(|(k, p)| (k, PathBuf::from(expand_env_vars(&p.to_string_lossy()))))
+                    .collect(),
+            },
         })
     }
 
@@ -604,6 +656,11 @@ impl RecipeFile {
                     self.process.env_passthrough,
                     overlay.process.env_passthrough,
                 ),
+                env: {
+                    let mut env = self.process.env;
+                    env.extend(overlay.process.env);
+                    env
+                },
             },
 
             // Resources: last-Some-wins.
@@ -623,6 +680,16 @@ impl RecipeFile {
                 deny: union_vecs(self.syscalls.deny, overlay.syscalls.deny),
                 allow_extra: union_vecs(self.syscalls.allow_extra, overlay.syscalls.allow_extra),
                 deny_extra: union_vecs(self.syscalls.deny_extra, overlay.syscalls.deny_extra),
+            },
+
+            // Proxy: enabled is last-Some-wins, interceptors are merged.
+            proxy: ProxyConfig {
+                enabled: overlay.proxy.enabled.or(self.proxy.enabled),
+                interceptors: {
+                    let mut m = self.proxy.interceptors;
+                    m.extend(overlay.proxy.interceptors);
+                    m
+                },
             },
         }
     }
