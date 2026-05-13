@@ -1,14 +1,13 @@
-# Process control — env filtering and max_pids.
-# Used by: t_process.sh
+# Network direct mode — direct outbound allowed.
+# Used by: t_network.sh
 
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "direct"
 
 [process]
-max_pids = 32
 env_passthrough = ["PATH", "HOME"]
 
 [syscalls]

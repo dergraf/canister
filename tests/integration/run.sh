@@ -13,17 +13,17 @@ SKIPPED=0
 FAILURES=()
 
 for test_file in "${TESTS_DIR}"/t_*.sh; do
-    if bash "$test_file"; then
+    output_file=$(mktemp)
+    if bash "$test_file" >"$output_file" 2>&1; then
         (( PASSED++ )) || true
+    elif grep -q "^SKIP " "$output_file"; then
+        (( SKIPPED++ )) || true
     else
-        exit_code=$?
-        if [[ $exit_code -eq 0 ]]; then
-            (( SKIPPED++ )) || true
-        else
-            (( FAILED++ )) || true
-            FAILURES+=("$(basename "$test_file")")
-        fi
+        (( FAILED++ )) || true
+        FAILURES+=("$(basename "$test_file")")
     fi
+    cat "$output_file"
+    rm -f "$output_file"
     echo ""
 done
 

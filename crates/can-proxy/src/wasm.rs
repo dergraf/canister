@@ -97,20 +97,18 @@ mod tests {
         let input = serde_json::json!({
             "method": "GET",
             "uri": "https://example.com/test",
-            "headers": {},
-            "body": ""
+            "headers": {}
         });
 
         let result = engine
             .execute(
                 "example.com",
-                "handle_request",
+                "on_request_headers",
                 serde_json::to_vec(&input).unwrap(),
             )
             .unwrap();
         let resp: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(resp["status"], 200);
-        assert_eq!(resp["body"], "eyJtZXNzYWdlIjogImhlbGxvIGZyb20gd2FzbSJ9");
+        assert_eq!(resp["action"], "Continue");
     }
 }

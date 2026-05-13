@@ -12,8 +12,10 @@ use nix::unistd::{ForkResult, Pid, fork, pipe};
 /// Set to -1 when no child exists.
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
 
+use can_net::dns_cache::DnsCache;
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
+use can_policy::config::EgressMode;
 
 use crate::{
     SandboxOpts, cgroups, notifier, overlay, process, resolve_command, seccomp, to_cstring,
@@ -112,11 +114,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let net_mode = NetworkMode::from_config(&opts.config.network);
     tracing::debug!(?net_mode, "network isolation mode");
 
-    // Initialize CA for the proxy if proxy is enabled.
+    // Initialize CA for the proxy when egress mode requires proxy path.
     // Done before forking so both parent (proxy thread) and child (cert file injection)
     // have access to it without IPC.
     let mut proxy_ca = None;
-    if opts.config.proxy.enabled() {
+    if matches!(opts.config.network.egress(), EgressMode::ProxyOnly) {
         match can_proxy::ca::DynamicCa::generate() {
             Ok(ca) => {
                 tracing::debug!("generated dynamic CA for proxy");
@@ -150,6 +152,17 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             resolved
         } else {
             Vec::new()
+        };
+
+    let dns_cache =
+        if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
+            let cache = DnsCache::new(std::time::Duration::from_secs(15));
+            for domain in &opts.config.network.allow_domains {
+                let _ = cache.resolve_cached_or_lookup(domain);
+            }
+            Some(cache)
+        } else {
+            None
         };
 
     // Create pipes for parent-child synchronization.
@@ -219,6 +232,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                     &opts.config,
                     &mut net_state,
                     proxy_ca.clone(),
+                    dns_cache.clone(),
                 ) {
                     Ok((addr, port)) => {
                         dns_addr = addr;
@@ -284,6 +298,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 notifier_enabled,
                 &resolved_ips,
                 proxy_ca,
+                dns_cache,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -300,8 +315,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 ///
 /// `child_pid` is the PID of the sandboxed child process. pasta is
 /// invoked with `--userns /proc/<pid>/ns/user` and `--netns /proc/<pid>/ns/net`.
-/// DNS resolution is handled by the seccomp notifier's domain-aware
-/// filtering — no separate DNS proxy is needed.
+/// DNS resolution is handled by seccomp notifier domain-aware filtering
+/// plus a shared TTL-aware DNS cache used by proxy/notifier components.
 ///
 /// Returns the DNS address configured inside the namespace by pasta.
 fn setup_parent_network(
@@ -309,6 +324,7 @@ fn setup_parent_network(
     config: &SandboxConfig,
     state: &mut NetworkState,
     proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
+    _dns_cache: Option<DnsCache>,
 ) -> Result<(String, u16), can_net::NetError> {
     if !can_net::pasta::is_available() {
         tracing::warn!(
@@ -380,17 +396,17 @@ fn setup_parent_network(
                 };
 
                 rt.block_on(async {
-                    let server =
-                        match can_proxy::server::ProxyServer::new_with_arc(ca, &interceptors) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!(
-                                    "proxy process: failed to start proxy server: {}",
-                                    e
-                                );
-                                std::process::exit(1);
-                            }
-                        };
+                    let server = match can_proxy::server::ProxyServer::new_with_policy(
+                        ca,
+                        &interceptors,
+                        &config.network,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("proxy process: failed to start proxy server: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
 
                     let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
                         Ok(l) => l,
@@ -465,6 +481,7 @@ fn child_entry(
     notifier_enabled: bool,
     resolved_ips: &[(String, Vec<std::net::IpAddr>)],
     proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
+    dns_cache: Option<DnsCache>,
 ) -> Result<(), NamespaceError> {
     // Build clone flags for the first unshare: user + PID [+ net] namespaces.
     //
@@ -567,7 +584,17 @@ fn child_entry(
     // The supervisor runs as PID 1 inside the same user + PID namespace
     // as the sandboxed processes, so /proc/<pid>/mem access works.
     let supervisor_context = if notifier_enabled {
-        let policy = notifier::policy_from_config(config, resolved_ips, &dns_addr);
+        let policy = notifier::policy_from_config(
+            config,
+            resolved_ips,
+            &dns_addr,
+            dns_cache,
+            if proxy_port > 0 {
+                Some(proxy_port)
+            } else {
+                None
+            },
+        );
         tracing::info!(
             allowed_ips = policy.allowed_ips.len(),
             allowed_cidrs = policy.allowed_cidrs.len(),

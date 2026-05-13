@@ -1,10 +1,10 @@
-# Minimal config — default deny-all, default seccomp baseline.
+# Minimal config — proxy-only egress, default seccomp baseline.
 # Used by: t_basic.sh
 
 [filesystem]
 allow = []
 
 [network]
-deny_all = true
+egress = "proxy-only"
 
 [syscalls]

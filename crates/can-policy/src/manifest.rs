@@ -244,7 +244,7 @@ recipes = ["elixir", "nix"]
 command = "mix test"
 
 [sandbox.test.network]
-deny_all = true
+egress = "proxy-only"
 
 [sandbox.ci]
 description = "CI — strict, no network"
@@ -272,7 +272,7 @@ cpu_percent = 100
         let test = manifest.get("test").unwrap();
         assert_eq!(test.recipes, vec!["elixir", "nix"]);
         assert_eq!(test.command, "mix test");
-        assert_eq!(test.network.deny_all, Some(true));
+        assert_eq!(test.network.egress(), crate::config::EgressMode::ProxyOnly);
 
         let ci = manifest.get("ci").unwrap();
         assert_eq!(ci.recipes, vec!["elixir", "nix", "generic-strict"]);

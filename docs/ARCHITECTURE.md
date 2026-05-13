@@ -86,6 +86,18 @@ canister/
 Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 `can-net`. `can-policy` and `can-log` have no internal dependencies.
 
+### Outbound Defense Model (Filtered + Proxy)
+
+When proxy is enabled with enforcement, outbound networking follows a two-layer model:
+
+1. **Kernel first-line (seccomp USER_NOTIF):** sandboxed processes may only connect to
+   local proxy loopback endpoint and DNS server; all other direct outbound INET/INET6
+   traffic is denied.
+2. **Proxy second-line (user space):** proxy validates destination against allow policy
+   and forwards via L7 HTTP interception path or L4 CONNECT passthrough path.
+
+This prevents bypass by unsetting proxy environment variables.
+
 ---
 
 ## Execution Flow

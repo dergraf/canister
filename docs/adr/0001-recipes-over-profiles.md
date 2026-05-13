@@ -74,7 +74,7 @@ policies on top.
 **Resolution order:**
 1. `--recipe PATH` loads a recipe TOML file
 2. `--profile NAME` overrides the baseline from the file
-3. No `--recipe` flag: default deny-all policy with generic baseline
+3. No `--recipe` flag: default proxy-only policy with generic baseline
 
 **Recipe discovery:** `can recipes` searches `./.canister/`, `$XDG_CONFIG_HOME/canister/recipes/`,
 and `/etc/canister/recipes/`. The `--recipe` flag takes a file path (not a name). Name-based

@@ -26,7 +26,7 @@ TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-deny_all = true
+egress = "proxy-only"
 [syscalls]
 allow_extra = ["ptrace"]
 EOF
@@ -42,7 +42,7 @@ TMPCONF2=$(tmpconfig <<'EOF'
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-deny_all = true
+egress = "proxy-only"
 [syscalls]
 deny_extra = ["personality"]
 EOF
@@ -56,7 +56,7 @@ assert_eq "deny_extra works" "$RUN_STDOUT"
 begin_test "old [profile] section is rejected"
 TMPOLD=$(tmpconfig <<'EOF'
 [network]
-deny_all = true
+egress = "proxy-only"
 [profile]
 name = "python"
 EOF

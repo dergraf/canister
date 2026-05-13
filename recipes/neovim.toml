@@ -27,6 +27,7 @@ allow = [
 deny = ["/etc/shadow", "/root"]
 
 [network]
+egress = "proxy-only"
 # LSP servers, Mason, and plugin managers may need network access
 # for installation and updates. Lock down to known hosts.
 allow_domains = [
@@ -49,7 +50,6 @@ allow_domains = [
     # Lazy.nvim plugin manager
     "github.com",
 ]
-deny_all = true
 
 [process]
 max_pids = 256

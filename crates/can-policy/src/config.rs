@@ -214,6 +214,14 @@ impl PortMapping {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Egress mode controls outbound networking behavior.
+    ///
+    /// - `proxy-only` (default): outbound traffic must go through local proxy
+    /// - `none`: no outbound networking
+    /// - `direct`: direct outbound allowed, still policy-checked
+    #[serde(default)]
+    pub egress: Option<EgressMode>,
+
     /// Allowed domain names (resolved via internal DNS proxy).
     #[serde(default)]
     pub allow_domains: Vec<String>,
@@ -222,48 +230,39 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub allow_ips: Vec<String>,
 
-    /// If true, deny all network access except explicitly allowed.
-    /// Defaults to true (secure by default) when resolved.
-    ///
-    /// `None` in a recipe means "not specified" — the merge preserves
-    /// the earlier value. `into_sandbox_config()` resolves `None` to `true`.
-    #[serde(default)]
-    pub deny_all: Option<bool>,
-
     /// Port forwarding rules: map host ports to sandbox ports.
     ///
     /// Uses Docker/Podman syntax: `[ip:]hostPort:containerPort[/protocol]`.
-    /// Requires `deny_all = true` (Filtered network mode). Forwarded ports
-    /// are accessible from the host to the sandbox.
+    /// Supported when `egress != direct` (filtered networking).
+    /// Forwarded ports are accessible from the host to the sandbox.
     #[serde(default)]
     pub ports: Vec<PortMapping>,
 }
 
 impl NetworkConfig {
-    /// Return the effective `deny_all` value (defaults to `true`).
-    pub fn deny_all(&self) -> bool {
-        self.deny_all.unwrap_or(true)
+    /// Return the effective egress mode (defaults to proxy-only).
+    pub fn egress(&self) -> EgressMode {
+        self.egress.unwrap_or(EgressMode::ProxyOnly)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EgressMode {
+    None,
+    ProxyOnly,
+    Direct,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Enable the L7 HTTP/HTTPS proxy.
-    #[serde(default)]
-    pub enabled: Option<bool>,
-
     /// Map of target domains to intercept -> path to Wasm plugin.
     #[serde(default)]
     pub interceptors: std::collections::HashMap<String, PathBuf>,
 }
 
-impl ProxyConfig {
-    /// Return the effective proxy enabled state.
-    pub fn enabled(&self) -> bool {
-        self.enabled.unwrap_or(false)
-    }
-}
+impl ProxyConfig {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -415,7 +414,7 @@ impl SyscallConfig {
 }
 
 impl SandboxConfig {
-    /// Return a default config with sensible defaults (deny-all).
+    /// Return a default config with sensible defaults (proxy-only egress).
     pub fn default_deny() -> Self {
         Self {
             strict: false,
@@ -542,16 +541,13 @@ impl RecipeFile {
     ///
     /// Fills in defaults for all `Option` fields:
     /// - `strict` → `false`
-    /// - `deny_all` → `true`
+    /// - `network.egress` → `proxy-only`
     /// - `seccomp_mode` → `AllowList`
     ///
     /// Expands environment variables (`$HOME`, `$USER`, etc.) in:
     /// - `filesystem.allow` / `filesystem.allow_write` / `filesystem.deny`
     /// - `process.allow_execve`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
-        let is_filtered = self.network.deny_all();
-        let has_allow_domains = !self.network.allow_domains.is_empty();
-
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
             filesystem: FilesystemConfig {
@@ -590,13 +586,6 @@ impl RecipeFile {
             resources: self.resources,
             syscalls: self.syscalls,
             proxy: ProxyConfig {
-                enabled: self.proxy.enabled.or({
-                    if has_allow_domains && is_filtered {
-                        Some(true)
-                    } else {
-                        Some(false)
-                    }
-                }),
                 interceptors: self
                     .proxy
                     .interceptors
@@ -637,14 +626,14 @@ impl RecipeFile {
                 mask: union_vecs(self.filesystem.mask, overlay.filesystem.mask),
             },
 
-            // Network: union of lists, deny_all is last-Some-wins.
+            // Network: union of lists, egress is last-Some-wins.
             network: NetworkConfig {
+                egress: overlay.network.egress.or(self.network.egress),
                 allow_domains: union_vecs(
                     self.network.allow_domains,
                     overlay.network.allow_domains,
                 ),
                 allow_ips: union_vecs(self.network.allow_ips, overlay.network.allow_ips),
-                deny_all: overlay.network.deny_all.or(self.network.deny_all),
                 ports: union_vecs(self.network.ports, overlay.network.ports),
             },
 
@@ -684,7 +673,6 @@ impl RecipeFile {
 
             // Proxy: enabled is last-Some-wins, interceptors are merged.
             proxy: ProxyConfig {
-                enabled: overlay.proxy.enabled.or(self.proxy.enabled),
                 interceptors: {
                     let mut m = self.proxy.interceptors;
                     m.extend(overlay.proxy.interceptors);
@@ -823,7 +811,7 @@ allow_domains = ["pypi.org"]
         let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.filesystem.allow.len(), 2);
         assert_eq!(config.network.allow_domains, vec!["pypi.org"]);
-        assert!(config.network.deny_all()); // default
+        assert_eq!(config.network.egress(), EgressMode::ProxyOnly); // default
         assert!(config.syscalls.allow_extra.is_empty());
     }
 
@@ -838,7 +826,7 @@ deny = ["/etc/shadow"]
 [network]
 allow_domains = ["pypi.org", "registry.npmjs.org"]
 allow_ips = ["10.0.0.0/8"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 max_pids = 64
@@ -868,11 +856,17 @@ allow_extra = ["ptrace"]
     #[test]
     fn default_deny_config() {
         let config = SandboxConfig::default_deny();
-        assert!(config.network.deny_all());
+        assert_eq!(config.network.egress(), EgressMode::ProxyOnly);
         assert!(config.filesystem.allow.is_empty());
         assert!(config.network.allow_domains.is_empty());
         assert!(config.syscalls.allow_extra.is_empty());
         assert!(config.syscalls.deny_extra.is_empty());
+    }
+
+    #[test]
+    fn egress_default_is_proxy_only() {
+        let network = NetworkConfig::default();
+        assert_eq!(network.egress(), EgressMode::ProxyOnly);
     }
 
     #[test]
@@ -901,7 +895,7 @@ allow = ["/usr/lib", "/tmp"]
 
 [network]
 allow_domains = ["pypi.org", "files.pythonhosted.org"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
@@ -1143,26 +1137,26 @@ deny = ["/root"]
     }
 
     #[test]
-    fn merge_deny_all_last_wins() {
-        // None + None = None (resolved to true by default)
+    fn merge_egress_last_wins() {
+        // None + None = None (resolved to proxy-only by default)
         let a = parse_recipe("");
         let b = parse_recipe("");
-        assert_eq!(a.merge(b).network.deny_all, None);
+        assert_eq!(a.merge(b).network.egress, None);
 
-        // None + Some(false) = Some(false)
+        // None + Some(direct) = Some(direct)
         let a = parse_recipe("");
-        let b = parse_recipe("[network]\ndeny_all = false");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        let b = parse_recipe("[network]\negress = \"direct\"");
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
 
-        // Some(true) + Some(false) = Some(false) (last wins)
-        let a = parse_recipe("[network]\ndeny_all = true");
-        let b = parse_recipe("[network]\ndeny_all = false");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        // proxy-only + direct = direct (last wins)
+        let a = parse_recipe("[network]\negress = \"proxy-only\"");
+        let b = parse_recipe("[network]\negress = \"direct\"");
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
 
-        // Some(false) + None = Some(false) (None preserves base)
-        let a = parse_recipe("[network]\ndeny_all = false");
+        // direct + None = direct (None preserves base)
+        let a = parse_recipe("[network]\negress = \"direct\"");
         let b = parse_recipe("");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
     }
 
     #[test]

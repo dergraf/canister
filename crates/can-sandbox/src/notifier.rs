@@ -70,6 +70,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+use can_policy::config::EgressMode;
 
 use crate::seccomp::SeccompError;
 
@@ -255,6 +258,21 @@ pub struct NotifierPolicy {
     /// - Send supervisor-side DNS queries to this address for
     ///   `resolve_and_add()` (dynamic allowlist population)
     pub dns_server_addr: String,
+
+    /// Domains configured in policy for dynamic DNS resolution.
+    pub allowed_domains: Vec<String>,
+
+    /// Shared DNS cache used for TTL-aware refresh of domain → IP mappings.
+    pub dns_cache: Option<can_net::dns_cache::DnsCache>,
+
+    /// Dynamic IP allowlist populated from DNS cache lookups.
+    pub dynamic_ips: Arc<RwLock<HashSet<IpAddr>>>,
+
+    /// Whether outbound INET/INET6 traffic must go through local proxy.
+    pub enforce_proxy_egress: bool,
+
+    /// Local proxy listening port inside the sandbox namespace.
+    pub proxy_port: Option<u16>,
 }
 
 impl Default for NotifierPolicy {
@@ -269,6 +287,11 @@ impl Default for NotifierPolicy {
             allow_af_inet: true,
             restrict_outbound: true,
             dns_server_addr: can_net::pasta::PASTA_DNS_ADDR.to_string(),
+            allowed_domains: Vec::new(),
+            dns_cache: None,
+            dynamic_ips: Arc::new(RwLock::new(HashSet::new())),
+            enforce_proxy_egress: false,
+            proxy_port: None,
         }
     }
 }
@@ -284,6 +307,12 @@ impl NotifierPolicy {
         // Check explicit IPs.
         if self.allowed_ips.contains(&ip) {
             return true;
+        }
+
+        if let Ok(guard) = self.dynamic_ips.read() {
+            if guard.contains(&ip) {
+                return true;
+            }
         }
 
         // Check CIDR ranges.
@@ -1000,7 +1029,33 @@ fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
         return Verdict::Deny(libc::EPERM as u32);
     }
 
-    classify_connect_addr(pid, &addr_bytes, addr_len, policy)
+    let verdict = classify_connect_addr(pid, &addr_bytes, addr_len, policy);
+    maybe_refresh_dynamic_allowlist_on_deny(policy, &verdict);
+    if matches!(verdict, Verdict::Deny(_)) {
+        classify_connect_addr(pid, &addr_bytes, addr_len, policy)
+    } else {
+        verdict
+    }
+}
+
+fn maybe_refresh_dynamic_allowlist_on_deny(policy: &NotifierPolicy, verdict: &Verdict) {
+    if !matches!(verdict, Verdict::Deny(_)) {
+        return;
+    }
+    let Some(cache) = &policy.dns_cache else {
+        return;
+    };
+
+    let mut refreshed = HashSet::new();
+    for domain in &policy.allowed_domains {
+        if let Some(ips) = cache.resolve_cached_or_lookup(domain) {
+            refreshed.extend(ips);
+        }
+    }
+
+    if let Ok(mut guard) = policy.dynamic_ips.write() {
+        *guard = refreshed;
+    }
 }
 
 /// Classify a connect() destination address and return a verdict.
@@ -1032,6 +1087,10 @@ fn classify_connect_addr(
             }
             _ => {} // AF_UNIX, AF_UNSPEC, etc. — fall through to normal handling
         }
+    }
+
+    if policy.enforce_proxy_egress {
+        return classify_proxy_only_connect(pid, addr_bytes, addr_len, sa_family, policy);
     }
 
     match sa_family as i32 {
@@ -1159,16 +1218,72 @@ fn classify_connect_addr(
     }
 }
 
+fn classify_proxy_only_connect(
+    pid: u32,
+    addr_bytes: &[u8],
+    addr_len: usize,
+    sa_family: u16,
+    policy: &NotifierPolicy,
+) -> Verdict {
+    match sa_family as i32 {
+        libc::AF_UNSPEC => Verdict::Allow,
+        libc::AF_UNIX => Verdict::Allow,
+        libc::AF_INET => {
+            if addr_len < 8 {
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+            let port = u16::from_be_bytes([addr_bytes[2], addr_bytes[3]]);
+            let ip = Ipv4Addr::new(addr_bytes[4], addr_bytes[5], addr_bytes[6], addr_bytes[7]);
+            let ip_addr = IpAddr::V4(ip);
+
+            if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+                if ip_addr == dns_ip && port == 53 {
+                    return Verdict::Allow;
+                }
+            }
+
+            if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+                return Verdict::Allow;
+            }
+
+            tracing::warn!(pid, %ip_addr, port, "connect: denied (proxy-only egress mode)");
+            Verdict::Deny(libc::EACCES as u32)
+        }
+        libc::AF_INET6 => {
+            if addr_len < 24 {
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+            let port = u16::from_be_bytes([addr_bytes[2], addr_bytes[3]]);
+            let mut addr_buf = [0u8; 16];
+            addr_buf.copy_from_slice(&addr_bytes[8..24]);
+            let ip = Ipv6Addr::from(addr_buf);
+            let ip_addr = IpAddr::V6(ip);
+
+            if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+                if ip_addr == dns_ip && port == 53 {
+                    return Verdict::Allow;
+                }
+            }
+
+            if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+                return Verdict::Allow;
+            }
+
+            tracing::warn!(pid, %ip_addr, port, "connect: denied (proxy-only egress mode)");
+            Verdict::Deny(libc::EACCES as u32)
+        }
+        libc::AF_NETLINK => Verdict::Allow,
+        _ => Verdict::Deny(libc::EPERM as u32),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sendto / sendmsg evaluators with DNS awareness
 // ---------------------------------------------------------------------------
 
 /// DNS port (standard).
-
 /// Minimum valid DNS packet size (header only).
-
 /// Maximum DNS UDP message size we'll inspect.
-
 /// Evaluate a `sendto()` syscall.
 ///
 /// `sendto(fd, buf, len, flags, dest_addr, addrlen)`
@@ -1186,7 +1301,6 @@ fn classify_connect_addr(
 /// For non-NULL dest_addr: if the destination is port 53, parse the DNS
 /// query and check the domain against the allowlist. For other ports,
 /// check the destination IP against the static + dynamic allowlist.
-
 fn evaluate_sendto(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let pid = notif.pid;
     let dest_addr_ptr = notif.data.args[4];
@@ -1303,6 +1417,21 @@ fn classify_sendto_addr(
             return Verdict::Deny(libc::EPERM as u32);
         }
     };
+
+    if policy.enforce_proxy_egress {
+        if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+            if ip_addr == dns_ip && port == 53 {
+                return Verdict::Allow;
+            }
+        }
+        if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+            return Verdict::Allow;
+        }
+
+        tracing::warn!(pid, %ip_addr, port, "sendto: denied (proxy-only egress mode)");
+        return Verdict::Deny(libc::EACCES as u32);
+    }
+
     classify_outbound_ip(pid, ip_addr, port, policy, "sendto")
 }
 
@@ -1821,6 +1950,8 @@ pub fn policy_from_config(
     config: &can_policy::SandboxConfig,
     resolved_ips: &[(String, Vec<IpAddr>)],
     dns_addr: &str,
+    dns_cache: Option<can_net::dns_cache::DnsCache>,
+    proxy_port: Option<u16>,
 ) -> NotifierPolicy {
     let mut allowed_ips: HashSet<IpAddr> = HashSet::new();
     let mut allowed_cidrs: Vec<(IpAddr, u8)> = Vec::new();
@@ -1851,6 +1982,8 @@ pub fn policy_from_config(
     if let Ok(ip) = dns_addr.parse::<IpAddr>() {
         allowed_ips.insert(ip);
     }
+    allowed_ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    allowed_ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
     allowed_ips.insert(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap());
 
     // Allow the host's default gateway — pasta mirrors the host's
@@ -1888,7 +2021,8 @@ pub fn policy_from_config(
     // rules. Port-forwarding-only configs (no domains, no IPs) should
     // allow all outbound traffic — the notifier is still useful for
     // clone/socket/execve enforcement.
-    let restrict_outbound = !config.network.allow_ips.is_empty();
+    let restrict_outbound =
+        !config.network.allow_ips.is_empty() || !config.network.allow_domains.is_empty();
 
     NotifierPolicy {
         allowed_ips,
@@ -1900,6 +2034,11 @@ pub fn policy_from_config(
         allow_af_inet: true,
         restrict_outbound,
         dns_server_addr: dns_addr.to_string(),
+        allowed_domains: config.network.allow_domains.clone(),
+        dns_cache,
+        dynamic_ips: Arc::new(RwLock::new(HashSet::new())),
+        enforce_proxy_egress: matches!(config.network.egress(), EgressMode::ProxyOnly),
+        proxy_port,
     }
 }
 

@@ -17,12 +17,12 @@ version = "2"
 deny = ["/etc/shadow", "/root"]
 
 [network]
+egress = "proxy-only"
 allow_domains = [
     "registry.npmjs.org",
     "registry.yarnpkg.com",
     "registry.npmmirror.com",
 ]
-deny_all = true
 
 [process]
 max_pids = 128

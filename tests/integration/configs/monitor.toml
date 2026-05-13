@@ -6,7 +6,7 @@ allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 deny  = ["/etc/shadow"]
 
 [network]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 max_pids = 32

@@ -438,8 +438,8 @@ fn generate_merge_semantics(out_dir: &Path) -> Result<()> {
             "Deduplicated, preserving first-occurrence order",
         ),
         (
-            "network.deny_all",
-            "Option<bool>",
+            "network.egress",
+            "Option<EgressMode>",
             "Last-Some-wins",
             "`None` preserves earlier value; `Some(x)` overwrites",
         ),

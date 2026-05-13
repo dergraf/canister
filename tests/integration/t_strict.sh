@@ -35,7 +35,7 @@ TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-deny_all = true
+egress = "proxy-only"
 [process]
 env_passthrough = ["PATH", "HOME"]
 [syscalls]

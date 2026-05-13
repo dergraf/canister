@@ -12,7 +12,7 @@ strict = true
 
 [recipe]
 name = "generic-strict"
-description = "Strict deny-all policy for untrusted binaries (CI/production)"
+description = "Strict no-network policy for untrusted binaries (CI/production)"
 version = "2"
 
 [syscalls]
@@ -31,7 +31,7 @@ allow_extra = [
 deny = ["/etc/shadow", "/root", "/home"]
 
 [network]
-deny_all = true
+egress = "none"
 
 [process]
 max_pids = 64

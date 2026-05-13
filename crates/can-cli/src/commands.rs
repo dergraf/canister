@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use can_policy::config::EgressMode;
 use can_policy::profile::baseline_search_dirs;
 use can_policy::{
     Manifest, RecipeFile, SandboxConfig, SandboxDef, SeccompProfile, discover_manifest,
@@ -107,7 +108,7 @@ fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<Sandbox
             path = %path.display(),
             "loaded recipe"
         );
-        tracing::debug!("RECIPE {:?} PROXY ENABLED: {:?}", arg, recipe.proxy.enabled);
+        tracing::debug!("loaded recipe {:?}", arg);
 
         merged = merged.merge(recipe);
     }
@@ -424,7 +425,12 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
 
     // Network.
     println!("[network]");
-    println!("  deny_all: {}", config.network.deny_all());
+    let egress = match config.network.egress() {
+        EgressMode::None => "none",
+        EgressMode::ProxyOnly => "proxy-only",
+        EgressMode::Direct => "direct",
+    };
+    println!("  egress: {egress}");
     if !config.network.allow_domains.is_empty() {
         println!("  allow_domains: {:?}", config.network.allow_domains);
     }
@@ -510,7 +516,7 @@ pub fn show(recipe_args: &[String], command: Vec<String>) -> Result<i32> {
 
     // Resolve Option fields to their effective values so the output is
     // fully explicit — no hidden defaults.
-    config.network.deny_all = Some(config.network.deny_all());
+    config.network.egress = Some(config.network.egress());
     config.syscalls.seccomp_mode = Some(config.syscalls.seccomp_mode());
 
     let toml_str =
@@ -575,7 +581,7 @@ pub fn run(
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
 
-    tracing::debug!("PROXY ENABLED IN CONFIG: {:?}", config.proxy.enabled());
+    tracing::debug!("effective egress mode: {:?}", config.network.egress());
 
     let opts = SandboxOpts {
         command: cmd.clone(),
@@ -1000,7 +1006,7 @@ fn print_monitor_exit_summary(exit_code: i32, config: &SandboxConfig) {
         eprintln!("  your current policy is likely compatible. Remove --monitor to enforce.");
     } else {
         eprintln!();
-        eprintln!("  Tip: Using default deny-all policy. Consider creating a recipe file");
+        eprintln!("  Tip: Using default proxy-only policy. Consider creating a recipe file");
         eprintln!("  with appropriate allow lists based on the observations above.");
     }
 

@@ -9,12 +9,13 @@
 // DNS filtering is handled by the seccomp notifier in can-sandbox,
 // not by a separate DNS proxy. See notifier.rs for details.
 
+pub mod dns_cache;
 pub mod netns;
 pub mod pasta;
 
 use std::net::IpAddr;
 
-use can_policy::config::NetworkConfig;
+use can_policy::config::{EgressMode, NetworkConfig};
 
 /// Errors from network isolation operations.
 #[derive(Debug, thiserror::Error)]
@@ -42,8 +43,7 @@ pub enum NetworkMode {
     /// and DNS queries filtered by the seccomp notifier.
     Filtered,
 
-    /// Full network — no CLONE_NEWNET (when deny_all is false and
-    /// no specific allow rules are set). This is "trust mode".
+    /// Full network — no CLONE_NEWNET in direct egress mode.
     Full,
 }
 
@@ -53,17 +53,19 @@ impl NetworkMode {
     /// Port forwarding requires Filtered mode, so its presence
     /// upgrades None → Filtered.
     pub fn from_config(config: &NetworkConfig) -> Self {
-        if !config.deny_all() {
-            return NetworkMode::Full;
-        }
-
-        let has_allowlist = !config.allow_domains.is_empty() || !config.allow_ips.is_empty();
-        let has_ports = !config.ports.is_empty();
-
-        if has_allowlist || has_ports {
-            NetworkMode::Filtered
-        } else {
-            NetworkMode::None
+        match config.egress() {
+            EgressMode::None => NetworkMode::None,
+            EgressMode::ProxyOnly => NetworkMode::Filtered,
+            EgressMode::Direct => {
+                let has_allowlist =
+                    !config.allow_domains.is_empty() || !config.allow_ips.is_empty();
+                let has_ports = !config.ports.is_empty();
+                if has_allowlist || has_ports {
+                    NetworkMode::Filtered
+                } else {
+                    NetworkMode::Full
+                }
+            }
         }
     }
 }
@@ -148,53 +150,63 @@ pub fn resolve_allowed_domains(config: &NetworkConfig) -> Vec<(String, Vec<IpAdd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use can_policy::config::EgressMode;
 
     #[test]
-    fn network_mode_deny_all_no_allowlist() {
+    fn network_mode_proxy_only_default() {
         let config = NetworkConfig::default();
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::None);
+        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
 
     #[test]
-    fn network_mode_deny_all_with_domains() {
+    fn network_mode_proxy_only_with_domains() {
         let config = NetworkConfig {
+            egress: Some(EgressMode::ProxyOnly),
             allow_domains: vec!["example.com".to_string()],
             allow_ips: vec![],
-            deny_all: Some(true),
             ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
 
     #[test]
-    fn network_mode_deny_all_with_ips() {
+    fn network_mode_proxy_only_with_ips() {
         let config = NetworkConfig {
+            egress: Some(EgressMode::ProxyOnly),
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
-            deny_all: Some(true),
             ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
     }
 
     #[test]
-    fn network_mode_allow_all() {
+    fn network_mode_direct() {
         let config = NetworkConfig {
+            egress: Some(EgressMode::Direct),
             allow_domains: vec![],
             allow_ips: vec![],
-            deny_all: Some(false),
             ports: vec![],
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Full);
     }
 
     #[test]
+    fn network_mode_none() {
+        let config = NetworkConfig {
+            egress: Some(EgressMode::None),
+            ..Default::default()
+        };
+        assert_eq!(NetworkMode::from_config(&config), NetworkMode::None);
+    }
+
+    #[test]
     fn network_mode_ports_upgrade_to_filtered() {
         use can_policy::config::{PortMapping, PortProtocol};
         let config = NetworkConfig {
+            egress: Some(EgressMode::ProxyOnly),
             allow_domains: vec![],
             allow_ips: vec![],
-            deny_all: Some(true),
             ports: vec![PortMapping {
                 host_ip: None,
                 host_port: 8080,

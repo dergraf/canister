@@ -36,7 +36,7 @@ name = "test-recipe"
 description = "Integration test recipe"
 
 [network]
-deny_all = true
+egress = "proxy-only"
 EOF
 )
 _TMPFILES+=("$TMPRECIPE")
@@ -55,7 +55,7 @@ description = "Tests allow_extra override"
 allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-deny_all = true
+egress = "proxy-only"
 
 [syscalls]
 allow_extra = ["ptrace", "personality"]
@@ -82,7 +82,7 @@ assert_neq 0 "$RUN_EXIT" "unknown field 'baseline' should be rejected"
 begin_test "plain policy (no [recipe] section) works via --recipe"
 TMPPLAIN=$(tmpconfig <<'EOF'
 [network]
-deny_all = true
+egress = "proxy-only"
 [syscalls]
 EOF
 )
