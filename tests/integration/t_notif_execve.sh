@@ -22,8 +22,19 @@ header "USER_NOTIF supervisor: execve() allow list"
 # same canonical path. Using `os.execvp` with PATH search would try many
 # candidates (most of which aren't on the allow list) and trip the filter
 # even for "allowed" binaries — that's a test-rig issue, not a sandbox bug.
-PYTHON3_CANON=$(readlink -f "$(command -v python3)")
-SH_CANON=$(readlink -f /bin/sh)
+#
+# Both the raw command-v path AND its readlink -f resolution are added to
+# the allow list, since the supervisor canonicalises the kernel's reported
+# exec path which may already be canonical or may go through symlinks
+# depending on how the kernel resolves the binary.
+PYTHON3_RAW=$(command -v python3)
+PYTHON3_CANON=$(readlink -f "$PYTHON3_RAW")
+SH_RAW=/bin/sh
+SH_CANON=$(readlink -f "$SH_RAW")
+
+# Diagnostic: print what the test is going to use. Helps debug CI mismatches.
+echo "  python3: raw=${PYTHON3_RAW} canonical=${PYTHON3_CANON}"
+echo "  sh:      raw=${SH_RAW} canonical=${SH_CANON}"
 
 CONFIG=$(tmpconfig <<EOF
 [filesystem]
@@ -34,7 +45,7 @@ egress = "proxy-only"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
-allow_execve = ["${PYTHON3_CANON}", "${SH_CANON}"]
+allow_execve = ["${PYTHON3_RAW}", "${PYTHON3_CANON}", "${SH_RAW}", "${SH_CANON}"]
 
 [syscalls]
 EOF
@@ -47,7 +58,11 @@ run_can run --recipe "$CONFIG" -- python3 -c "
 import os
 os.execv('${SH_CANON}', ['sh', '-c', 'echo ALLOWED_EXEC_OK'])
 "
-assert_contains "$RUN_STDOUT" "ALLOWED_EXEC_OK"
+if [[ "$RUN_STDOUT" == *"ALLOWED_EXEC_OK"* ]]; then
+    pass
+else
+    fail "expected ALLOWED_EXEC_OK; exit=$RUN_EXIT stdout=$(echo "$RUN_STDOUT" | head -5 | tr '\n' '|') stderr=$(echo "$RUN_STDERR" | tail -5 | tr '\n' '|')"
+fi
 
 # ---- Test: disallowed binary mid-process is denied ----
 # `cat` is intentionally absent from allow_execve. Running python first

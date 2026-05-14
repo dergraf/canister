@@ -10,10 +10,10 @@ cargo test -p can-cli -p can-policy -p can-proxy -p can-sandbox -p can-net
 ./ci/check_ignored_tests.sh
 ./ci/check_unwraps.sh
 
-# shellcheck for integration test scripts. Best-effort: skip locally if
-# shellcheck isn't installed, but CI installs it explicitly.
+# Run shell-script linter on integration tests. Best-effort: skip locally
+# when not installed; CI installs it explicitly.
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -x -P "tests/integration" tests/integration/*.sh ci/*.sh
+    shellcheck -S error -x -P "tests/integration" tests/integration/*.sh ci/*.sh
 else
-    echo "shellcheck not installed — skipping (install on CI)"
+    echo "(shellcheck unavailable, skipping; CI installs it explicitly)"
 fi
