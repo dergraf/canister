@@ -28,7 +28,10 @@ can-policy = { path = "../can-policy" }
 extism = "1.21.0"
 base64 = "0.22.1"
 serde_json.workspace = true
-hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring"] }
+# Disable default features (which include `aws-lc-rs`) so the musl static
+# build doesn't have to compile aws-lc-sys' C code. Ring is the configured
+# crypto provider in `client.rs`.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "logging", "native-tokio"] }
 tokio-util = { version = "0.7", features = ["io"] }
 rustls-native-certs = "0.8.3"
 can-net = { path = "../can-net" }
