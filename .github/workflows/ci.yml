@@ -475,6 +475,12 @@ jobs:
           $SSH <<'REMOTE'
           set -euo pipefail
           sudo dnf install -y git passt selinux-policy-devel policycoreutils python3
+          # pasta unconditionally opens /var/run/netns at startup. On bare
+          # Fedora cloud images that dir does not exist (it's created by the
+          # `ip netns` tooling on first use). Pre-create it world-readable
+          # so unprivileged pasta invocations succeed.
+          sudo mkdir -p /var/run/netns
+          sudo chmod 755 /var/run/netns
           echo "--- Environment ---"
           uname -a
           getenforce
