@@ -1029,6 +1029,8 @@ fn read_proc_string_with_retry(
             Err(e) => last_err = Some(e),
         }
     }
+    // SAFETY-UNWRAP: we only reach this line after the loop executed at
+    // least once and every iteration's Err branch sets last_err.
     Err(last_err.expect("loop runs at least once"))
 }
 
