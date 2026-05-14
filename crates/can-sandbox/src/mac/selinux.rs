@@ -47,6 +47,7 @@ require {
     type fs_t;
     type tmpfs_t;
     type nsfs_t;
+    type var_run_t;
 }
 
 ########################################
@@ -124,6 +125,13 @@ allow canister_t canister_sandboxed_t:lnk_file { getattr read };
 # denies the open with "netns dir open: Permission denied".
 allow canister_t nsfs_t:file { getattr open read };
 allow canister_t nsfs_t:dir { getattr open read search };
+
+# /var/run access — pasta unconditionally opens /var/run/netns as an
+# auxiliary directory, even when --netns is passed as a full path.
+# The dir is var_run_t on Fedora; without read+search we hit
+# "netns dir open: Permission denied".
+allow canister_t var_run_t:dir { getattr open read search };
+allow canister_t var_run_t:file { getattr open read };
 
 # Network: socket operations for pasta coordination and sandboxed networking.
 allow canister_t self:tcp_socket { create accept bind connect listen getattr setopt shutdown };
