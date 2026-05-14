@@ -512,6 +512,8 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
     }
 
     // Save reference copy for status detection.
+    // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path with at
+    // least one component before the final segment.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     if let Err(e) = std::fs::create_dir_all(ref_dir) {
         tracing::warn!(error = %e, "could not create reference directory (status detection may be limited)");
@@ -550,6 +552,8 @@ fn remove_module() -> Result<(), SetupError> {
 
     // Clean up reference file.
     let _ = std::fs::remove_file(POLICY_REF_PATH);
+    // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path; parent()
+    // is always Some.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     let _ = std::fs::remove_dir(ref_dir);
 

@@ -1,8 +1,11 @@
-use extism::{Manifest, Plugin, Wasm};
+use extism::{CancelHandle, Manifest, Plugin, Wasm};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::debug;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::time::Duration;
+use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WasmError {
@@ -10,10 +13,21 @@ pub enum WasmError {
     Load(String),
     #[error("Failed to execute plugin: {0}")]
     Execute(String),
+    #[error("Wasm hook {function} for {domain} exceeded {timeout_ms} ms")]
+    Timeout {
+        domain: String,
+        function: String,
+        timeout_ms: u64,
+    },
+}
+
+struct PluginEntry {
+    plugin: parking_lot::Mutex<Plugin>,
+    cancel: CancelHandle,
 }
 
 pub struct WasmEngine {
-    plugins: HashMap<String, Arc<std::sync::Mutex<Plugin>>>,
+    plugins: HashMap<String, Arc<PluginEntry>>,
 }
 
 impl WasmEngine {
@@ -30,7 +44,14 @@ impl WasmEngine {
                         domain,
                         path.display()
                     );
-                    plugins.insert(domain.clone(), Arc::new(std::sync::Mutex::new(plugin)));
+                    let cancel = plugin.cancel_handle();
+                    plugins.insert(
+                        domain.clone(),
+                        Arc::new(PluginEntry {
+                            plugin: parking_lot::Mutex::new(plugin),
+                            cancel,
+                        }),
+                    );
                 }
                 Err(e) => {
                     return Err(WasmError::Load(format!(
@@ -48,24 +69,75 @@ impl WasmEngine {
         self.plugins.contains_key(domain)
     }
 
+    /// Execute a Wasm hook with a deadline. If the plugin call exceeds
+    /// `timeout`, the running call is cancelled via Extism's
+    /// `CancelHandle` and `WasmError::Timeout` is returned.
+    ///
+    /// `parking_lot::Mutex` is used (not `std::sync::Mutex`) to avoid the
+    /// poisoning failure mode where one cancelled call would render the
+    /// plugin permanently unusable.
     pub fn execute(
         &self,
         domain: &str,
         function: &str,
         input: impl AsRef<[u8]>,
+        timeout: Duration,
     ) -> Result<Vec<u8>, WasmError> {
-        if let Some(plugin) = self.plugins.get(domain) {
-            let mut plugin = plugin.lock().unwrap();
-            let input_ref = input.as_ref();
-            match plugin.call::<_, &[u8]>(function, input_ref) {
-                Ok(output) => Ok(output.to_vec()),
-                Err(e) => Err(WasmError::Execute(e.to_string())),
+        let entry = self
+            .plugins
+            .get(domain)
+            .ok_or_else(|| WasmError::Execute(format!("No plugin for domain {}", domain)))?;
+
+        // Arm a watchdog thread before locking. When `tx` is dropped (either
+        // by an explicit send below, or by the function returning early), the
+        // watchdog wakes via Disconnected and exits without cancelling. If the
+        // deadline fires first, it triggers `cancel()` AND sets `cancelled`,
+        // which is the authoritative signal that any subsequent plugin error
+        // came from our timeout (not from a plugin-returned Err).
+        let (tx, rx) = sync_channel::<()>(1);
+        let cancel = entry.cancel.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_watchdog = cancelled.clone();
+        let function_owned = function.to_string();
+        let domain_owned = domain.to_string();
+        let timeout_for_log = timeout;
+        let watchdog = std::thread::spawn(move || match rx.recv_timeout(timeout_for_log) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                cancelled_watchdog.store(true, Ordering::SeqCst);
+                if let Err(e) = cancel.cancel() {
+                    warn!(
+                        "wasm watchdog: cancel() for {} {} failed: {}",
+                        domain_owned, function_owned, e
+                    );
+                }
             }
-        } else {
-            Err(WasmError::Execute(format!(
-                "No plugin for domain {}",
-                domain
-            )))
+        });
+
+        let result = {
+            let mut plugin = entry.plugin.lock();
+            plugin
+                .call::<_, &[u8]>(function, input.as_ref())
+                .map(|o| o.to_vec())
+        };
+
+        // Tell the watchdog we're done — drop tx so the channel disconnects.
+        drop(tx);
+        let _ = watchdog.join();
+
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    Err(WasmError::Timeout {
+                        domain: domain.to_string(),
+                        function: function.to_string(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    })
+                } else {
+                    Err(WasmError::Execute(e.to_string()))
+                }
+            }
         }
     }
 }
@@ -105,6 +177,7 @@ mod tests {
                 "example.com",
                 "on_request_headers",
                 serde_json::to_vec(&input).unwrap(),
+                Duration::from_secs(5),
             )
             .unwrap();
         let resp: serde_json::Value = serde_json::from_slice(&result).unwrap();

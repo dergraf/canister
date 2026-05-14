@@ -35,10 +35,36 @@ pub fn on_request_headers(input: String) -> FnResult<String> {
         .unwrap_or(false);
     let mode = read_header(&req, "x-canister-mode").unwrap_or_default();
 
+    // Modes used by integration tests to exercise proxy hardening paths:
+    //  - "hang": busy-loop forever; the proxy's Extism cancel handle must
+    //    interrupt this after `wasm_hook_timeout`.
+    //  - "error": return a plugin error so the proxy's strict-mode logic
+    //    can decide whether to fail closed.
+    //  - "crlf-smuggling": attempt to set a header value containing CRLF;
+    //    the proxy must reject it.
+    if mode == "hang" {
+        // tight loop, deliberately unbounded; cancellable by the host.
+        loop {
+            std::hint::spin_loop();
+        }
+    }
+    if mode == "error" {
+        return Err(WithReturnCode::new(
+            extism_pdk::Error::msg("simulated plugin error"),
+            1,
+        ));
+    }
+
     let mut set_headers = serde_json::Map::new();
     set_headers.insert("x-canister-test".to_string(), json!("request-seen"));
     if mode == "inject-remove" {
         set_headers.insert("x-added-by-proxy".to_string(), json!("yes"));
+    }
+    if mode == "crlf-smuggling" {
+        set_headers.insert(
+            "x-evil".to_string(),
+            json!("benign\r\nset-cookie: admin=true"),
+        );
     }
 
     let remove_headers = if mode == "inject-remove" {

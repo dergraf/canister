@@ -359,6 +359,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ipnet",
+ "parking_lot",
  "rcgen",
  "reqwest",
  "rustls",
@@ -371,6 +372,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
  "wat",
  "x509-parser 0.16.0",
 ]

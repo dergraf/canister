@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, Limited, combinators::BoxBody};
 use hyper::body::SizeHint;
 use hyper::header::{CONTENT_LENGTH, HOST, HeaderName, HeaderValue, TRANSFER_ENCODING};
 use hyper::server::conn::http1;
@@ -22,7 +22,7 @@ use crate::ca::DynamicCa;
 use crate::client::{HttpsClient, build_client};
 use crate::egress;
 use crate::policy::OutboundPolicy;
-use crate::wasm::WasmEngine;
+use crate::wasm::{WasmEngine, WasmError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -36,57 +36,118 @@ pub enum ProxyError {
     Wasm(#[from] crate::wasm::WasmError),
 }
 
+/// Runtime limits shared with every request handler. Cloned freely; cheap.
+#[derive(Clone, Debug)]
+pub struct ProxyLimits {
+    pub max_buffered_body_bytes: usize,
+    pub wasm_hook_timeout: Duration,
+    pub upstream_request_timeout: Duration,
+    pub strict: bool,
+}
+
+impl Default for ProxyLimits {
+    fn default() -> Self {
+        Self {
+            max_buffered_body_bytes:
+                can_policy::config::ProxyConfig::DEFAULT_MAX_BUFFERED_BODY_BYTES,
+            wasm_hook_timeout: Duration::from_millis(
+                can_policy::config::ProxyConfig::DEFAULT_WASM_HOOK_TIMEOUT_MS,
+            ),
+            upstream_request_timeout: Duration::from_millis(
+                can_policy::config::ProxyConfig::DEFAULT_UPSTREAM_REQUEST_TIMEOUT_MS,
+            ),
+            strict: false,
+        }
+    }
+}
+
+impl ProxyLimits {
+    pub fn from_config(proxy: &can_policy::config::ProxyConfig, strict: bool) -> Self {
+        Self {
+            max_buffered_body_bytes: proxy.max_buffered_body_bytes(),
+            wasm_hook_timeout: proxy.wasm_hook_timeout(),
+            upstream_request_timeout: proxy.upstream_request_timeout(),
+            strict,
+        }
+    }
+}
+
+/// Single, fluent way to configure a `ProxyServer`. Replaces the three
+/// previous `new*` constructors. Build with `ProxyServerConfig::new(ca)` and
+/// chain `.with_interceptors`, `.with_network`, `.with_proxy_config`,
+/// `.with_strict` as needed.
+pub struct ProxyServerConfig {
+    pub ca: Arc<DynamicCa>,
+    pub interceptors: std::collections::HashMap<String, std::path::PathBuf>,
+    pub network: Option<can_policy::config::NetworkConfig>,
+    pub proxy: can_policy::config::ProxyConfig,
+    pub strict: bool,
+}
+
+impl ProxyServerConfig {
+    pub fn new(ca: Arc<DynamicCa>) -> Self {
+        Self {
+            ca,
+            interceptors: Default::default(),
+            network: None,
+            proxy: Default::default(),
+            strict: false,
+        }
+    }
+
+    pub fn with_interceptors(
+        mut self,
+        interceptors: std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> Self {
+        self.interceptors = interceptors;
+        self
+    }
+
+    pub fn with_network(mut self, network: can_policy::config::NetworkConfig) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    pub fn with_proxy_config(mut self, proxy: can_policy::config::ProxyConfig) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+}
+
 pub struct ProxyServer {
     ca: Arc<DynamicCa>,
     wasm_engine: Arc<WasmEngine>,
     client: HttpsClient,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    limits: ProxyLimits,
 }
 
 impl ProxyServer {
-    pub fn new(
-        ca: DynamicCa,
-        interceptors: &std::collections::HashMap<String, std::path::PathBuf>,
-    ) -> Result<Self, ProxyError> {
-        let wasm_engine = WasmEngine::new(interceptors)?;
-        Ok(Self {
-            ca: Arc::new(ca),
-            wasm_engine: Arc::new(wasm_engine),
-            client: build_client(),
-            dns_cache: can_net::dns_cache::DnsCache::new(Duration::from_secs(15)),
-            outbound_policy: OutboundPolicy::default(),
-        })
-    }
+    pub fn new(config: ProxyServerConfig) -> Result<Self, ProxyError> {
+        let wasm_engine = WasmEngine::new(&config.interceptors)?;
+        let outbound_policy = match &config.network {
+            Some(network) => OutboundPolicy::from_config(network),
+            None => OutboundPolicy::default(),
+        };
 
-    pub fn new_with_arc(
-        ca: Arc<DynamicCa>,
-        interceptors: &std::collections::HashMap<String, std::path::PathBuf>,
-    ) -> Result<Self, ProxyError> {
-        let wasm_engine = WasmEngine::new(interceptors)?;
-        Ok(Self {
-            ca,
-            wasm_engine: Arc::new(wasm_engine),
-            client: build_client(),
-            dns_cache: can_net::dns_cache::DnsCache::new(Duration::from_secs(15)),
-            outbound_policy: OutboundPolicy::default(),
-        })
-    }
-
-    pub fn new_with_policy(
-        ca: Arc<DynamicCa>,
-        interceptors: &std::collections::HashMap<String, std::path::PathBuf>,
-        network: &can_policy::config::NetworkConfig,
-    ) -> Result<Self, ProxyError> {
-        let wasm_engine = WasmEngine::new(interceptors)?;
-        let outbound_policy = OutboundPolicy::from_config(network);
+        // ProxyServer always uses interceptors from `ProxyServerConfig.interceptors`
+        // (which is canonically `config.proxy.interceptors`). Build the limits
+        // from the same `proxy` block so timeouts and body caps stay in sync.
+        let limits = ProxyLimits::from_config(&config.proxy, config.strict);
 
         Ok(Self {
-            ca,
+            ca: config.ca,
             wasm_engine: Arc::new(wasm_engine),
             client: build_client(),
             dns_cache: can_net::dns_cache::DnsCache::new(Duration::from_secs(15)),
             outbound_policy,
+            limits,
         })
     }
 
@@ -102,6 +163,7 @@ impl ProxyServer {
             let client = self.client.clone();
             let dns_cache = self.dns_cache.clone();
             let outbound_policy = self.outbound_policy.clone();
+            let limits = self.limits.clone();
             tokio::task::spawn(async move {
                 if let Err(err) = http1::Builder::new()
                     .preserve_header_case(true)
@@ -116,6 +178,7 @@ impl ProxyServer {
                                 client.clone(),
                                 dns_cache.clone(),
                                 outbound_policy.clone(),
+                                limits.clone(),
                             )
                         }),
                     )
@@ -136,6 +199,7 @@ async fn handle_proxy_request(
     client: HttpsClient,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    limits: ProxyLimits,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     if req.method() == Method::CONNECT {
         let authority = req
@@ -143,7 +207,7 @@ async fn handle_proxy_request(
             .authority()
             .map(|a| a.to_string())
             .unwrap_or_default();
-        let host_name_only = authority.split(':').next().unwrap_or("").to_string();
+        let host_name_only = parse_host_from_authority(&authority);
         let has_interceptor = wasm_engine.has_plugin(&host_name_only);
         debug!("Received CONNECT request for {}", authority);
 
@@ -158,6 +222,7 @@ async fn handle_proxy_request(
                             wasm_engine,
                             client.clone(),
                             dns_cache.clone(),
+                            limits.clone(),
                         )
                         .await
                         {
@@ -190,25 +255,24 @@ async fn handle_proxy_request(
     // For plain HTTP requests
     let host = extract_host(&req);
     if wasm_engine.has_plugin(&host) {
-        return handle_inner_request(req, wasm_engine, client.clone(), "http").await;
+        return handle_inner_request(req, wasm_engine, client.clone(), "http", limits).await;
     }
 
     // Plain HTTP passthrough
-    handle_http_passthrough(req, dns_cache, outbound_policy).await
+    handle_http_passthrough(req, dns_cache, outbound_policy, limits).await
 }
 
 async fn handle_http_passthrough(
     req: Request<hyper::body::Incoming>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    limits: ProxyLimits,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    let host = req.uri().host().map(|s| s.to_string()).unwrap_or_else(|| {
-        req.headers()
-            .get(hyper::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            .unwrap_or_default()
-    });
+    let host = req
+        .uri()
+        .host()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| extract_host(&req));
     let port = req.uri().port_u16().unwrap_or(80);
 
     match connect_via_cache(&dns_cache, &host, port, &outbound_policy).await {
@@ -226,10 +290,13 @@ async fn handle_http_passthrough(
                 }
             });
 
-            sender
-                .send_request(req)
+            match tokio::time::timeout(limits.upstream_request_timeout, sender.send_request(req))
                 .await
-                .map(|res| res.map(|body| body.boxed()))
+            {
+                Ok(Ok(res)) => Ok(res.map(|body| body.boxed())),
+                Ok(Err(e)) => Err(e),
+                Err(_elapsed) => Ok(gateway_timeout_response(limits.upstream_request_timeout)),
+            }
         }
         Err(e) => {
             let mut resp = Response::new(full_body(format!("Bad Gateway: {}", e)));
@@ -258,6 +325,7 @@ async fn handle_inner_request(
     wasm_engine: Arc<WasmEngine>,
     client: HttpsClient,
     default_scheme: &'static str,
+    limits: ProxyLimits,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     debug!("Intercepting request: {} {}", req.method(), req.uri());
 
@@ -276,6 +344,7 @@ async fn handle_inner_request(
             &host,
             "on_request_headers",
             serde_json::to_vec(&req_headers_json).unwrap_or_default(),
+            limits.wasm_hook_timeout,
         ) {
             Ok(output) => {
                 if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&output) {
@@ -288,10 +357,10 @@ async fn handle_inner_request(
                 }
             }
             Err(e) => {
-                debug!(
-                    "Wasm on_request_headers execution failed or not found for {}: {}",
-                    host, e
-                );
+                if let Some(resp) = handle_wasm_hook_error(&host, "on_request_headers", &e, &limits)
+                {
+                    return Ok(resp);
+                }
             }
         }
 
@@ -312,14 +381,36 @@ async fn handle_inner_request(
 
     let (mut parts, body) = req.into_parts();
     let req_body = if has_plugin && buffer_request_body {
-        let collected = body.collect().await?;
-        let trailers = collected
-            .trailers()
-            .cloned()
-            .map(|trailers| mutate_trailers(&wasm_engine, &host, "on_request_trailers", trailers));
+        let limited = Limited::new(body, limits.max_buffered_body_bytes);
+        let collected = match limited.collect().await {
+            Ok(c) => c,
+            Err(_) => {
+                warn!(
+                    "request body exceeded buffered limit of {} bytes for {}",
+                    limits.max_buffered_body_bytes, host
+                );
+                return Ok(payload_too_large_response(limits.max_buffered_body_bytes));
+            }
+        };
+        let trailers = collected.trailers().cloned().map(|trailers| {
+            mutate_trailers(
+                &wasm_engine,
+                &host,
+                "on_request_trailers",
+                trailers,
+                &limits,
+            )
+        });
         let has_trailers = trailers.as_ref().is_some_and(|t| !t.is_empty());
         let mut bytes = collected.to_bytes();
-        bytes = mutate_body_chunk_with_eos(&wasm_engine, &host, "on_request_body", bytes, true);
+        bytes = mutate_body_chunk_with_eos(
+            &wasm_engine,
+            &host,
+            "on_request_body",
+            bytes,
+            true,
+            &limits,
+        );
 
         update_length_headers(&mut parts.headers, bytes.len(), has_trailers);
 
@@ -331,6 +422,7 @@ async fn handle_inner_request(
             host.clone(),
             "on_request_body",
             "on_request_trailers",
+            limits.clone(),
         )
         .boxed()
     } else {
@@ -341,8 +433,18 @@ async fn handle_inner_request(
         egress::sanitize_h2c_headers(&mut upstream_req);
     }
 
-    let upstream_result: Result<Response<hyper::body::Incoming>, String> =
-        egress::forward_request(client.clone(), upstream_req, &original_scheme).await;
+    let upstream_fut = egress::forward_request(client.clone(), upstream_req, &original_scheme);
+    let upstream_result =
+        match tokio::time::timeout(limits.upstream_request_timeout, upstream_fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                warn!(
+                    "upstream request to {} exceeded timeout of {:?}",
+                    host, limits.upstream_request_timeout
+                );
+                return Ok(gateway_timeout_response(limits.upstream_request_timeout));
+            }
+        };
 
     match upstream_result {
         Ok(mut res) => {
@@ -353,27 +455,54 @@ async fn handle_inner_request(
                     "headers": res.headers().iter().map(|(k, v)| (k.as_str(), v.to_str().unwrap_or(""))).collect::<std::collections::HashMap<_, _>>()
                 });
 
-                if let Ok(output) = wasm_engine.execute(
+                match wasm_engine.execute(
                     &host,
                     "on_response_headers",
                     serde_json::to_vec(&resp_headers_json).unwrap_or_default(),
+                    limits.wasm_hook_timeout,
                 ) {
-                    if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&output) {
-                        if let Some(resp) = build_short_circuit_response(&resp_json) {
+                    Ok(output) => {
+                        if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&output)
+                        {
+                            if let Some(resp) = build_short_circuit_response(&resp_json) {
+                                return Ok(resp);
+                            }
+
+                            apply_header_mutations(res.headers_mut(), &resp_json);
+                            buffer_response_body = should_buffer_body(&resp_json);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(resp) =
+                            handle_wasm_hook_error(&host, "on_response_headers", &e, &limits)
+                        {
                             return Ok(resp);
                         }
-
-                        apply_header_mutations(res.headers_mut(), &resp_json);
-                        buffer_response_body = should_buffer_body(&resp_json);
                     }
                 }
             }
 
             let (mut parts, body) = res.into_parts();
             let resp_body: BoxBody<Bytes, hyper::Error> = if has_plugin && buffer_response_body {
-                let collected = body.collect().await?;
+                let limited = Limited::new(body, limits.max_buffered_body_bytes);
+                let collected = match limited.collect().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        warn!(
+                            "response body exceeded buffered limit of {} bytes for {}",
+                            limits.max_buffered_body_bytes, host
+                        );
+                        return Ok(bad_gateway_oversized(limits.max_buffered_body_bytes));
+                    }
+                };
                 let trailers = collected.trailers().cloned().map(|trailers| {
-                    mutate_trailers(&wasm_engine, &host, "on_response_trailers", trailers)
+                    mutate_trailers(
+                        &wasm_engine,
+                        &host,
+                        "on_response_trailers",
+                        trailers,
+                        &limits,
+                    )
                 });
                 let has_trailers = trailers.as_ref().is_some_and(|t| !t.is_empty());
                 let mut bytes = collected.to_bytes();
@@ -383,6 +512,7 @@ async fn handle_inner_request(
                     "on_response_body",
                     bytes,
                     true,
+                    &limits,
                 );
 
                 update_length_headers(&mut parts.headers, bytes.len(), has_trailers);
@@ -395,6 +525,7 @@ async fn handle_inner_request(
                     host,
                     "on_response_body",
                     "on_response_trailers",
+                    limits.clone(),
                 )
                 .boxed()
             } else {
@@ -418,8 +549,9 @@ async fn handle_tunnel(
     wasm_engine: Arc<WasmEngine>,
     client: HttpsClient,
     _dns_cache: can_net::dns_cache::DnsCache,
+    limits: ProxyLimits,
 ) -> Result<(), std::io::Error> {
-    let host = host_with_port.split(':').next().unwrap_or("").to_string();
+    let host = parse_host_from_authority(&host_with_port);
     debug!("Establishing TLS tunnel for {}", host);
 
     let (cert, key) = ca
@@ -441,7 +573,13 @@ async fn handle_tunnel(
         .serve_connection(
             tls_io,
             service_fn(move |req| {
-                handle_inner_request(req, wasm_engine.clone(), client.clone(), "https")
+                handle_inner_request(
+                    req,
+                    wasm_engine.clone(),
+                    client.clone(),
+                    "https",
+                    limits.clone(),
+                )
             }),
         )
         .await
@@ -451,6 +589,22 @@ async fn handle_tunnel(
 }
 
 fn split_target_host_port(target: &str) -> Result<(String, u16), std::io::Error> {
+    // Handle bracketed IPv6: [::1]:8080 or [2001:db8::1]:443
+    if let Some(stripped) = target.strip_prefix('[') {
+        let close = stripped
+            .find(']')
+            .ok_or_else(|| std::io::Error::other("malformed IPv6 authority"))?;
+        let host = &stripped[..close];
+        let rest = &stripped[close + 1..];
+        let port_str = rest
+            .strip_prefix(':')
+            .ok_or_else(|| std::io::Error::other("missing port after IPv6 authority"))?;
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| std::io::Error::other("invalid port"))?;
+        return Ok((host.to_string(), port));
+    }
+
     let mut split = target.rsplitn(2, ':');
     let port_str = split
         .next()
@@ -463,6 +617,22 @@ fn split_target_host_port(target: &str) -> Result<(String, u16), std::io::Error>
         .parse::<u16>()
         .map_err(|_| std::io::Error::other("invalid port"))?;
     Ok((host, port))
+}
+
+/// Parse the host out of an authority string. Correctly handles bracketed
+/// IPv6 literals (`[::1]:8080` → `::1`) and bare host:port pairs alike. Falls
+/// back to the input when the authority is malformed (rather than producing
+/// silently corrupt output).
+fn parse_host_from_authority(authority: &str) -> String {
+    if let Some(stripped) = authority.strip_prefix('[') {
+        if let Some(close) = stripped.find(']') {
+            return stripped[..close].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _port)) if !host.is_empty() && !host.contains(':') => host.to_string(),
+        _ => authority.to_string(),
+    }
 }
 
 async fn connect_via_cache(
@@ -515,14 +685,104 @@ fn full_body<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
+fn payload_too_large_response(limit: usize) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full_body(format!(
+        "Payload too large: buffered body exceeded {} bytes",
+        limit
+    )));
+    *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-canister-error"),
+        HeaderValue::from_static("body-too-large"),
+    );
+    resp
+}
+
+fn bad_gateway_oversized(limit: usize) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full_body(format!(
+        "Bad Gateway: upstream response exceeded buffered limit of {} bytes",
+        limit
+    )));
+    *resp.status_mut() = StatusCode::BAD_GATEWAY;
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-canister-error"),
+        HeaderValue::from_static("upstream-body-too-large"),
+    );
+    resp
+}
+
+fn gateway_timeout_response(timeout: Duration) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full_body(format!(
+        "Gateway Timeout: upstream did not respond within {:?}",
+        timeout
+    )));
+    *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-canister-error"),
+        HeaderValue::from_static("upstream-timeout"),
+    );
+    resp
+}
+
+fn wasm_failure_response(
+    host: &str,
+    function: &str,
+    err: &WasmError,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let mut resp = Response::new(full_body(format!(
+        "Bad Gateway: wasm hook {} for {} failed: {}",
+        function, host, err
+    )));
+    *resp.status_mut() = StatusCode::BAD_GATEWAY;
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-canister-error"),
+        match err {
+            WasmError::Timeout { .. } => HeaderValue::from_static("wasm-timeout"),
+            _ => HeaderValue::from_static("wasm-error"),
+        },
+    );
+    resp
+}
+
+/// Centralised Wasm error handler. In strict mode, every hook failure short-
+/// circuits with 502 (fail-closed). Otherwise headers-stage failures are
+/// logged at warn! and the request proceeds without the filter's mutations
+/// (preserves the pre-hardening behavior on streaming body hooks too).
+///
+/// Returns `Some(response)` when the caller should short-circuit with that
+/// response; `None` when processing should continue without applying the
+/// hook's output.
+fn handle_wasm_hook_error(
+    host: &str,
+    function: &str,
+    err: &WasmError,
+    limits: &ProxyLimits,
+) -> Option<Response<BoxBody<Bytes, hyper::Error>>> {
+    match err {
+        WasmError::Timeout { .. } => {
+            warn!("wasm hook {} for {} timed out: {}", function, host, err);
+        }
+        _ => {
+            warn!("wasm hook {} for {} failed: {}", function, host, err);
+        }
+    }
+
+    if limits.strict {
+        Some(wasm_failure_response(host, function, err))
+    } else {
+        None
+    }
+}
+
 fn extract_host<B>(req: &Request<B>) -> String {
-    req.uri().host().map(str::to_string).unwrap_or_else(|| {
-        req.headers()
-            .get(HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            .unwrap_or_default()
-    })
+    if let Some(host) = req.uri().host() {
+        return host.to_string();
+    }
+    req.headers()
+        .get(HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(parse_host_from_authority)
+        .unwrap_or_default()
 }
 
 fn build_short_circuit_response(
@@ -540,7 +800,14 @@ fn build_short_circuit_response(
     if let Some(headers) = hook_response.get("headers").and_then(|h| h.as_object()) {
         for (k, v) in headers {
             if let Some(v_str) = v.as_str() {
-                builder = builder.header(k, v_str);
+                if header_value_is_safe(v_str) {
+                    builder = builder.header(k, v_str);
+                } else {
+                    warn!(
+                        "wasm short-circuit response header {} dropped: forbidden CR/LF/NUL",
+                        k
+                    );
+                }
             }
         }
     }
@@ -558,6 +825,21 @@ fn build_short_circuit_response(
     }))
 }
 
+/// Reject any header value containing CR, LF, or NUL. Hyper would reject
+/// these too via `HeaderValue::from_str`, but failing here gives a clear
+/// log line naming the Wasm filter as the source rather than burying the
+/// failure inside hyper.
+fn header_value_is_safe(value: &str) -> bool {
+    !value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
+fn header_name_is_safe(name: &str) -> bool {
+    // Header names must be tchar per RFC 7230. We rely on HeaderName::from_bytes
+    // to fully validate, but explicitly reject the obvious smuggling chars
+    // here so the warn! log is unambiguous about why the mutation was dropped.
+    !name.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
 fn apply_header_mutations(headers: &mut hyper::HeaderMap, hook_response: &serde_json::Value) {
     let Some(mutations) = hook_response.get("mutations") else {
         return;
@@ -565,21 +847,46 @@ fn apply_header_mutations(headers: &mut hyper::HeaderMap, hook_response: &serde_
 
     if let Some(remove_headers) = mutations.get("remove_headers").and_then(|h| h.as_array()) {
         for name in remove_headers.iter().filter_map(|h| h.as_str()) {
+            if !header_name_is_safe(name) {
+                warn!("wasm remove_headers entry rejected (CR/LF/NUL): {:?}", name);
+                continue;
+            }
             if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
                 headers.remove(header_name);
+            } else {
+                warn!(
+                    "wasm remove_headers entry rejected (not a valid header name): {:?}",
+                    name
+                );
             }
         }
     }
 
     if let Some(set_headers) = mutations.get("set_headers").and_then(|h| h.as_object()) {
         for (name, value) in set_headers {
+            if !header_name_is_safe(name) {
+                warn!("wasm set_headers name rejected (CR/LF/NUL): {:?}", name);
+                continue;
+            }
             let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                warn!("wasm set_headers name rejected (invalid): {:?}", name);
                 continue;
             };
             let Some(value) = value.as_str() else {
                 continue;
             };
+            if !header_value_is_safe(value) {
+                warn!(
+                    "wasm set_headers value for {} rejected (CR/LF/NUL)",
+                    header_name
+                );
+                continue;
+            }
             let Ok(header_value) = HeaderValue::from_str(value) else {
+                warn!(
+                    "wasm set_headers value for {} rejected (not a valid header value)",
+                    header_name
+                );
                 continue;
             };
             headers.insert(header_name, header_value);
@@ -615,18 +922,31 @@ fn mutate_body_chunk_with_eos(
     function: &str,
     chunk: Bytes,
     end_of_stream: bool,
+    limits: &ProxyLimits,
 ) -> Bytes {
     let payload = serde_json::json!({
         "body": base64::prelude::BASE64_STANDARD.encode(&chunk),
         "end_of_stream": end_of_stream
     });
 
-    let Ok(output) = wasm_engine.execute(
+    let output = match wasm_engine.execute(
         host,
         function,
         serde_json::to_vec(&payload).unwrap_or_default(),
-    ) else {
-        return chunk;
+        limits.wasm_hook_timeout,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            // Streaming body hooks: log and pass the chunk through unchanged
+            // rather than aborting the in-flight response mid-stream. Even in
+            // strict mode this is the safer default — once headers are sent we
+            // can no longer return a 502.
+            warn!(
+                "wasm streaming hook {} for {} failed: {}",
+                function, host, e
+            );
+            return chunk;
+        }
     };
 
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output) else {
@@ -654,6 +974,7 @@ fn mutate_trailers(
     host: &str,
     function: &'static str,
     mut trailers: hyper::HeaderMap,
+    limits: &ProxyLimits,
 ) -> hyper::HeaderMap {
     if trailers.is_empty() {
         return trailers;
@@ -667,12 +988,17 @@ fn mutate_trailers(
         "end_of_stream": true
     });
 
-    let Ok(output) = wasm_engine.execute(
+    let output = match wasm_engine.execute(
         host,
         function,
         serde_json::to_vec(&payload).unwrap_or_default(),
-    ) else {
-        return trailers;
+        limits.wasm_hook_timeout,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("wasm trailers hook {} for {} failed: {}", function, host, e);
+            return trailers;
+        }
     };
 
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output) else {
@@ -691,6 +1017,7 @@ struct HookedBody<B> {
     trailers_function: &'static str,
     eos_emitted: bool,
     saw_trailers: bool,
+    limits: ProxyLimits,
 }
 
 fn single_chunk_body(
@@ -750,6 +1077,7 @@ impl<B> HookedBody<B> {
         host: String,
         function: &'static str,
         trailers_function: &'static str,
+        limits: ProxyLimits,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -759,6 +1087,7 @@ impl<B> HookedBody<B> {
             trailers_function,
             eos_emitted: false,
             saw_trailers: false,
+            limits,
         }
     }
 }
@@ -787,6 +1116,7 @@ where
                         self.function,
                         data,
                         end_of_stream,
+                        &self.limits,
                     );
                     Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))))
                 }
@@ -798,6 +1128,7 @@ where
                             &self.host,
                             self.trailers_function,
                             trailers,
+                            &self.limits,
                         );
                         Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))))
                     }
@@ -813,6 +1144,7 @@ where
                         self.function,
                         Bytes::new(),
                         true,
+                        &self.limits,
                     );
                     if !eos.is_empty() {
                         return Poll::Ready(Some(Ok(hyper::body::Frame::data(eos))));
@@ -822,5 +1154,63 @@ where
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_from_authority_ipv6_bracketed() {
+        assert_eq!(parse_host_from_authority("[::1]:8080"), "::1");
+        assert_eq!(
+            parse_host_from_authority("[2001:db8::1]:443"),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn parse_host_from_authority_ipv4_with_port() {
+        assert_eq!(parse_host_from_authority("127.0.0.1:8080"), "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_host_from_authority_host_only() {
+        assert_eq!(parse_host_from_authority("example.com"), "example.com");
+    }
+
+    #[test]
+    fn parse_host_from_authority_bare_ipv6_falls_back() {
+        // No brackets: ambiguous, but should not corrupt to "::1"
+        assert_eq!(parse_host_from_authority("::1"), "::1");
+    }
+
+    #[test]
+    fn header_value_safe_rejects_crlf() {
+        assert!(header_value_is_safe("plain"));
+        assert!(!header_value_is_safe("foo\r\nSet-Cookie: bad"));
+        assert!(!header_value_is_safe("foo\nbar"));
+        assert!(!header_value_is_safe("foo\0bar"));
+    }
+
+    #[test]
+    fn split_target_host_port_ipv6() {
+        assert_eq!(
+            split_target_host_port("[::1]:8080").unwrap(),
+            ("::1".to_string(), 8080)
+        );
+        assert_eq!(
+            split_target_host_port("[2001:db8::1]:443").unwrap(),
+            ("2001:db8::1".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn split_target_host_port_ipv4() {
+        assert_eq!(
+            split_target_host_port("example.com:80").unwrap(),
+            ("example.com".to_string(), 80)
+        );
     }
 }

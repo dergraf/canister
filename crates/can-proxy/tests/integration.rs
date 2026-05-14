@@ -42,8 +42,9 @@ async fn start_test_proxy(interceptors: HashMap<String, std::path::PathBuf>) -> 
         ensure_test_plugin_built();
     }
 
-    let ca = DynamicCa::generate().unwrap();
-    let proxy = ProxyServer::new(ca, &interceptors).unwrap();
+    let ca = Arc::new(DynamicCa::generate().unwrap());
+    let config = can_proxy::server::ProxyServerConfig::new(ca).with_interceptors(interceptors);
+    let proxy = ProxyServer::new(config).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -65,7 +66,37 @@ async fn start_test_proxy_with_network(
     }
 
     let ca = Arc::new(DynamicCa::generate().unwrap());
-    let proxy = ProxyServer::new_with_policy(ca, &interceptors, &network).unwrap();
+    let config = can_proxy::server::ProxyServerConfig::new(ca)
+        .with_interceptors(interceptors)
+        .with_network(network);
+    let proxy = ProxyServer::new(config).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        proxy.run(listener).await.unwrap();
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    addr
+}
+
+async fn start_test_proxy_with_proxy_config(
+    interceptors: HashMap<String, std::path::PathBuf>,
+    proxy_config: can_policy::config::ProxyConfig,
+    strict: bool,
+) -> SocketAddr {
+    if !interceptors.is_empty() {
+        ensure_test_plugin_built();
+    }
+
+    let ca = Arc::new(DynamicCa::generate().unwrap());
+    let config = can_proxy::server::ProxyServerConfig::new(ca)
+        .with_interceptors(interceptors)
+        .with_proxy_config(proxy_config)
+        .with_strict(strict);
+    let proxy = ProxyServer::new(config).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -122,6 +153,32 @@ async fn start_test_upstream() -> SocketAddr {
                         let removed = req.headers().contains_key("x-remove-me");
 
                         let body = format!("added={added};removed={removed}");
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain")
+                            .body(
+                                Full::new(Bytes::from(body))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .unwrap();
+                        return Ok::<_, hyper::Error>(resp);
+                    }
+
+                    if req.uri().path() == "/echo-evil" {
+                        let evil = req
+                            .headers()
+                            .get("x-evil")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("missing")
+                            .to_string();
+                        let smuggled = req
+                            .headers()
+                            .get("set-cookie")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("missing")
+                            .to_string();
+                        let body = format!("x_evil={evil};set_cookie={smuggled}");
                         let resp = Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "text/plain")
@@ -827,4 +884,161 @@ async fn test_websocket_upgrade_returns_not_implemented_for_now() {
 
     let res = sender.send_request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+fn test_plugin_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/test-plugin/target/wasm32-unknown-unknown/release/test_plugin.wasm")
+}
+
+#[tokio::test]
+async fn test_request_body_buffer_limit_returns_413() {
+    let upstream = start_test_upstream().await;
+
+    let mut interceptors = HashMap::new();
+    interceptors.insert("127.0.0.1".to_string(), test_plugin_path());
+
+    let proxy_config = can_policy::config::ProxyConfig {
+        max_buffered_body_bytes: Some(64),
+        ..Default::default()
+    };
+
+    let proxy_addr = start_test_proxy_with_proxy_config(interceptors, proxy_config, false).await;
+    let proxy_url = format!("http://{}", proxy_addr);
+    let client = Client::builder()
+        .proxy(Proxy::all(&proxy_url).unwrap())
+        .build()
+        .unwrap();
+
+    // Body well over the 64-byte cap; `x-canister-buffer: true` forces the
+    // proxy to fully buffer the request body before forwarding.
+    let big_body = vec![b'x'; 4 * 1024];
+    let url = format!("http://127.0.0.1:{}/echo", upstream.port());
+    let res = client
+        .post(url)
+        .header("x-canister-buffer", "true")
+        .body(big_body)
+        .send()
+        .await
+        .expect("failed to send oversized request through proxy");
+
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        res.headers()
+            .get("x-canister-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("body-too-large")
+    );
+}
+
+#[tokio::test]
+async fn test_wasm_hook_timeout_returns_502_in_strict_mode() {
+    let upstream = start_test_upstream().await;
+
+    let mut interceptors = HashMap::new();
+    interceptors.insert("127.0.0.1".to_string(), test_plugin_path());
+
+    let proxy_config = can_policy::config::ProxyConfig {
+        wasm_hook_timeout_ms: Some(50),
+        ..Default::default()
+    };
+
+    let proxy_addr = start_test_proxy_with_proxy_config(interceptors, proxy_config, true).await;
+    let proxy_url = format!("http://{}", proxy_addr);
+    let client = Client::builder()
+        .proxy(Proxy::all(&proxy_url).unwrap())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    // Mode "hang" puts the plugin into a tight infinite loop; the proxy's
+    // watchdog must cancel it after ~50 ms and return 502.
+    let url = format!("http://127.0.0.1:{}/echo", upstream.port());
+    let res = client
+        .get(url)
+        .header("x-canister-mode", "hang")
+        .send()
+        .await
+        .expect("expected proxy to respond rather than hang");
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get("x-canister-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("wasm-timeout")
+    );
+}
+
+#[tokio::test]
+async fn test_strict_mode_wasm_error_returns_502() {
+    let upstream = start_test_upstream().await;
+
+    let mut interceptors = HashMap::new();
+    interceptors.insert("127.0.0.1".to_string(), test_plugin_path());
+
+    let proxy_addr = start_test_proxy_with_proxy_config(
+        interceptors,
+        can_policy::config::ProxyConfig::default(),
+        true,
+    )
+    .await;
+    let proxy_url = format!("http://{}", proxy_addr);
+    let client = Client::builder()
+        .proxy(Proxy::all(&proxy_url).unwrap())
+        .build()
+        .unwrap();
+
+    // Mode "error" causes on_request_headers to return Err. In strict mode
+    // the proxy must fail closed with 502 and `x-canister-error: wasm-error`.
+    let url = format!("http://127.0.0.1:{}/echo", upstream.port());
+    let res = client
+        .get(url)
+        .header("x-canister-mode", "error")
+        .send()
+        .await
+        .expect("strict-mode plugin error should still produce a response");
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get("x-canister-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("wasm-error")
+    );
+}
+
+#[tokio::test]
+async fn test_wasm_crlf_header_is_dropped() {
+    let upstream = start_test_upstream().await;
+
+    let mut interceptors = HashMap::new();
+    interceptors.insert("127.0.0.1".to_string(), test_plugin_path());
+
+    // Non-strict: the request should succeed; the smuggled CRLF header must
+    // be silently dropped before reaching upstream.
+    let proxy_addr = start_test_proxy(interceptors).await;
+    let proxy_url = format!("http://{}", proxy_addr);
+    let client = Client::builder()
+        .proxy(Proxy::all(&proxy_url).unwrap())
+        .build()
+        .unwrap();
+
+    let url = format!("http://127.0.0.1:{}/echo-evil", upstream.port());
+    let res = client
+        .get(url)
+        .header("x-canister-mode", "crlf-smuggling")
+        .send()
+        .await
+        .expect("CRLF-smuggling request should reach upstream without the evil header");
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    // Upstream sees neither x-evil nor a smuggled set-cookie. The response
+    // body is passed through the test plugin's on_response_body hook which
+    // appends |RSCHUNK and |RESP-EOS markers.
+    assert!(
+        body.starts_with("x_evil=missing;set_cookie=missing"),
+        "smuggled headers must not reach upstream; got body: {body:?}"
+    );
 }

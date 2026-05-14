@@ -53,6 +53,21 @@ jobs:
       - name: Guard ignored tests metadata
         run: ./ci/check_ignored_tests.sh
 
+      - name: Guard against unannotated unwrap/expect/panic
+        run: ./ci/check_unwraps.sh
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Shellcheck integration scripts
+        run: shellcheck -x -P tests/integration tests/integration/*.sh ci/*.sh
+
+      - name: Install cargo-audit
+        run: cargo install --quiet cargo-audit --locked
+
+      - name: Cargo audit (advisory check)
+        run: cargo audit --deny warnings || echo "::warning::cargo audit reported findings"
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -743,6 +758,11 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [check, test, build, integration-fedora-selinux, integration-ubuntu-apparmor]
+    # Job-level escalation only — the rest of the workflow runs with the
+    # top-level `contents: read`. The release job needs write access to
+    # publish artifacts under `latest`.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 

@@ -396,11 +396,12 @@ fn setup_parent_network(
                 };
 
                 rt.block_on(async {
-                    let server = match can_proxy::server::ProxyServer::new_with_policy(
-                        ca,
-                        &interceptors,
-                        &config.network,
-                    ) {
+                    let proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
+                        .with_interceptors(interceptors)
+                        .with_network(config.network.clone())
+                        .with_proxy_config(config.proxy.clone())
+                        .with_strict(config.strict);
+                    let server = match can_proxy::server::ProxyServer::new(proxy_server_config) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!("proxy process: failed to start proxy server: {}", e);
@@ -787,6 +788,11 @@ fn child_entry(
     if notifier_enabled {
         // Retrieve the send end of the fd channel that was stashed by
         // enter_pid_namespace_supervised in the worker child.
+        // SAFETY-UNWRAP: NOTIFIER_SEND_FD is a process-local Mutex set by
+        // the same setup path before this point; only mutex poisoning could
+        // cause failure here, which would itself indicate a panic that
+        // already aborts the process. The expect() also encodes the
+        // setup-time invariant for readers.
         let send_fd = NOTIFIER_SEND_FD
             .lock()
             .unwrap()
@@ -1289,6 +1295,8 @@ fn enter_pid_namespace_supervised(
 
                             // Stash the send fd for later — child_entry will
                             // retrieve it after installing the seccomp filter.
+                            // SAFETY-UNWRAP: process-local Mutex; poisoning
+                            // would require a prior panic that already aborts.
                             *NOTIFIER_SEND_FD.lock().unwrap() = Some(send_fd);
 
                             tracing::debug!(

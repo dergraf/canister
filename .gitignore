@@ -8,3 +8,27 @@
 # Generated docs
 docs/src/generated/
 docs/book/
+
+# Patch artifacts
+*.orig
+*.rej
+
+# Build/runtime detritus
+/--out-dir/
+/.local/
+erl_crash.dump
+strace-*.log
+.nvimlog
+
+# Local scratch files at repo root
+/refactor*.py
+/rewrite_*.py
+/patch.patch
+/patch_*.sh
+/test_*.rs
+/test-policy.toml
+/test-recipe.toml
+/my_test_app/
+
+# Per-machine Claude Code settings (allowlists, default mode, etc.).
+.claude/settings.local.json

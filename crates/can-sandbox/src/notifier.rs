@@ -1465,7 +1465,11 @@ fn evaluate_sendmsg(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
         }
     };
 
+    // SAFETY-UNWRAP: hdr_bytes is sized MSGHDR_SIZE >= 48, and we slice
+    // fixed 8-byte / 4-byte windows whose lengths exactly match the target
+    // arrays — try_into() cannot fail.
     let msg_name_ptr = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
+    // SAFETY-UNWRAP: same fixed-window guarantee as msg_name_ptr above.
     let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize;
 
     // Defense-in-depth: block ancillary data (msg_control) on AF_INET/AF_INET6
@@ -1482,6 +1486,8 @@ fn evaluate_sendmsg(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
     //
     // IMPORTANT: This check runs BEFORE the restrict_outbound early-return so
     // that inet SCM_RIGHTS is always blocked regardless of outbound policy.
+    // SAFETY-UNWRAP: hdr_bytes is sized MSGHDR_SIZE >= 48; the 8-byte slice
+    // length matches u64 exactly.
     let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap());
     if msg_controllen > 0 {
         // Determine the socket address family to decide whether to allow.
@@ -1689,6 +1695,8 @@ fn evaluate_clone3(notif: &SeccompNotif, notifier_fd: RawFd) -> Verdict {
         return Verdict::Deny(libc::EPERM as u32);
     }
 
+    // SAFETY-UNWRAP: flags_bytes was just read as exactly 8 bytes; the
+    // try_into() to [u8; 8] cannot fail.
     let flags = u64::from_ne_bytes(flags_bytes.try_into().unwrap());
     let ns_flags = flags & NS_FLAGS_MASK;
     if ns_flags != 0 {
@@ -1984,6 +1992,8 @@ pub fn policy_from_config(
     }
     allowed_ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
     allowed_ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    // SAFETY-UNWRAP: PASTA_DNS_ADDR is a const &str whose validity as an
+    // IP literal is checked by can_net::pasta tests.
     allowed_ips.insert(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap());
 
     // Allow the host's default gateway — pasta mirrors the host's

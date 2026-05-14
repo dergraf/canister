@@ -14,14 +14,23 @@ FAILURES=()
 
 for test_file in "${TESTS_DIR}"/t_*.sh; do
     output_file=$(mktemp)
-    if bash "$test_file" >"$output_file" 2>&1; then
-        (( PASSED++ )) || true
-    elif grep -q "^SKIP " "$output_file"; then
-        (( SKIPPED++ )) || true
-    else
-        (( FAILED++ )) || true
-        FAILURES+=("$(basename "$test_file")")
-    fi
+    set +e
+    bash "$test_file" >"$output_file" 2>&1
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
+            (( PASSED++ )) || true
+            ;;
+        77)
+            # Exit 77 = skip_all() from lib.sh (autoconf convention).
+            (( SKIPPED++ )) || true
+            ;;
+        *)
+            (( FAILED++ )) || true
+            FAILURES+=("$(basename "$test_file") (exit $rc)")
+            ;;
+    esac
     cat "$output_file"
     rm -f "$output_file"
     echo ""

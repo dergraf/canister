@@ -260,9 +260,47 @@ pub struct ProxyConfig {
     /// Map of target domains to intercept -> path to Wasm plugin.
     #[serde(default)]
     pub interceptors: std::collections::HashMap<String, PathBuf>,
+
+    /// Maximum bytes buffered when a Wasm hook returns `buffer_body=true`.
+    /// Requests/responses exceeding the cap get a 413 (request) or are
+    /// truncated/aborted (response). Defaults to 8 MiB.
+    #[serde(default)]
+    pub max_buffered_body_bytes: Option<usize>,
+
+    /// Per-hook Wasm execution timeout in milliseconds. Plugins exceeding it
+    /// are cancelled and the request fails with 502. Defaults to 200 ms.
+    #[serde(default)]
+    pub wasm_hook_timeout_ms: Option<u64>,
+
+    /// Upstream request total timeout in milliseconds. Defaults to 30 000 ms.
+    #[serde(default)]
+    pub upstream_request_timeout_ms: Option<u64>,
 }
 
-impl ProxyConfig {}
+impl ProxyConfig {
+    pub const DEFAULT_MAX_BUFFERED_BODY_BYTES: usize = 8 * 1024 * 1024;
+    pub const DEFAULT_WASM_HOOK_TIMEOUT_MS: u64 = 200;
+    pub const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn max_buffered_body_bytes(&self) -> usize {
+        self.max_buffered_body_bytes
+            .unwrap_or(Self::DEFAULT_MAX_BUFFERED_BODY_BYTES)
+    }
+
+    pub fn wasm_hook_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.wasm_hook_timeout_ms
+                .unwrap_or(Self::DEFAULT_WASM_HOOK_TIMEOUT_MS),
+        )
+    }
+
+    pub fn upstream_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.upstream_request_timeout_ms
+                .unwrap_or(Self::DEFAULT_UPSTREAM_REQUEST_TIMEOUT_MS),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -592,6 +630,9 @@ impl RecipeFile {
                     .into_iter()
                     .map(|(k, p)| (k, PathBuf::from(expand_env_vars(&p.to_string_lossy()))))
                     .collect(),
+                max_buffered_body_bytes: self.proxy.max_buffered_body_bytes,
+                wasm_hook_timeout_ms: self.proxy.wasm_hook_timeout_ms,
+                upstream_request_timeout_ms: self.proxy.upstream_request_timeout_ms,
             },
         })
     }
@@ -678,6 +719,18 @@ impl RecipeFile {
                     m.extend(overlay.proxy.interceptors);
                     m
                 },
+                max_buffered_body_bytes: overlay
+                    .proxy
+                    .max_buffered_body_bytes
+                    .or(self.proxy.max_buffered_body_bytes),
+                wasm_hook_timeout_ms: overlay
+                    .proxy
+                    .wasm_hook_timeout_ms
+                    .or(self.proxy.wasm_hook_timeout_ms),
+                upstream_request_timeout_ms: overlay
+                    .proxy
+                    .upstream_request_timeout_ms
+                    .or(self.proxy.upstream_request_timeout_ms),
             },
         }
     }

@@ -154,6 +154,8 @@ impl SeccompProfile {
     /// Panics if the embedded default.toml is malformed (compile-time
     /// guarantee — this should never happen).
     pub fn default_baseline() -> Self {
+        // SAFETY-UNWRAP: default.toml is embedded via include_str! at build
+        // time; if it doesn't parse the binary cannot have been built.
         Self::from_embedded()
             .expect("embedded default.toml is malformed")
             .profile

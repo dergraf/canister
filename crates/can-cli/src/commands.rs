@@ -302,6 +302,9 @@ pub fn up(
         }
     };
 
+    // SAFETY-UNWRAP: sandbox_name was just resolved from this manifest's
+    // entries (either by explicit lookup or by taking the first key), so
+    // get() is guaranteed to return Some.
     let def = manifest.get(&sandbox_name).unwrap();
 
     // Print sandbox info.
