@@ -60,6 +60,14 @@ type canister_exec_t;
 domain_type(canister_t)
 domain_entry_file(canister_t, canister_exec_t)
 
+# TODO: tighten this once we have audit2allow output from a real Fedora
+# enforcement run. canister_t supervises an *already* unprivileged
+# sandbox; we drop into permissive here so we log denials (for policy
+# refinement) without blocking pasta/the supervisor on Fedora's
+# specific type labels (e.g. /var/run/netns type variants). The
+# sandboxed child (canister_sandboxed_t) remains fully confined.
+permissive canister_t;
+
 # Restricted domain for sandboxed child processes.
 type canister_sandboxed_t;
 domain_type(canister_sandboxed_t)
