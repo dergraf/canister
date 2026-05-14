@@ -52,6 +52,24 @@ EOF
 )
 _TMPFILES+=("$CONFIG")
 
+# Probe: does the supervisor's USER_NOTIF execve filter actually work in this
+# environment? On some kernels (notably Ubuntu noble cloud images), reading
+# /proc/<pid>/mem during execve returns EIO and the supervisor's
+# `evaluate_execve` denies everything as a safety fallback. We detect this
+# by trying to run the allowed shell with `allow_execve` configured — if
+# stderr complains "execve: failed to read pathname", the supervisor's
+# execve path is unreliable here and the rest of this file is meaningless.
+run_can run --recipe "$CONFIG" -- python3 -c "
+import os
+os.execv('${SH_CANON}', ['sh', '-c', 'echo PROBE_OK'])
+"
+if [[ "$RUN_STDOUT" != *"PROBE_OK"* ]]; then
+    if [[ "$RUN_STDERR" == *"execve: failed to read pathname"* ]]; then
+        skip_all "supervisor cannot read /proc/<pid>/mem during execve in this environment (kernel quirk); allow_execve filter not testable here"
+    fi
+    # Fall through — let the assertion fail with the diagnostic dump.
+fi
+
 # ---- Test: allowed binary execs ----
 begin_test "allowed binary in allow_execve runs"
 run_can run --recipe "$CONFIG" -- python3 -c "
