@@ -107,9 +107,17 @@ allow canister_t file_type:dir { getattr open read search };
 allow canister_t file_type:lnk_file { getattr read };
 
 # /proc access for PID namespace supervision and seccomp USER_NOTIF.
+# Includes dir/lnk_file access — pasta walks /proc/<pid>/ns/ as a
+# directory and dereferences the symlinks before setns()'ing into the
+# nsfs entry, and the supervisor reads /proc/<worker>/mem for arg-
+# level filtering.
 allow canister_t proc_t:file { getattr open read };
+allow canister_t proc_t:dir { getattr open read search };
+allow canister_t proc_t:lnk_file { getattr read };
 allow canister_t canister_sandboxed_t:process { ptrace signal sigkill };
 allow canister_t canister_sandboxed_t:file { getattr open read };
+allow canister_t canister_sandboxed_t:dir { getattr open read search };
+allow canister_t canister_sandboxed_t:lnk_file { getattr read };
 
 # Namespace fs access — pasta opens /proc/<pid>/ns/{user,net} (nsfs_t)
 # to setns() into the child's namespaces; without this Fedora's SELinux

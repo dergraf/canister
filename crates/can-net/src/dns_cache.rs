@@ -67,18 +67,23 @@ impl DnsCache {
         let nameserver: IpAddr = can_crate_upstream_dns()?;
         let group = NameServerConfigGroup::from_ips_clear(&[nameserver], 53, true);
         let config = ResolverConfig::from_parts(None, Vec::new(), group);
-        let resolver = Resolver::new(config, ResolverOpts::default()).ok()?;
 
         // CDNs (Cloudflare, Fastly, …) typically return one A record per
         // query and rotate edges across requests. A single lookup catches
         // only the supervisor's slice of edges; the sandboxed worker's
         // separate query may land on a different one. Issue a small burst
-        // of queries and union the results to widen coverage. `min_ttl`
-        // (and the per-domain `valid_until`) still bound how often the
-        // burst re-runs.
+        // of queries through fresh resolvers (no internal hickory cache)
+        // and union the results to widen coverage. `min_ttl` (and the
+        // per-domain `valid_until`) still bound how often the burst
+        // re-runs.
+        let mut opts = ResolverOpts::default();
+        opts.cache_size = 0;
         let mut ips: HashSet<IpAddr> = HashSet::new();
         let mut min_valid_until = None;
-        for _ in 0..3 {
+        for _ in 0..5 {
+            let Ok(resolver) = Resolver::new(config.clone(), opts.clone()) else {
+                break;
+            };
             let Ok(lookup) = resolver.lookup_ip(domain) else {
                 break;
             };

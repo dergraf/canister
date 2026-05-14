@@ -989,6 +989,37 @@ fn read_proc_string(pid: u32, addr: u64, max_len: usize) -> Result<String, Notif
     Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
+/// Read a NUL-terminated string from a child process's memory with retry.
+///
+/// On some kernels (e.g. Ubuntu noble cloud kernels), `/proc/<pid>/mem`
+/// returns EIO when the worker is paused mid-`execve()` — the mm is in a
+/// transient state between the old and new program. This wrapper retries
+/// the read with small backoffs, giving the kernel time to either commit
+/// the new mm or roll back to the old one. Used only for execve/execveat;
+/// other syscalls don't trigger the transient state.
+fn read_proc_string_with_retry(
+    pid: u32,
+    addr: u64,
+    max_len: usize,
+) -> Result<String, NotifierError> {
+    const RETRIES: u32 = 5;
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+
+    let mut last_err = None;
+    for attempt in 0..RETRIES {
+        match read_proc_string(pid, addr, max_len) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if attempt < RETRIES - 1 {
+                    std::thread::sleep(SLEEP);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
 // ---------------------------------------------------------------------------
 // Syscall evaluators
 // ---------------------------------------------------------------------------
@@ -1831,7 +1862,7 @@ fn evaluate_execve(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: R
         return Verdict::Allow;
     }
 
-    let pathname = match read_proc_string(pid, pathname_ptr, 4096) {
+    let pathname = match read_proc_string_with_retry(pid, pathname_ptr, 4096) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(pid, error = %e, "execve: failed to read pathname, denying");
@@ -1886,7 +1917,7 @@ fn evaluate_execveat(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd:
     }
 
     // Read the pathname.
-    let pathname = match read_proc_string(pid, pathname_ptr, 4096) {
+    let pathname = match read_proc_string_with_retry(pid, pathname_ptr, 4096) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(pid, error = %e, "execveat: failed to read pathname, denying");
