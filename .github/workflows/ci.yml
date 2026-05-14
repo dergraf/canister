@@ -115,6 +115,43 @@ jobs:
         if: steps.sandbox-check.outputs.sandbox == 'true'
         run: ./tests/integration/run.sh
 
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup toolchain
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: coverage-${{ runner.os }}-
+
+      - name: Install cargo-llvm-cov
+        run: cargo install --quiet cargo-llvm-cov --locked
+
+      - name: Run coverage
+        # Threshold is enforced inside ci/coverage.sh (default 65%, override
+        # via $COVERAGE_THRESHOLD). The script also writes the lcov artifact
+        # so the post-job upload-artifact step picks it up.
+        run: ./ci/coverage.sh --lcov lcov.info
+
+      - name: Upload lcov artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 7
+
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
