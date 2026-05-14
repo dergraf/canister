@@ -989,35 +989,97 @@ fn read_proc_string(pid: u32, addr: u64, max_len: usize) -> Result<String, Notif
     Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
-/// Read a NUL-terminated string from a child process's memory with retry.
+/// Read a NUL-terminated string from a child process's memory, with a
+/// `process_vm_readv` fallback and a backoff retry for `/proc/<pid>/mem`.
 ///
 /// On some kernels (e.g. Ubuntu noble cloud kernels), `/proc/<pid>/mem`
 /// returns EIO when the worker is paused mid-`execve()` — the mm is in a
-/// transient state between the old and new program. This wrapper retries
-/// the read with small backoffs, giving the kernel time to either commit
-/// the new mm or roll back to the old one. Used only for execve/execveat;
-/// other syscalls don't trigger the transient state.
+/// transient state between the old and new program. `process_vm_readv`
+/// is implemented through a different kernel path (no per-fd mm-access
+/// check at open time) and frequently succeeds in this window. If both
+/// fail, retry the proc/mem read with backoff to give the kernel time to
+/// either commit the new mm or roll back. Used only for execve/execveat.
 fn read_proc_string_with_retry(
     pid: u32,
     addr: u64,
     max_len: usize,
 ) -> Result<String, NotifierError> {
-    const RETRIES: u32 = 5;
-    const SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+    // Fast path 1: try process_vm_readv. Works on most kernels.
+    if let Ok(s) = read_proc_string_vm(pid, addr, max_len) {
+        return Ok(s);
+    }
+
+    // Fast path 2: try /proc/<pid>/mem once without sleeping.
+    if let Ok(s) = read_proc_string(pid, addr, max_len) {
+        return Ok(s);
+    }
+
+    // Slow path: backoff loop alternating both mechanisms.
+    const RETRIES: u32 = 12;
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
 
     let mut last_err = None;
-    for attempt in 0..RETRIES {
+    for _ in 0..RETRIES {
+        std::thread::sleep(SLEEP);
+        if let Ok(s) = read_proc_string_vm(pid, addr, max_len) {
+            return Ok(s);
+        }
         match read_proc_string(pid, addr, max_len) {
             Ok(s) => return Ok(s),
-            Err(e) => {
-                if attempt < RETRIES - 1 {
-                    std::thread::sleep(SLEEP);
-                }
-                last_err = Some(e);
-            }
+            Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.expect("loop runs at least once"))
+}
+
+/// Read a string from another process's memory via `process_vm_readv(2)`.
+///
+/// This bypasses the `/proc/<pid>/mem` open + read sequence. The kernel
+/// performs the mm-access check at call time rather than at open time,
+/// which means it can succeed during the brief window where /proc/mem
+/// returns EIO mid-execve.
+fn read_proc_string_vm(pid: u32, addr: u64, max_len: usize) -> Result<String, NotifierError> {
+    if pid == 0 {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pid is 0",
+        )));
+    }
+    if max_len == 0 || max_len > MAX_PROC_MEM_READ {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_len {max_len} out of bounds"),
+        )));
+    }
+    if addr >= KERNEL_ADDR_BOUNDARY
+        || addr
+            .checked_add(max_len as u64)
+            .is_none_or(|end| end > KERNEL_ADDR_BOUNDARY)
+    {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "address in kernel space",
+        )));
+    }
+
+    let mut buf = vec![0u8; max_len];
+    let local_iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: max_len,
+    };
+    let remote_iov = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: max_len,
+    };
+    // SAFETY: we pass valid iovecs sized to `max_len`; the kernel writes
+    // at most that many bytes into `buf` and returns the count.
+    let n = unsafe { libc::process_vm_readv(pid as i32, &local_iov, 1, &remote_iov, 1, 0) };
+    if n < 0 {
+        return Err(NotifierError::ProcMem(std::io::Error::last_os_error()));
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
 // ---------------------------------------------------------------------------
