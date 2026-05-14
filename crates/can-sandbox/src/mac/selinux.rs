@@ -46,6 +46,7 @@ require {
     type proc_t;
     type fs_t;
     type tmpfs_t;
+    type nsfs_t;
 }
 
 ########################################
@@ -109,6 +110,12 @@ allow canister_t file_type:lnk_file { getattr read };
 allow canister_t proc_t:file { getattr open read };
 allow canister_t canister_sandboxed_t:process { ptrace signal sigkill };
 allow canister_t canister_sandboxed_t:file { getattr open read };
+
+# Namespace fs access — pasta opens /proc/<pid>/ns/{user,net} (nsfs_t)
+# to setns() into the child's namespaces; without this Fedora's SELinux
+# denies the open with "netns dir open: Permission denied".
+allow canister_t nsfs_t:file { getattr open read };
+allow canister_t nsfs_t:dir { getattr open read search };
 
 # Network: socket operations for pasta coordination and sandboxed networking.
 allow canister_t self:tcp_socket { create accept bind connect listen getattr setopt shutdown };

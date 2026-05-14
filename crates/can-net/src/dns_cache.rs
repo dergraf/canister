@@ -68,14 +68,34 @@ impl DnsCache {
         let group = NameServerConfigGroup::from_ips_clear(&[nameserver], 53, true);
         let config = ResolverConfig::from_parts(None, Vec::new(), group);
         let resolver = Resolver::new(config, ResolverOpts::default()).ok()?;
-        let lookup = resolver.lookup_ip(domain).ok()?;
-        let ips: HashSet<IpAddr> = lookup.iter().collect();
+
+        // CDNs (Cloudflare, Fastly, …) typically return one A record per
+        // query and rotate edges across requests. A single lookup catches
+        // only the supervisor's slice of edges; the sandboxed worker's
+        // separate query may land on a different one. Issue a small burst
+        // of queries and union the results to widen coverage. `min_ttl`
+        // (and the per-domain `valid_until`) still bound how often the
+        // burst re-runs.
+        let mut ips: HashSet<IpAddr> = HashSet::new();
+        let mut min_valid_until = None;
+        for _ in 0..3 {
+            let Ok(lookup) = resolver.lookup_ip(domain) else {
+                break;
+            };
+            ips.extend(lookup.iter());
+            min_valid_until = match min_valid_until {
+                None => Some(lookup.valid_until()),
+                Some(prev) => Some(prev.min(lookup.valid_until())),
+            };
+        }
         if ips.is_empty() {
             return None;
         }
 
         let now = Instant::now();
-        let ttl_from_resolver = lookup.valid_until().saturating_duration_since(now);
+        let ttl_from_resolver = min_valid_until
+            .map(|t| t.saturating_duration_since(now))
+            .unwrap_or(Duration::ZERO);
         let ttl = std::cmp::max(self.min_ttl, ttl_from_resolver);
 
         let mut guard = self.inner.write().ok()?;

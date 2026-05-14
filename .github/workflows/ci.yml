@@ -457,6 +457,12 @@ jobs:
           cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
           chmod +x ~/canister/tests/integration/*.sh
           cp -r /tmp/canister-unpack/recipes ~/canister/recipes
+          # Install recipes into the XDG-discoverable location so `can run
+          # -r <name>` resolves them. `baseline_search_dirs()` looks at
+          # $XDG_CONFIG_HOME/canister/recipes (default ~/.config/...) but
+          # does NOT scan ~/canister/recipes/.
+          mkdir -p ~/.config/canister
+          cp -r ~/canister/recipes ~/.config/canister/recipes
           echo "--- Artifact layout ---"
           find ~/canister -type f | head -40
           REMOTE
@@ -670,6 +676,12 @@ jobs:
           cp -r /tmp/canister-unpack/integration ~/canister/tests/integration
           chmod +x ~/canister/tests/integration/*.sh
           cp -r /tmp/canister-unpack/recipes ~/canister/recipes
+          # Install recipes into the XDG-discoverable location so `can run
+          # -r <name>` resolves them. `baseline_search_dirs()` looks at
+          # $XDG_CONFIG_HOME/canister/recipes (default ~/.config/...) but
+          # does NOT scan ~/canister/recipes/.
+          mkdir -p ~/.config/canister
+          cp -r ~/canister/recipes ~/.config/canister/recipes
           echo "--- Artifact layout ---"
           find ~/canister -type f | head -40
           REMOTE
