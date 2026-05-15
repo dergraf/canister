@@ -1195,6 +1195,100 @@ mod tests {
     }
 
     #[test]
+    fn header_value_safe_accepts_normal_punctuation_and_high_bytes() {
+        // HTTP field-value allows tabs, spaces, printable ASCII, and
+        // obs-text (>= 0x80) per RFC 7230. We only block the framing
+        // characters; everything else must round-trip.
+        assert!(header_value_is_safe("application/json; charset=utf-8"));
+        assert!(header_value_is_safe("Bearer abc.def-ghi_jkl/mno=pqr"));
+        assert!(header_value_is_safe("with\ttab"));
+        assert!(header_value_is_safe("multi word value"));
+        assert!(header_value_is_safe("ümlauts-and-€-symbols"));
+    }
+
+    #[test]
+    fn header_value_safe_rejects_lone_cr_or_lf() {
+        // Lone CR or LF (not just CRLF together) can still split a
+        // header on permissive parsers. Reject both individually.
+        assert!(!header_value_is_safe("foo\rbar"));
+        assert!(!header_value_is_safe("\rstart"));
+        assert!(!header_value_is_safe("end\r"));
+        assert!(!header_value_is_safe("end\n"));
+        assert!(!header_value_is_safe("multi\rline\rsplits"));
+    }
+
+    #[test]
+    fn header_name_safe_rejects_smuggling_bytes() {
+        assert!(header_name_is_safe("x-canister-test"));
+        assert!(header_name_is_safe("Content-Type"));
+
+        // The three bytes our predicate must reject; everything else
+        // is hyper's problem (HeaderName::from_bytes enforces tchar).
+        assert!(!header_name_is_safe("x-evil\r\nset-cookie"));
+        assert!(!header_name_is_safe("x-evil\rcontinuation"));
+        assert!(!header_name_is_safe("x-evil\nlfsplit"));
+        assert!(!header_name_is_safe("x-evil\0nul"));
+
+        // Edge: empty name string. The predicate itself returns true
+        // (no banned bytes); HeaderName::from_bytes rejects empty.
+        assert!(header_name_is_safe(""));
+    }
+
+    /// Contract test: `apply_header_mutations` must skip every set or
+    /// remove entry whose name or value contains a smuggling byte,
+    /// applying the rest unchanged. The fixture mixes a benign
+    /// mutation with a CRLF-laden header name AND value to ensure
+    /// both rejection paths fire and neither blocks the others.
+    #[test]
+    fn apply_header_mutations_drops_smuggling_entries() {
+        use hyper::HeaderMap;
+        use serde_json::json;
+
+        let hook_response = json!({
+            "mutations": {
+                "set_headers": {
+                    "x-benign": "ok",
+                    "x-evil-value": "smuggled\r\nset-cookie: pwn=yes",
+                    "x-evil-name\r\nset-cookie": "anything",
+                },
+                "remove_headers": [
+                    "x-benign-to-remove",
+                    "x-evil-remove\r\nlol",
+                ],
+            }
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-benign-to-remove",
+            hyper::header::HeaderValue::from_static("present"),
+        );
+
+        apply_header_mutations(&mut headers, &hook_response);
+
+        // Benign set survived.
+        assert_eq!(
+            headers
+                .get("x-benign")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "ok",
+        );
+        // Smuggling-laden set was dropped.
+        assert!(!headers.contains_key("x-evil-value"));
+        // Smuggling-named set was dropped (the CRLF prevents the name
+        // from being parsed at all, but more importantly, the proxy
+        // must not forward such a name to upstream).
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.as_str().contains("x-evil-name"))
+        );
+        // Benign remove honored.
+        assert!(!headers.contains_key("x-benign-to-remove"));
+    }
+
+    #[test]
     fn split_target_host_port_ipv6() {
         assert_eq!(
             split_target_host_port("[::1]:8080").unwrap(),

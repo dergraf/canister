@@ -1398,6 +1398,266 @@ deny = ["/root"]
     }
 
     #[test]
+    fn merge_three_recipes_any_strict_true_wins() {
+        // strict=true sticky across the chain in every position.
+        let strict_first = parse_recipe("strict = true")
+            .merge(parse_recipe(""))
+            .merge(parse_recipe("strict = false"));
+        assert_eq!(strict_first.strict, Some(true), "strict=true in slot 0");
+
+        let strict_middle = parse_recipe("")
+            .merge(parse_recipe("strict = true"))
+            .merge(parse_recipe("strict = false"));
+        assert_eq!(strict_middle.strict, Some(true), "strict=true in slot 1");
+
+        let strict_last = parse_recipe("strict = false")
+            .merge(parse_recipe(""))
+            .merge(parse_recipe("strict = true"));
+        assert_eq!(strict_last.strict, Some(true), "strict=true in slot 2");
+    }
+
+    #[test]
+    fn merge_three_recipes_egress_chain_last_wins() {
+        // egress: None + Direct + ProxyOnly → ProxyOnly (last wins)
+        let merged = parse_recipe("")
+            .merge(parse_recipe(
+                r#"
+[network]
+egress = "direct"
+"#,
+            ))
+            .merge(parse_recipe(
+                r#"
+[network]
+egress = "proxy-only"
+"#,
+            ));
+        assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
+
+        // egress: ProxyOnly + None-set + Direct → Direct (last non-None
+        // value wins; an "empty" recipe doesn't reset to None)
+        let merged = parse_recipe(
+            r#"
+[network]
+egress = "proxy-only"
+"#,
+        )
+        .merge(parse_recipe(""))
+        .merge(parse_recipe(
+            r#"
+[network]
+egress = "direct"
+"#,
+        ));
+        assert_eq!(merged.network.egress, Some(EgressMode::Direct));
+    }
+
+    #[test]
+    fn merge_three_recipes_allow_extra_union_dedupes() {
+        // Same syscall named in two different recipes must dedupe.
+        let merged = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace"]
+"#,
+        )
+        .merge(parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace", "io_uring_setup"]
+"#,
+        ))
+        .merge(parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["io_uring_setup", "io_uring_enter"]
+"#,
+        ));
+        // Union semantics + insertion-order preservation. dedup must
+        // not produce ["ptrace", "ptrace", "io_uring_setup", ...].
+        assert_eq!(merged.syscalls.allow_extra.len(), 3);
+        for s in ["ptrace", "io_uring_setup", "io_uring_enter"] {
+            assert!(
+                merged.syscalls.allow_extra.contains(&s.to_string()),
+                "{s} missing from merged allow_extra",
+            );
+        }
+    }
+
+    #[test]
+    fn merge_recipe_with_allow_and_deny_extra_keeps_both() {
+        // Intra-recipe contradiction: same syscall in both allow_extra
+        // and deny_extra. The merge layer faithfully unions both lists;
+        // the actual conflict resolution (deny wins) is enforced later
+        // by SeccompProfile::apply_overrides.
+        let merged = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace"]
+deny_extra = ["ptrace"]
+"#,
+        );
+        assert!(merged.syscalls.allow_extra.contains(&"ptrace".to_string()));
+        assert!(merged.syscalls.deny_extra.contains(&"ptrace".to_string()));
+    }
+
+    #[test]
+    fn merge_three_recipes_strict_invariant_with_egress_change() {
+        // Realistic three-way chain: a strict baseline, an auto-detected
+        // recipe that loosens egress, and an explicit -r that adds
+        // domains. strict should remain Some(true).
+        let strict_base = parse_recipe(
+            r#"
+strict = true
+
+[network]
+egress = "proxy-only"
+"#,
+        );
+        let auto_detected = parse_recipe(
+            r#"
+[network]
+allow_domains = ["github.com"]
+"#,
+        );
+        let cli_override = parse_recipe(
+            r#"
+[network]
+allow_domains = ["registry.npmjs.org"]
+"#,
+        );
+        let merged = strict_base.merge(auto_detected).merge(cli_override);
+        assert_eq!(merged.strict, Some(true));
+        assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
+        // Both domains union into the final allow list.
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "github.com")
+        );
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "registry.npmjs.org")
+        );
+    }
+
+    #[test]
+    fn merge_proxy_interceptors_overlay_overrides_per_key() {
+        // proxy.interceptors is a map: overlay entries override same-host
+        // entries in the base, while non-overlapping keys union.
+        let base = parse_recipe(
+            r#"
+[proxy.interceptors]
+"example.com" = "/plugins/a.wasm"
+"api.example.org" = "/plugins/b.wasm"
+"#,
+        );
+        let overlay = parse_recipe(
+            r#"
+[proxy.interceptors]
+"example.com" = "/plugins/a2.wasm"
+"newhost.io" = "/plugins/c.wasm"
+"#,
+        );
+        let merged = base.merge(overlay);
+        let interceptors = &merged.proxy.interceptors;
+        assert_eq!(
+            interceptors.get("example.com").map(|p| p.as_path()),
+            Some(std::path::Path::new("/plugins/a2.wasm")),
+            "overlay must win for shared key",
+        );
+        assert_eq!(
+            interceptors.get("api.example.org").map(|p| p.as_path()),
+            Some(std::path::Path::new("/plugins/b.wasm")),
+            "base-only key preserved",
+        );
+        assert_eq!(
+            interceptors.get("newhost.io").map(|p| p.as_path()),
+            Some(std::path::Path::new("/plugins/c.wasm")),
+            "overlay-only key added",
+        );
+    }
+
+    #[test]
+    fn merge_proxy_limit_options_last_some_wins() {
+        let base = parse_recipe(
+            r#"
+[proxy]
+max_buffered_body_bytes = 1024
+wasm_hook_timeout_ms = 100
+"#,
+        );
+        // Empty overlay must NOT clear the values from base.
+        let merged_empty_overlay = base.clone().merge(parse_recipe(""));
+        assert_eq!(
+            merged_empty_overlay.proxy.max_buffered_body_bytes,
+            Some(1024)
+        );
+        assert_eq!(merged_empty_overlay.proxy.wasm_hook_timeout_ms, Some(100));
+
+        // Overlay with its own values overrides.
+        let merged_override = base.merge(parse_recipe(
+            r#"
+[proxy]
+max_buffered_body_bytes = 8192
+upstream_request_timeout_ms = 5000
+"#,
+        ));
+        assert_eq!(merged_override.proxy.max_buffered_body_bytes, Some(8192));
+        // wasm_hook_timeout_ms from base survives since overlay didn't set it.
+        assert_eq!(merged_override.proxy.wasm_hook_timeout_ms, Some(100));
+        assert_eq!(
+            merged_override.proxy.upstream_request_timeout_ms,
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn merge_case_different_domains_preserved_then_normalized_at_policy() {
+        // The recipe merge layer treats domain entries as opaque strings
+        // (union dedupes by exact bytes). The policy layer
+        // (OutboundPolicy::from_config) is what folds case. This test
+        // documents the contract so a future refactor doesn't
+        // accidentally lowercase at merge time and break the round-trip
+        // through serde for diagnostic output.
+        let a = parse_recipe(
+            r#"
+[network]
+allow_domains = ["Example.com"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[network]
+allow_domains = ["example.com"]
+"#,
+        );
+        let merged = a.merge(b);
+        // Both case variants present at the recipe layer.
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "Example.com"),
+            "merged should still contain Example.com",
+        );
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "example.com"),
+            "merged should still contain example.com",
+        );
+    }
+
+    #[test]
     fn merge_match_prefix_preserved() {
         let a = parse_recipe(
             r#"

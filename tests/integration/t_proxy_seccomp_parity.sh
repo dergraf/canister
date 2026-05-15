@@ -144,4 +144,201 @@ case "$RUN_STDOUT" in
         ;;
 esac
 
+# ============================================================================
+# Matrix extension: cover the rest of the policy axes
+# ============================================================================
+
+# ---- Test 4: CIDR allow_ips in proxy-only mode ----
+# The proxy's connect_via_cache must agree with NetworkConfig.allow_ips
+# CIDR notation. Even in proxy-only mode, this matters when an
+# interceptor returns Continue and the proxy dials upstream by IP — the
+# proxy's allows_ip check must respect the CIDR.
+CIDR_CONFIG=$(tmpconfig <<'EOF'
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+
+[network]
+egress = "proxy-only"
+allow_ips = ["10.0.0.0/24"]
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[syscalls]
+EOF
+)
+_TMPFILES+=("$CIDR_CONFIG")
+
+begin_test "proxy denies IP outside CIDR in allow_ips"
+run_can run --recipe "$CIDR_CONFIG" -- python3 -c '
+import os, urllib.request, urllib.error
+proxy = os.environ.get("HTTP_PROXY")
+handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+opener = urllib.request.build_opener(handler)
+# 11.0.0.5 is outside 10.0.0.0/24
+req = urllib.request.Request("http://11.0.0.5/")
+try:
+    resp = opener.open(req, timeout=3)
+    print(f"UNEXPECTED status={resp.status}")
+except urllib.error.HTTPError as e:
+    body = e.read()[:200].decode("utf-8", errors="replace")
+    print(f"BLOCKED status={e.code} body={body}")
+except Exception as e:
+    print(f"ERR error={e}")
+'
+case "$RUN_STDOUT" in
+    *"BLOCKED status=502"*"not allowed by policy"*) pass ;;
+    *) fail "expected 502 policy block for 11.0.0.5 outside 10.0.0.0/24, got: $RUN_STDOUT" ;;
+esac
+
+begin_test "seccomp denies direct connect even to IP inside CIDR (proxy-only)"
+# In proxy-only mode the seccomp filter unconditionally denies non-proxy
+# direct egress — allow_ips is for the proxy's outbound policy, not for
+# the worker's syscall budget. This pins ADR-0006 semantics.
+run_can run --recipe "$CIDR_CONFIG" -- python3 -c '
+import errno, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect(("10.0.0.5", 80))     # inside the CIDR
+    print("DIRECT_ALLOWED_UNEXPECTED")
+except (PermissionError, OSError) as e:
+    code = getattr(e, "errno", None)
+    if isinstance(e, PermissionError) or code in (errno.EPERM, errno.EACCES):
+        print("DIRECT_DENIED")
+    else:
+        print(f"DIRECT_ERRNO_{code}")
+finally:
+    s.close()
+'
+case "$RUN_STDOUT" in
+    *DIRECT_DENIED*) pass ;;
+    *) fail "expected DIRECT_DENIED even for in-CIDR IP under proxy-only; got: $RUN_STDOUT" ;;
+esac
+
+# ---- Test 5: egress = "none" — both layers deny everything ----
+NONE_CONFIG=$(tmpconfig <<'EOF'
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+
+[network]
+egress = "none"
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[syscalls]
+EOF
+)
+_TMPFILES+=("$NONE_CONFIG")
+
+begin_test "egress=none: no HTTP_PROXY is exported (no proxy to use)"
+run_can run --recipe "$NONE_CONFIG" -- sh -c 'echo "PROXY=${HTTP_PROXY:-unset}"'
+# In egress=none mode there should be no proxy started, so HTTP_PROXY
+# should be unset OR pointing to a port that nothing listens on. We
+# accept "unset" as the contract — egress=none means "no egress at all".
+case "$RUN_STDOUT" in
+    *"PROXY=unset"*) pass ;;
+    *) fail "expected PROXY=unset under egress=none; got: $RUN_STDOUT" ;;
+esac
+
+begin_test "egress=none: even loopback non-proxy connect denied"
+run_can run --recipe "$NONE_CONFIG" -- python3 -c '
+import errno, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    # Any port on 127.0.0.1 — there is no proxy, so this should be denied
+    # by the supervisor (no proxy_port to allow).
+    s.connect(("127.0.0.1", 12345))
+    print("UNEXPECTED_ALLOWED")
+except PermissionError:
+    print("DENIED")
+except OSError as e:
+    if e.errno in (errno.EPERM, errno.EACCES):
+        print("DENIED")
+    elif e.errno == errno.ECONNREFUSED:
+        # The connect itself was allowed at the supervisor; just nothing
+        # listening. That would be a contract violation under egress=none.
+        print("UNEXPECTED_ALLOWED_REFUSED")
+    else:
+        print(f"OTHER_ERRNO_{e.errno}")
+finally:
+    s.close()
+'
+case "$RUN_STDOUT" in
+    *DENIED*) pass ;;
+    *) fail "expected DENIED under egress=none; got: $RUN_STDOUT" ;;
+esac
+
+# ---- Test 6: allow_domains + allow_ips combo ----
+# When both are set, the proxy must allow EITHER an allowed domain OR an
+# allowed IP literal. allow_domains by itself blocks IP literals (per the
+# `enforce_ip_policy` gate in policy.rs); adding allow_ips should
+# re-enable just the listed IPs without re-enabling arbitrary literals.
+COMBO_CONFIG=$(tmpconfig <<'EOF'
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+
+[network]
+egress = "proxy-only"
+allow_domains = ["example.com"]
+allow_ips = ["192.0.2.1"]
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[syscalls]
+EOF
+)
+_TMPFILES+=("$COMBO_CONFIG")
+
+begin_test "combo: proxy still rejects an unrelated IP literal"
+run_can run --recipe "$COMBO_CONFIG" -- python3 -c '
+import os, urllib.request, urllib.error
+proxy = os.environ.get("HTTP_PROXY")
+handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+opener = urllib.request.build_opener(handler)
+req = urllib.request.Request("http://198.51.100.1/")    # documentation IP, NOT on allow_ips
+try:
+    resp = opener.open(req, timeout=3)
+    print(f"UNEXPECTED status={resp.status}")
+except urllib.error.HTTPError as e:
+    body = e.read()[:200].decode("utf-8", errors="replace")
+    print(f"BLOCKED status={e.code} body={body}")
+except Exception as e:
+    print(f"ERR error={e}")
+'
+case "$RUN_STDOUT" in
+    *"BLOCKED status=502"*"not allowed by policy"*) pass ;;
+    *) fail "expected combo recipe to still block 198.51.100.1: $RUN_STDOUT" ;;
+esac
+
+begin_test "combo: proxy allows the listed IP literal at policy gate"
+run_can run --recipe "$COMBO_CONFIG" -- python3 -c '
+import os, urllib.request, urllib.error
+proxy = os.environ.get("HTTP_PROXY")
+handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+opener = urllib.request.build_opener(handler)
+# 192.0.2.1 IS on allow_ips. The TCP connect will fail (TEST-NET-1 is
+# unreachable) but it must not be rejected at the *policy* gate — we
+# look for the absence of the policy-refusal message.
+req = urllib.request.Request("http://192.0.2.1/")
+try:
+    resp = opener.open(req, timeout=3)
+    print(f"ALLOWED_OK status={resp.status}")
+except urllib.error.HTTPError as e:
+    body = e.read()[:200].decode("utf-8", errors="replace")
+    print(f"ALLOWED_HTTPERR status={e.code} body={body}")
+except Exception as e:
+    print(f"ALLOWED_NETERR error={e}")
+'
+case "$RUN_STDOUT" in
+    *"not allowed by policy"*)
+        fail "proxy rejected an allow_ips entry at policy gate: $RUN_STDOUT"
+        ;;
+    *ALLOWED_*) pass ;;
+    *) fail "no recognisable outcome: $RUN_STDOUT" ;;
+esac
+
 summary

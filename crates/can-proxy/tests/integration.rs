@@ -1042,3 +1042,57 @@ async fn test_wasm_crlf_header_is_dropped() {
         "smuggled headers must not reach upstream; got body: {body:?}"
     );
 }
+
+// ============================================================================
+// Body-mutation EOS matrix
+// ============================================================================
+//
+// Pins the proxy's behaviour when a Wasm plugin instructs it to buffer
+// the response body and that body exceeds the configured cap: proxy
+// must return 502 with the upstream-body-too-large marker rather than
+// truncating. The mirror cases for plugin-driven request-body
+// drop/expand need an ABI extension (request headers in the body-hook
+// payload) and are tracked separately.
+// ============================================================================
+
+#[tokio::test]
+async fn body_mutation_buffered_response_oversize_returns_502() {
+    let upstream = start_test_upstream().await;
+
+    let mut interceptors = HashMap::new();
+    interceptors.insert("127.0.0.1".to_string(), test_plugin_path());
+
+    // Tiny cap; the upstream's "/echo" reply will easily exceed it.
+    let proxy_config = can_policy::config::ProxyConfig {
+        max_buffered_body_bytes: Some(8),
+        ..Default::default()
+    };
+    let proxy_addr = start_test_proxy_with_proxy_config(interceptors, proxy_config, false).await;
+    let proxy_url = format!("http://{}", proxy_addr);
+    let client = Client::builder()
+        .proxy(Proxy::all(&proxy_url).unwrap())
+        .build()
+        .unwrap();
+
+    // The /echo endpoint echoes the body. With x-canister-buffer-response,
+    // upstream returns a `x-canister-buffer: true` header that the test
+    // plugin's on_response_headers respects, forcing the proxy to buffer
+    // the response body. Body is bigger than the 8-byte limit, so the
+    // proxy must return 502 with x-canister-error: upstream-body-too-large.
+    let url = format!("http://127.0.0.1:{}/echo", upstream.port());
+    let res = client
+        .post(url)
+        .header("x-canister-buffer-response", "true")
+        .body("payload-larger-than-eight-bytes")
+        .send()
+        .await
+        .expect("request reached proxy");
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get("x-canister-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("upstream-body-too-large"),
+    );
+}

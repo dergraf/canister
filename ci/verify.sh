@@ -9,6 +9,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test -p can-cli -p can-policy -p can-proxy -p can-sandbox -p can-net
 ./ci/check_ignored_tests.sh
 ./ci/check_unwraps.sh
+./ci/test_check_unwraps.sh
 
 # Run shell-script linter on integration tests. Best-effort: skip locally
 # when not installed; CI installs it explicitly.

@@ -4,6 +4,7 @@ pub mod mac;
 pub mod namespace;
 pub mod notifier;
 pub mod overlay;
+pub mod pipe_protocol;
 pub mod process;
 pub mod seccomp;
 

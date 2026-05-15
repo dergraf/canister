@@ -246,19 +246,17 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 }
             }
 
-            // Signal child that network is ready, including DNS address and proxy port.
-            // Protocol: u16 proxy_port + u16 length (big-endian) + DNS address string bytes.
-            let dns_bytes = dns_addr.as_bytes();
-            let len_bytes = (dns_bytes.len() as u16).to_be_bytes();
-            let port_bytes = proxy_port.to_be_bytes();
+            // Signal child that network is ready. See `pipe_protocol`
+            // module for the framed wire format.
             let mut net_w = std::fs::File::from(network_done.1);
-            net_w
-                .write_all(&port_bytes)
-                .map_err(NamespaceError::UidMap)?;
-            net_w
-                .write_all(&len_bytes)
-                .map_err(NamespaceError::UidMap)?;
-            net_w.write_all(dns_bytes).map_err(NamespaceError::UidMap)?;
+            crate::pipe_protocol::write_handshake(
+                &mut net_w,
+                &crate::pipe_protocol::NetworkHandshake {
+                    proxy_port,
+                    dns_addr: dns_addr.clone(),
+                },
+            )
+            .map_err(NamespaceError::UidMap)?;
             drop(net_w);
 
             // Forward SIGTERM/SIGINT to the child process so that killing
@@ -540,31 +538,15 @@ fn child_entry(
     // Wait for parent to start pasta and complete network setup.
     // The parent spawns pasta with --userns + --netns pointing at our
     // /proc/<pid>/ns/* paths. Pasta joins our user namespace first (to
-    // acquire CAP_SYS_ADMIN), then our network namespace.
-    //
-    // The parent also sends the proxy port and DNS address.
-    // Protocol: u16 proxy_port + u16 length (big-endian) + DNS address bytes.
+    // acquire CAP_SYS_ADMIN), then our network namespace. Once the
+    // proxy is also up, the parent emits the framed handshake; see
+    // `pipe_protocol` for the wire format.
     let mut net_r = std::fs::File::from(network_read);
-    let mut port_buf = [0u8; 2];
-    net_r
-        .read_exact(&mut port_buf)
+    let crate::pipe_protocol::NetworkHandshake {
+        proxy_port,
+        dns_addr,
+    } = crate::pipe_protocol::read_handshake(&mut net_r, can_net::pasta::PASTA_DNS_ADDR)
         .map_err(NamespaceError::UidMap)?;
-    let proxy_port = u16::from_be_bytes(port_buf);
-
-    let mut len_buf = [0u8; 2];
-    net_r
-        .read_exact(&mut len_buf)
-        .map_err(NamespaceError::UidMap)?;
-    let dns_len = u16::from_be_bytes(len_buf) as usize;
-    let dns_addr = if dns_len > 0 && dns_len < 256 {
-        let mut dns_buf = vec![0u8; dns_len];
-        net_r
-            .read_exact(&mut dns_buf)
-            .map_err(NamespaceError::UidMap)?;
-        String::from_utf8(dns_buf).unwrap_or_else(|_| can_net::pasta::PASTA_DNS_ADDR.to_string())
-    } else {
-        can_net::pasta::PASTA_DNS_ADDR.to_string()
-    };
     drop(net_r);
 
     tracing::debug!(dns = %dns_addr, proxy_port, "network ready, continuing sandbox setup");
