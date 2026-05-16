@@ -1,0 +1,33 @@
+[recipe]
+name = "tool:pip"
+description = "pip: cache + config; ~/.pypirc denied (use PIP_INDEX_URL env for private indexes)"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/pip",
+]
+allow_write = [
+    "$HOME/.cache/pip",
+]
+deny = [
+    "$HOME/.pypirc",
+    "$HOME/.pip/pip.conf",
+]
+
+[network]
+allow_domains = [
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+
+[process]
+env_passthrough = [
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_TRUSTED_HOST",
+    "PIP_CACHE_DIR",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "PYTHONDONTWRITEBYTECODE",
+]

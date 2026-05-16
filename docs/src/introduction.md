@@ -16,6 +16,7 @@ The script sees an empty filesystem (except explicitly allowed paths), can only 
 - **Filesystem control** — read-only bind mounts with explicit write paths
 - **Network filtering** — DNS-level domain filtering + IP/CIDR rules
 - **Seccomp BPF** — syscall allow/deny lists with optional `SECCOMP_RET_USER_NOTIF` supervisor
+- **L7 egress proxy + DLP** — TLS-terminating proxy with credential pattern detection and per-service domain scoping; canary tokens and session entropy budgeting catch exfiltration attempts
 - **Recipe composition** — layered TOML configs that merge predictably
 - **Zero dependencies** — static Rust binary, no daemon, no root
 

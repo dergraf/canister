@@ -59,6 +59,7 @@ deny = [
 ]
 
 [network]
+egress = "proxy-only"
 # GitHub Copilot auth and API
 # - github.com: OAuth device flow
 # - api.github.com: token exchange and user info
@@ -75,7 +76,7 @@ deny = [
 # - opencode.ai
 #
 # WebFetch tool — OpenCode fetches arbitrary URLs for research.
-# If you need unrestricted web access, set deny_all = false.
+# If you need unrestricted web access, set egress = "direct".
 allow_domains = [
     "github.com",
     "api.github.com",
@@ -85,7 +86,6 @@ allow_domains = [
     "api.openai.com",
     "opencode.ai",
 ]
-deny_all = true
 
 [process]
 # OpenCode spawns subprocesses for tools (git, cargo, rg, etc.)

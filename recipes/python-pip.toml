@@ -15,11 +15,11 @@ version = "2"
 deny = ["/etc/shadow", "/root"]
 
 [network]
+egress = "proxy-only"
 allow_domains = [
     "pypi.org",
     "files.pythonhosted.org",
 ]
-deny_all = true
 
 [process]
 max_pids = 32

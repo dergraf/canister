@@ -8,9 +8,12 @@ description = "Core sandbox runtime: namespaces, seccomp, overlayfs, cgroups"
 
 [dependencies]
 can-policy.workspace = true
+can-proxy = { path = "../can-proxy" }
+can-dlp = { path = "../can-dlp" }
 can-net.workspace = true
 can-log.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 nix.workspace = true
+tokio = { version = "1.37", features = ["rt", "net"] }
 libc.workspace = true

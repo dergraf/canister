@@ -1,0 +1,52 @@
+# Canister tool recipe — ssh-agent (agent-mediated SSH)
+#
+# Lets a sandboxed process use the host's running ssh-agent for
+# authentication WITHOUT exposing private key files. The agent socket
+# is reached via SSH_AUTH_SOCK; any process that can talk to that
+# socket can request signatures from the loaded keys but cannot
+# read the key material.
+#
+# DOES NOT mount ~/.ssh — private keys never enter the sandbox. If a
+# user genuinely needs on-disk keys (e.g., a tool that doesn't speak
+# agent protocol), they must add an explicit `[filesystem] allow` entry
+# in their canister.toml and accept the exposure.
+#
+# No `allow_domains`: SSH is not HTTP and does not flow through the
+# canister proxy. SSH egress is controlled by `[network] allow_ips`
+# (or `egress = "direct"`) on the containing sandbox.
+#
+# Note: the agent socket itself lives at a path the parent ssh-agent
+# chose. The default canister filesystem isolation mounts /tmp, so if
+# the socket is in /tmp (the common case) it's already reachable.
+# Sockets in /run/user/<uid>/ require an explicit mount of that path.
+
+[recipe]
+name = "tool:ssh-agent"
+description = "agent-mediated SSH via SSH_AUTH_SOCK; no on-disk private keys"
+version = "1"
+
+[filesystem]
+# Allow the known-hosts file so SSH host-key prompts don't recur. The
+# host pubkey collection is not credential material.
+allow = [
+    "$HOME/.ssh/known_hosts",
+    "$HOME/.ssh/known_hosts.d",
+    "$HOME/.ssh/config",
+]
+# Defence in depth: even if a future recipe re-adds $HOME/.ssh wholesale,
+# the private key globs stay denied. (deny wins over allow per the
+# overlay.rs deny-wins rule.)
+deny = [
+    "$HOME/.ssh/id_rsa",
+    "$HOME/.ssh/id_dsa",
+    "$HOME/.ssh/id_ecdsa",
+    "$HOME/.ssh/id_ed25519",
+    "$HOME/.ssh/id_xmss",
+    "$HOME/.ssh/identity",
+]
+
+[process]
+env_passthrough = [
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+]

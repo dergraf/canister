@@ -13,3 +13,4 @@ tracing.workspace = true
 nix.workspace = true
 ipnet.workspace = true
 libc.workspace = true
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }

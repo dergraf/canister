@@ -1,0 +1,29 @@
+[recipe]
+name = "tool:pnpm"
+description = "pnpm: global store + config; auth tokens denied (use NPM_TOKEN env)"
+version = "1"
+
+[filesystem]
+allow_write = [
+    "$HOME/.local/share/pnpm",
+    "$HOME/.local/share/pnpm/store",
+    "$HOME/.config/pnpm",
+]
+deny = [
+    "$HOME/.npmrc",
+]
+
+[network]
+allow_domains = [
+    "registry.npmjs.org",
+]
+
+[process]
+env_passthrough = [
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "NPM_CONFIG_REGISTRY",
+    "PNPM_HOME",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+]

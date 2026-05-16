@@ -83,7 +83,7 @@ layer, not the composition stack.
 |---|---|---|
 | `Vec<T>` (paths, domains, syscalls, env vars) | Union (deduplicated, first-occurrence order) | Additive — each layer contributes its needs |
 | `strict` (`Option<bool>`) | OR — any `Some(true)` wins | Security: strict mode can never be loosened by composition |
-| `deny_all` (`Option<bool>`) | Last-`Some`-wins | Network policy is a deliberate choice per layer |
+| `egress` (`Option<EgressMode>`) | Last-`Some`-wins | Network policy is a deliberate choice per layer |
 | `seccomp_mode` (`Option<SeccompMode>`) | Last-`Some`-wins | Mode is a global setting, last layer decides |
 | Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | Last-`Some`-wins | Resource limits are contextual |
 | `RecipeMeta` | Overlay (non-empty fields win) | Metadata is informational |

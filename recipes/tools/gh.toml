@@ -1,0 +1,55 @@
+# Canister tool recipe — gh (GitHub CLI)
+#
+# Mounts `gh`'s non-credential config so the CLI knows the user's
+# preferences (default editor, pager, host aliases). The OAuth token
+# stored in ~/.config/gh/hosts.yml is denied so that a sandboxed
+# process can't read it directly off disk.
+#
+# To use `gh` *with* authentication, pass the token via the GH_TOKEN /
+# GITHUB_TOKEN env vars (env_passthrough handles this) rather than
+# letting gh read it from hosts.yml. A sandboxed process can still
+# observe the env var, but at least it can't read every authenticated
+# host's token from disk.
+#
+# Composes with: tool:git, plus any project recipe that owns transport
+# mode (`egress = "proxy-only" | "direct"`).
+
+[recipe]
+name = "tool:gh"
+description = "gh: editor/pager/host config; hosts.yml token denied (use env vars)"
+version = "1"
+
+[filesystem]
+# We intentionally do NOT broadly mount $HOME/.config/gh because
+# hosts.yml lives there and contains the OAuth token. Mount only the
+# user preferences file. `gh` falls back to defaults if config.yml is
+# absent on the host, so this is safe to declare.
+allow = [
+    "$HOME/.config/gh/config.yml",
+]
+deny = [
+    "$HOME/.config/gh/hosts.yml",
+]
+
+[network]
+# Destinations the GitHub CLI needs to function. Unioned with any
+# `allow_domains` from other recipes; ignored entirely unless the
+# containing sandbox enables `egress = "proxy-only"`.
+allow_domains = [
+    "github.com",
+    "api.github.com",
+    "uploads.github.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+]
+
+[process]
+env_passthrough = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_HOST",
+    "GH_REPO",
+    "GH_EDITOR",
+    "GH_PAGER",
+    "GH_BROWSER",
+]

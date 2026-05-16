@@ -105,6 +105,14 @@ cargo build --release
 
 The binary is at `target/release/can`.
 
+### Contributor verification
+
+Run the same core checks as CI before opening a PR:
+
+```bash
+./ci/verify.sh
+```
+
 ## Quick Start
 
 ### Project manifest (`canister.toml`)
@@ -151,7 +159,7 @@ can up dev --dry-run  # preview the resolved policy
 For one-off commands without a manifest:
 
 ```bash
-# Minimal -- default deny-all policy, default seccomp baseline
+# Minimal -- default proxy-only policy, default seccomp baseline
 can run -- echo "hello from the sandbox"
 
 # With a recipe file (path)
@@ -335,7 +343,7 @@ composed into the stack. For example, running a nix-installed `mix` auto-detects
 |---|---|
 | `Vec` fields (paths, domains, syscalls, env vars) | **Union** (deduplicated) |
 | `strict` | **OR** -- any `true` wins, can never be loosened |
-| `deny_all`, `seccomp_mode` | **Last-wins** -- `None` preserves earlier value |
+| `egress`, `seccomp_mode` | **Last-wins** -- `None` preserves earlier value |
 | Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-wins** |
 
 ### Environment variable expansion
@@ -383,7 +391,7 @@ deny  = ["/etc/shadow"]
 [network]
 allow_domains = ["pypi.org", "files.pythonhosted.org"]
 allow_ips     = ["10.0.0.0/8"]
-deny_all      = true   # default
+egress        = "proxy-only"   # default
 
 [process]
 max_pids       = 64
@@ -404,13 +412,14 @@ For complete reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Network Modes
 
-The network mode is determined automatically from the `[network]` config:
+The network mode is determined from `[network].egress` plus allowlists/ports:
 
 | Config | Mode | Behavior |
 |--------|------|----------|
-| `deny_all = true`, no allowlists | **None** | Empty network namespace, loopback only |
-| `deny_all = true`, with allowlists | **Filtered** | pasta provides connectivity, domains pre-resolved |
-| `deny_all = false` | **Full** | No network isolation (trust mode) |
+| `egress = "none"` | **None** | Empty network namespace, loopback only |
+| `egress = "proxy-only"` | **Filtered** | Outbound traffic must use local proxy; direct egress blocked |
+| `egress = "direct"` (no allowlists/ports) | **Full** | No network isolation (trust mode) |
+| `egress = "direct"` (with allowlists/ports) | **Filtered** | Direct egress with policy checks and filtered namespace |
 
 Filtered mode requires `pasta` installed (`sudo apt install passt` on Debian/Ubuntu, `sudo dnf install passt` on Fedora).
 
@@ -558,7 +567,7 @@ canister/
 │   ├── example.toml    # Example recipe (all options documented)
 │   ├── python-pip.toml # Python pip install recipe
 │   ├── node-build.toml # Node.js build recipe
-│   └── generic-strict.toml # Strict deny-all recipe for CI
+│   └── generic-strict.toml # Strict no-network recipe for CI
 ├── docs/
 │   ├── ARCHITECTURE.md # Design and execution flow
 │   ├── CONFIGURATION.md# Complete config reference (incl. canister.toml)

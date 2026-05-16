@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -41,6 +41,10 @@ pub struct SandboxConfig {
     /// Seccomp syscall overrides and enforcement mode.
     #[serde(default)]
     pub syscalls: SyscallConfig,
+
+    /// L7 Proxy and interception configuration.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
@@ -210,6 +214,14 @@ impl PortMapping {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    /// Egress mode controls outbound networking behavior.
+    ///
+    /// - `proxy-only` (default): outbound traffic must go through local proxy
+    /// - `none`: no outbound networking
+    /// - `direct`: direct outbound allowed, still policy-checked
+    #[serde(default)]
+    pub egress: Option<EgressMode>,
+
     /// Allowed domain names (resolved via internal DNS proxy).
     #[serde(default)]
     pub allow_domains: Vec<String>,
@@ -218,27 +230,139 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub allow_ips: Vec<String>,
 
-    /// If true, deny all network access except explicitly allowed.
-    /// Defaults to true (secure by default) when resolved.
-    ///
-    /// `None` in a recipe means "not specified" — the merge preserves
-    /// the earlier value. `into_sandbox_config()` resolves `None` to `true`.
-    #[serde(default)]
-    pub deny_all: Option<bool>,
-
     /// Port forwarding rules: map host ports to sandbox ports.
     ///
     /// Uses Docker/Podman syntax: `[ip:]hostPort:containerPort[/protocol]`.
-    /// Requires `deny_all = true` (Filtered network mode). Forwarded ports
-    /// are accessible from the host to the sandbox.
+    /// Supported when `egress != direct` (filtered networking).
+    /// Forwarded ports are accessible from the host to the sandbox.
     #[serde(default)]
     pub ports: Vec<PortMapping>,
+
+    /// Data Loss Prevention configuration for the egress proxy.
+    #[serde(default)]
+    pub dlp: Option<DlpConfig>,
 }
 
 impl NetworkConfig {
-    /// Return the effective `deny_all` value (defaults to `true`).
-    pub fn deny_all(&self) -> bool {
-        self.deny_all.unwrap_or(true)
+    /// Return the effective egress mode (defaults to proxy-only).
+    pub fn egress(&self) -> EgressMode {
+        self.egress.unwrap_or(EgressMode::ProxyOnly)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum EgressMode {
+    None,
+    ProxyOnly,
+    Direct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Maximum bytes buffered for DLP body scanning.
+    /// Requests exceeding the cap get a 413. Defaults to 8 MiB.
+    #[serde(default)]
+    pub max_buffered_body_bytes: Option<usize>,
+
+    /// Upstream request total timeout in milliseconds. Defaults to 30 000 ms.
+    #[serde(default)]
+    pub upstream_request_timeout_ms: Option<u64>,
+}
+
+/// Data Loss Prevention configuration for the egress proxy.
+///
+/// When enabled, the proxy scans outbound requests for credential patterns
+/// (GitHub PATs, npm tokens, AWS keys, etc.) and enforces per-detector
+/// domain scoping: each token type can only flow to its home service.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DlpConfig {
+    /// Enable DLP scanning. Implicitly enabled in `--strict` mode when
+    /// `egress = "proxy-only"`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Inject canary tokens (fake credentials) into the sandbox environment
+    /// to detect exfiltration attempts. Default: true when DLP is enabled.
+    #[serde(default)]
+    pub canary_tokens: Option<bool>,
+
+    /// Maximum encoding chain recursion depth (base64, hex, percent-encoding).
+    /// Default: 32.
+    #[serde(default)]
+    pub max_decode_depth: Option<usize>,
+
+    /// Decompress request bodies (gzip/deflate/brotli) before scanning.
+    /// Default: true.
+    #[serde(default)]
+    pub decompress: Option<bool>,
+
+    /// Shannon entropy threshold for DNS label exfiltration detection.
+    /// Hostname labels above this threshold trigger blocking.
+    /// Default: 4.5.
+    #[serde(default)]
+    pub dns_entropy_threshold: Option<f64>,
+
+    /// Cumulative high-entropy bytes allowed per sandbox session before
+    /// requests are blocked. Default: 8192.
+    #[serde(default)]
+    pub session_entropy_budget: Option<u64>,
+
+    /// Extend built-in home domains for detectors (self-hosted instances).
+    /// Keys are detector names (e.g., "github_pat"), values are domain lists.
+    #[serde(default)]
+    pub extra_scopes: HashMap<String, Vec<String>>,
+}
+
+impl DlpConfig {
+    pub const DEFAULT_MAX_DECODE_DEPTH: usize = 32;
+    pub const DEFAULT_DNS_ENTROPY_THRESHOLD: f64 = 4.5;
+    pub const DEFAULT_SESSION_ENTROPY_BUDGET: u64 = 8192;
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn canary_tokens(&self) -> bool {
+        self.canary_tokens.unwrap_or(true)
+    }
+
+    pub fn max_decode_depth(&self) -> usize {
+        self.max_decode_depth
+            .unwrap_or(Self::DEFAULT_MAX_DECODE_DEPTH)
+    }
+
+    pub fn decompress(&self) -> bool {
+        self.decompress.unwrap_or(true)
+    }
+
+    pub fn dns_entropy_threshold(&self) -> f64 {
+        self.dns_entropy_threshold
+            .unwrap_or(Self::DEFAULT_DNS_ENTROPY_THRESHOLD)
+    }
+
+    pub fn session_entropy_budget(&self) -> u64 {
+        self.session_entropy_budget
+            .unwrap_or(Self::DEFAULT_SESSION_ENTROPY_BUDGET)
+    }
+}
+
+impl ProxyConfig {
+    pub const DEFAULT_MAX_BUFFERED_BODY_BYTES: usize = 8 * 1024 * 1024;
+    pub const DEFAULT_UPSTREAM_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+    pub fn max_buffered_body_bytes(&self) -> usize {
+        self.max_buffered_body_bytes
+            .unwrap_or(Self::DEFAULT_MAX_BUFFERED_BODY_BYTES)
+    }
+
+    pub fn upstream_request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.upstream_request_timeout_ms
+                .unwrap_or(Self::DEFAULT_UPSTREAM_REQUEST_TIMEOUT_MS),
+        )
     }
 }
 
@@ -256,6 +380,11 @@ pub struct ProcessConfig {
     /// All others are stripped.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+
+    /// Environment variables to set in the sandbox.
+    /// These are evaluated after passthrough.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
@@ -387,7 +516,7 @@ impl SyscallConfig {
 }
 
 impl SandboxConfig {
-    /// Return a default config with sensible defaults (deny-all).
+    /// Return a default config with sensible defaults (proxy-only egress).
     pub fn default_deny() -> Self {
         Self {
             strict: false,
@@ -396,6 +525,7 @@ impl SandboxConfig {
             process: ProcessConfig::default(),
             resources: ResourceConfig::default(),
             syscalls: SyscallConfig::default(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -489,6 +619,10 @@ pub struct RecipeFile {
     /// Syscall overrides on top of the default baseline.
     #[serde(default)]
     pub syscalls: SyscallConfig,
+
+    /// L7 Proxy configuration.
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 impl RecipeFile {
@@ -509,7 +643,7 @@ impl RecipeFile {
     ///
     /// Fills in defaults for all `Option` fields:
     /// - `strict` → `false`
-    /// - `deny_all` → `true`
+    /// - `network.egress` → `proxy-only`
     /// - `seccomp_mode` → `AllowList`
     ///
     /// Expands environment variables (`$HOME`, `$USER`, etc.) in:
@@ -549,9 +683,11 @@ impl RecipeFile {
                     .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
                     .collect(),
                 env_passthrough: self.process.env_passthrough,
+                env: self.process.env,
             },
             resources: self.resources,
             syscalls: self.syscalls,
+            proxy: self.proxy,
         })
     }
 
@@ -585,15 +721,16 @@ impl RecipeFile {
                 mask: union_vecs(self.filesystem.mask, overlay.filesystem.mask),
             },
 
-            // Network: union of lists, deny_all is last-Some-wins.
+            // Network: union of lists, egress is last-Some-wins, DLP merges.
             network: NetworkConfig {
+                egress: overlay.network.egress.or(self.network.egress),
                 allow_domains: union_vecs(
                     self.network.allow_domains,
                     overlay.network.allow_domains,
                 ),
                 allow_ips: union_vecs(self.network.allow_ips, overlay.network.allow_ips),
-                deny_all: overlay.network.deny_all.or(self.network.deny_all),
                 ports: union_vecs(self.network.ports, overlay.network.ports),
+                dlp: merge_dlp(self.network.dlp, overlay.network.dlp),
             },
 
             // Process: union of lists, max_pids is last-Some-wins.
@@ -604,6 +741,11 @@ impl RecipeFile {
                     self.process.env_passthrough,
                     overlay.process.env_passthrough,
                 ),
+                env: {
+                    let mut env = self.process.env;
+                    env.extend(overlay.process.env);
+                    env
+                },
             },
 
             // Resources: last-Some-wins.
@@ -623,6 +765,17 @@ impl RecipeFile {
                 deny: union_vecs(self.syscalls.deny, overlay.syscalls.deny),
                 allow_extra: union_vecs(self.syscalls.allow_extra, overlay.syscalls.allow_extra),
                 deny_extra: union_vecs(self.syscalls.deny_extra, overlay.syscalls.deny_extra),
+            },
+
+            proxy: ProxyConfig {
+                max_buffered_body_bytes: overlay
+                    .proxy
+                    .max_buffered_body_bytes
+                    .or(self.proxy.max_buffered_body_bytes),
+                upstream_request_timeout_ms: overlay
+                    .proxy
+                    .upstream_request_timeout_ms
+                    .or(self.proxy.upstream_request_timeout_ms),
             },
         }
     }
@@ -727,6 +880,48 @@ pub fn expand_env_vars(input: &str) -> String {
     result
 }
 
+/// Merge two `DlpConfig` options.
+///
+/// - `enabled`: OR semantics (any `Some(true)` wins — security escalation)
+/// - `canary_tokens`: OR semantics
+/// - `extra_scopes`: per-detector domain lists union
+/// - Numeric options: last-Some-wins
+fn merge_dlp(base: Option<DlpConfig>, overlay: Option<DlpConfig>) -> Option<DlpConfig> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(b), Some(o)) => {
+            let mut extra_scopes = b.extra_scopes;
+            for (key, values) in o.extra_scopes {
+                let entry = extra_scopes.entry(key).or_default();
+                for v in values {
+                    if !entry.contains(&v) {
+                        entry.push(v);
+                    }
+                }
+            }
+            Some(DlpConfig {
+                enabled: match (b.enabled, o.enabled) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (_, s @ Some(_)) => s,
+                    (s, None) => s,
+                },
+                canary_tokens: match (b.canary_tokens, o.canary_tokens) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (_, s @ Some(_)) => s,
+                    (s, None) => s,
+                },
+                max_decode_depth: o.max_decode_depth.or(b.max_decode_depth),
+                decompress: o.decompress.or(b.decompress),
+                dns_entropy_threshold: o.dns_entropy_threshold.or(b.dns_entropy_threshold),
+                session_entropy_budget: o.session_entropy_budget.or(b.session_entropy_budget),
+                extra_scopes,
+            })
+        }
+    }
+}
+
 /// Merge two `Vec<T>` by appending, deduplicating (preserving first occurrence order).
 fn union_vecs<T: Clone + Eq + std::hash::Hash>(base: Vec<T>, overlay: Vec<T>) -> Vec<T> {
     let mut seen = HashSet::with_capacity(base.len() + overlay.len());
@@ -756,7 +951,7 @@ allow_domains = ["pypi.org"]
         let config = recipe.into_sandbox_config().unwrap();
         assert_eq!(config.filesystem.allow.len(), 2);
         assert_eq!(config.network.allow_domains, vec!["pypi.org"]);
-        assert!(config.network.deny_all()); // default
+        assert_eq!(config.network.egress(), EgressMode::ProxyOnly); // default
         assert!(config.syscalls.allow_extra.is_empty());
     }
 
@@ -771,7 +966,7 @@ deny = ["/etc/shadow"]
 [network]
 allow_domains = ["pypi.org", "registry.npmjs.org"]
 allow_ips = ["10.0.0.0/8"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 max_pids = 64
@@ -801,11 +996,17 @@ allow_extra = ["ptrace"]
     #[test]
     fn default_deny_config() {
         let config = SandboxConfig::default_deny();
-        assert!(config.network.deny_all());
+        assert_eq!(config.network.egress(), EgressMode::ProxyOnly);
         assert!(config.filesystem.allow.is_empty());
         assert!(config.network.allow_domains.is_empty());
         assert!(config.syscalls.allow_extra.is_empty());
         assert!(config.syscalls.deny_extra.is_empty());
+    }
+
+    #[test]
+    fn egress_default_is_proxy_only() {
+        let network = NetworkConfig::default();
+        assert_eq!(network.egress(), EgressMode::ProxyOnly);
     }
 
     #[test]
@@ -834,7 +1035,7 @@ allow = ["/usr/lib", "/tmp"]
 
 [network]
 allow_domains = ["pypi.org", "files.pythonhosted.org"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
@@ -1076,26 +1277,26 @@ deny = ["/root"]
     }
 
     #[test]
-    fn merge_deny_all_last_wins() {
-        // None + None = None (resolved to true by default)
+    fn merge_egress_last_wins() {
+        // None + None = None (resolved to proxy-only by default)
         let a = parse_recipe("");
         let b = parse_recipe("");
-        assert_eq!(a.merge(b).network.deny_all, None);
+        assert_eq!(a.merge(b).network.egress, None);
 
-        // None + Some(false) = Some(false)
+        // None + Some(direct) = Some(direct)
         let a = parse_recipe("");
-        let b = parse_recipe("[network]\ndeny_all = false");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        let b = parse_recipe("[network]\negress = \"direct\"");
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
 
-        // Some(true) + Some(false) = Some(false) (last wins)
-        let a = parse_recipe("[network]\ndeny_all = true");
-        let b = parse_recipe("[network]\ndeny_all = false");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        // proxy-only + direct = direct (last wins)
+        let a = parse_recipe("[network]\negress = \"proxy-only\"");
+        let b = parse_recipe("[network]\negress = \"direct\"");
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
 
-        // Some(false) + None = Some(false) (None preserves base)
-        let a = parse_recipe("[network]\ndeny_all = false");
+        // direct + None = direct (None preserves base)
+        let a = parse_recipe("[network]\negress = \"direct\"");
         let b = parse_recipe("");
-        assert_eq!(a.merge(b).network.deny_all, Some(false));
+        assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
     }
 
     #[test]
@@ -1281,6 +1482,223 @@ deny = ["/root"]
         assert_eq!(merged.filesystem.deny, vec![PathBuf::from("/root")]);
         assert_eq!(merged.syscalls.allow_extra, vec!["ptrace"]);
         assert_eq!(merged.strict, Some(true));
+    }
+
+    #[test]
+    fn merge_three_recipes_any_strict_true_wins() {
+        // strict=true sticky across the chain in every position.
+        let strict_first = parse_recipe("strict = true")
+            .merge(parse_recipe(""))
+            .merge(parse_recipe("strict = false"));
+        assert_eq!(strict_first.strict, Some(true), "strict=true in slot 0");
+
+        let strict_middle = parse_recipe("")
+            .merge(parse_recipe("strict = true"))
+            .merge(parse_recipe("strict = false"));
+        assert_eq!(strict_middle.strict, Some(true), "strict=true in slot 1");
+
+        let strict_last = parse_recipe("strict = false")
+            .merge(parse_recipe(""))
+            .merge(parse_recipe("strict = true"));
+        assert_eq!(strict_last.strict, Some(true), "strict=true in slot 2");
+    }
+
+    #[test]
+    fn merge_three_recipes_egress_chain_last_wins() {
+        // egress: None + Direct + ProxyOnly → ProxyOnly (last wins)
+        let merged = parse_recipe("")
+            .merge(parse_recipe(
+                r#"
+[network]
+egress = "direct"
+"#,
+            ))
+            .merge(parse_recipe(
+                r#"
+[network]
+egress = "proxy-only"
+"#,
+            ));
+        assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
+
+        // egress: ProxyOnly + None-set + Direct → Direct (last non-None
+        // value wins; an "empty" recipe doesn't reset to None)
+        let merged = parse_recipe(
+            r#"
+[network]
+egress = "proxy-only"
+"#,
+        )
+        .merge(parse_recipe(""))
+        .merge(parse_recipe(
+            r#"
+[network]
+egress = "direct"
+"#,
+        ));
+        assert_eq!(merged.network.egress, Some(EgressMode::Direct));
+    }
+
+    #[test]
+    fn merge_three_recipes_allow_extra_union_dedupes() {
+        // Same syscall named in two different recipes must dedupe.
+        let merged = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace"]
+"#,
+        )
+        .merge(parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace", "io_uring_setup"]
+"#,
+        ))
+        .merge(parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["io_uring_setup", "io_uring_enter"]
+"#,
+        ));
+        // Union semantics + insertion-order preservation. dedup must
+        // not produce ["ptrace", "ptrace", "io_uring_setup", ...].
+        assert_eq!(merged.syscalls.allow_extra.len(), 3);
+        for s in ["ptrace", "io_uring_setup", "io_uring_enter"] {
+            assert!(
+                merged.syscalls.allow_extra.contains(&s.to_string()),
+                "{s} missing from merged allow_extra",
+            );
+        }
+    }
+
+    #[test]
+    fn merge_recipe_with_allow_and_deny_extra_keeps_both() {
+        // Intra-recipe contradiction: same syscall in both allow_extra
+        // and deny_extra. The merge layer faithfully unions both lists;
+        // the actual conflict resolution (deny wins) is enforced later
+        // by SeccompProfile::apply_overrides.
+        let merged = parse_recipe(
+            r#"
+[syscalls]
+allow_extra = ["ptrace"]
+deny_extra = ["ptrace"]
+"#,
+        );
+        assert!(merged.syscalls.allow_extra.contains(&"ptrace".to_string()));
+        assert!(merged.syscalls.deny_extra.contains(&"ptrace".to_string()));
+    }
+
+    #[test]
+    fn merge_three_recipes_strict_invariant_with_egress_change() {
+        // Realistic three-way chain: a strict baseline, an auto-detected
+        // recipe that loosens egress, and an explicit -r that adds
+        // domains. strict should remain Some(true).
+        let strict_base = parse_recipe(
+            r#"
+strict = true
+
+[network]
+egress = "proxy-only"
+"#,
+        );
+        let auto_detected = parse_recipe(
+            r#"
+[network]
+allow_domains = ["github.com"]
+"#,
+        );
+        let cli_override = parse_recipe(
+            r#"
+[network]
+allow_domains = ["registry.npmjs.org"]
+"#,
+        );
+        let merged = strict_base.merge(auto_detected).merge(cli_override);
+        assert_eq!(merged.strict, Some(true));
+        assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
+        // Both domains union into the final allow list.
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "github.com")
+        );
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "registry.npmjs.org")
+        );
+    }
+
+    #[test]
+    fn merge_proxy_limit_options_last_some_wins() {
+        let base = parse_recipe(
+            r#"
+[proxy]
+max_buffered_body_bytes = 1024
+"#,
+        );
+        let merged_empty_overlay = base.clone().merge(parse_recipe(""));
+        assert_eq!(
+            merged_empty_overlay.proxy.max_buffered_body_bytes,
+            Some(1024)
+        );
+
+        let merged_override = base.merge(parse_recipe(
+            r#"
+[proxy]
+max_buffered_body_bytes = 8192
+upstream_request_timeout_ms = 5000
+"#,
+        ));
+        assert_eq!(merged_override.proxy.max_buffered_body_bytes, Some(8192));
+        assert_eq!(
+            merged_override.proxy.upstream_request_timeout_ms,
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn merge_case_different_domains_preserved_then_normalized_at_policy() {
+        // The recipe merge layer treats domain entries as opaque strings
+        // (union dedupes by exact bytes). The policy layer
+        // (OutboundPolicy::from_config) is what folds case. This test
+        // documents the contract so a future refactor doesn't
+        // accidentally lowercase at merge time and break the round-trip
+        // through serde for diagnostic output.
+        let a = parse_recipe(
+            r#"
+[network]
+allow_domains = ["Example.com"]
+"#,
+        );
+        let b = parse_recipe(
+            r#"
+[network]
+allow_domains = ["example.com"]
+"#,
+        );
+        let merged = a.merge(b);
+        // Both case variants present at the recipe layer.
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "Example.com"),
+            "merged should still contain Example.com",
+        );
+        assert!(
+            merged
+                .network
+                .allow_domains
+                .iter()
+                .any(|d| d == "example.com"),
+            "merged should still contain example.com",
+        );
     }
 
     #[test]

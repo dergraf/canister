@@ -154,6 +154,8 @@ impl SeccompProfile {
     /// Panics if the embedded default.toml is malformed (compile-time
     /// guarantee — this should never happen).
     pub fn default_baseline() -> Self {
+        // SAFETY-UNWRAP: default.toml is embedded via include_str! at build
+        // time; if it doesn't parse the binary cannot have been built.
         Self::from_embedded()
             .expect("embedded default.toml is malformed")
             .profile
@@ -161,21 +163,47 @@ impl SeccompProfile {
 
     /// Apply recipe-level syscall overrides on top of the baseline.
     ///
-    /// - `allow_extra`: syscalls added to the allow list
-    /// - `deny_extra`: syscalls added to the deny list and removed from allow list
+    /// - `allow_extra`: syscalls added to the allow list (subject to the
+    ///   absolute-deny guard below).
+    /// - `deny_extra`: syscalls added to the deny list and removed from
+    ///   the allow list.
+    ///
+    /// Security invariant: a recipe MUST NOT be able to move a syscall
+    /// from the deny list to the allow list. The baseline deny set
+    /// contains sandbox-escape-relevant syscalls (`unshare`, `setns`,
+    /// `mount`, `pivot_root`, `memfd_create`, …); a malicious or careless
+    /// recipe listing one of these under `allow_extra` is silently
+    /// filtered with a warn-level log. Use `deny_extra` to remove a
+    /// syscall from the allow list, never the inverse.
+    ///
+    /// `deny_extra` is applied first so a same-recipe contradiction
+    /// (`allow_extra = ["foo"]` + `deny_extra = ["foo"]`) resolves
+    /// fail-closed.
     pub fn apply_overrides(&mut self, allow_extra: &[String], deny_extra: &[String]) {
-        // Add extra allows (deduplicated).
-        for syscall in allow_extra {
-            if !self.allow_syscalls.contains(syscall) {
-                self.allow_syscalls.push(syscall.clone());
-            }
-        }
-
-        // Add extra denies and remove them from allow list.
+        // Apply deny_extra first so subsequent allow_extra entries cannot
+        // subvert a same-recipe deny.
         for syscall in deny_extra {
             self.allow_syscalls.retain(|s| s != syscall);
             if !self.deny_syscalls.contains(syscall) {
                 self.deny_syscalls.push(syscall.clone());
+            }
+        }
+
+        // Add extra allows (deduplicated). Refuse to allow anything that
+        // is currently on the deny list — that includes the baseline's
+        // absolute-deny set as well as anything just added via
+        // `deny_extra`.
+        for syscall in allow_extra {
+            if self.deny_syscalls.contains(syscall) {
+                tracing::warn!(
+                    syscall = %syscall,
+                    "allow_extra ignored: '{syscall}' is on the deny list and \
+                     cannot be re-enabled via a recipe override",
+                );
+                continue;
+            }
+            if !self.allow_syscalls.contains(syscall) {
+                self.allow_syscalls.push(syscall.clone());
             }
         }
     }

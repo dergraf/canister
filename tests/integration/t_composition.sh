@@ -22,7 +22,7 @@ RECIPE_A=$(tmpconfig <<'EOF'
 name = "layer-a"
 
 [network]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 env_passthrough = ["HOME"]
@@ -87,7 +87,7 @@ else
 name = "relaxed"
 
 [network]
-deny_all = true
+egress = "proxy-only"
 EOF
 )
     RECIPE_STRICT=$(tmpconfig <<'EOF'
@@ -97,7 +97,7 @@ strict = true
 name = "strict-layer"
 
 [network]
-deny_all = true
+egress = "proxy-only"
 EOF
 )
     _TMPFILES+=("$RECIPE_RELAXED" "$RECIPE_STRICT")
@@ -113,7 +113,7 @@ R1=$(tmpconfig <<'EOF'
 name = "base-layer"
 
 [network]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 env_passthrough = ["HOME"]
@@ -143,8 +143,8 @@ run_can run --recipe "$R1" --recipe "$R2" --recipe "$R3" -- echo "three-way"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "three-way" "$RUN_STDOUT"
 
-# ---- Test 7: No recipe still works (default deny-all) ----
-begin_test "no --recipe flag uses default deny-all policy"
+# ---- Test 7: No recipe still works (default proxy-only) ----
+begin_test "no --recipe flag uses default proxy-only policy"
 run_can run -- echo "no recipe"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "no recipe" "$RUN_STDOUT"

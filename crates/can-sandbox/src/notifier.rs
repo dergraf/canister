@@ -72,6 +72,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use can_policy::config::EgressMode;
+
 use crate::seccomp::SeccompError;
 
 // ---------------------------------------------------------------------------
@@ -221,15 +223,6 @@ pub struct NotifierPolicy {
     /// Allowed destination CIDR ranges (stored as (network, prefix_len)).
     pub allowed_cidrs: Vec<(IpAddr, u8)>,
 
-    /// Allowed domain names for DNS queries.
-    ///
-    /// When a sandboxed process sends a DNS query (sendto/sendmsg to port 53),
-    /// the queried domain is checked against this list. Matching uses suffix
-    /// semantics: `"example.com"` allows `example.com` and `*.example.com`.
-    /// If the domain is allowed, the supervisor resolves it and adds the
-    /// resulting IPs to the dynamic allowlist.
-    pub allowed_domains: Vec<String>,
-
     /// Allowed executable paths for execve()/execveat() — exact matches.
     pub allowed_exec_paths: HashSet<PathBuf>,
 
@@ -265,6 +258,21 @@ pub struct NotifierPolicy {
     /// - Send supervisor-side DNS queries to this address for
     ///   `resolve_and_add()` (dynamic allowlist population)
     pub dns_server_addr: String,
+
+    /// Domains configured in policy for dynamic DNS resolution.
+    pub allowed_domains: Vec<String>,
+
+    /// Shared DNS cache used for TTL-aware refresh of domain → IP mappings.
+    pub dns_cache: Option<can_net::dns_cache::DnsCache>,
+
+    /// Dynamic IP allowlist populated from DNS cache lookups.
+    pub dynamic_ips: Arc<RwLock<HashSet<IpAddr>>>,
+
+    /// Whether outbound INET/INET6 traffic must go through local proxy.
+    pub enforce_proxy_egress: bool,
+
+    /// Local proxy listening port inside the sandbox namespace.
+    pub proxy_port: Option<u16>,
 }
 
 impl Default for NotifierPolicy {
@@ -272,57 +280,19 @@ impl Default for NotifierPolicy {
         Self {
             allowed_ips: HashSet::new(),
             allowed_cidrs: Vec::new(),
-            allowed_domains: Vec::new(),
+
             allowed_exec_paths: HashSet::new(),
             allowed_exec_prefixes: Vec::new(),
             allow_af_unix: true,
             allow_af_inet: true,
             restrict_outbound: true,
             dns_server_addr: can_net::pasta::PASTA_DNS_ADDR.to_string(),
+            allowed_domains: Vec::new(),
+            dns_cache: None,
+            dynamic_ips: Arc::new(RwLock::new(HashSet::new())),
+            enforce_proxy_egress: false,
+            proxy_port: None,
         }
-    }
-}
-
-/// Thread-safe dynamic IP allowlist.
-///
-/// When the notifier sees a DNS query for an allowed domain, the supervisor
-/// resolves that domain in a background thread and adds the resulting IPs
-/// here. The `evaluate_connect` and `evaluate_sendto` functions check this
-/// list alongside the static `NotifierPolicy.allowed_ips`.
-///
-/// Uses `RwLock` for low-contention reads (the common path) with occasional
-/// writes from resolver threads.
-#[derive(Debug, Clone)]
-pub struct DynamicAllowlist {
-    ips: Arc<RwLock<HashSet<IpAddr>>>,
-}
-
-impl Default for DynamicAllowlist {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DynamicAllowlist {
-    /// Create a new empty dynamic allowlist.
-    pub fn new() -> Self {
-        Self {
-            ips: Arc::new(RwLock::new(HashSet::new())),
-        }
-    }
-
-    /// Check whether an IP is in the dynamic allowlist.
-    pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.ips
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(ip)
-    }
-
-    /// Add IPs to the dynamic allowlist.
-    pub fn add_ips(&self, ips: impl IntoIterator<Item = IpAddr>) {
-        let mut set = self.ips.write().unwrap_or_else(|e| e.into_inner());
-        set.extend(ips);
     }
 }
 
@@ -337,6 +307,12 @@ impl NotifierPolicy {
         // Check explicit IPs.
         if self.allowed_ips.contains(&ip) {
             return true;
+        }
+
+        if let Ok(guard) = self.dynamic_ips.read() {
+            if guard.contains(&ip) {
+                return true;
+            }
         }
 
         // Check CIDR ranges.
@@ -694,7 +670,6 @@ fn install_supervisor_signal_handler() {
 pub fn run_supervisor_with_child(
     notifier_fd: OwnedFd,
     policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
     child: nix::unistd::Pid,
 ) -> i32 {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -720,14 +695,14 @@ pub fn run_supervisor_with_child(
                 tracing::debug!(code, "inner child exited");
                 child_exit_code = Some(code);
                 // Drain remaining notifications before exiting.
-                drain_notifications(fd, policy, dynamic_allowlist);
+                drain_notifications(fd, policy);
                 break;
             }
             Ok(WaitStatus::Signaled(_, signal, _)) => {
                 let code = 128 + signal as i32;
                 tracing::debug!(signal = %signal, code, "inner child killed by signal");
                 child_exit_code = Some(code);
-                drain_notifications(fd, policy, dynamic_allowlist);
+                drain_notifications(fd, policy);
                 break;
             }
             Ok(WaitStatus::StillAlive) => {
@@ -782,7 +757,7 @@ pub fn run_supervisor_with_child(
         }
 
         // Process one notification.
-        process_one_notification(fd, policy, dynamic_allowlist);
+        process_one_notification(fd, policy);
     }
 
     // If we broke out without getting a child status, block-wait for the child.
@@ -803,7 +778,7 @@ pub fn run_supervisor_with_child(
 /// There may be notifications in flight from child processes that are
 /// still being torn down. Process them briefly to avoid blocking those
 /// teardown paths.
-fn drain_notifications(fd: RawFd, policy: &NotifierPolicy, dynamic_allowlist: &DynamicAllowlist) {
+fn drain_notifications(fd: RawFd, policy: &NotifierPolicy) {
     for _ in 0..64 {
         let mut pfd = libc::pollfd {
             fd,
@@ -817,16 +792,12 @@ fn drain_notifications(fd: RawFd, policy: &NotifierPolicy, dynamic_allowlist: &D
         if pfd.revents & libc::POLLIN == 0 {
             break;
         }
-        process_one_notification(fd, policy, dynamic_allowlist);
+        process_one_notification(fd, policy);
     }
 }
 
 /// Process a single seccomp notification (receive, evaluate, respond).
-fn process_one_notification(
-    fd: RawFd,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-) {
+fn process_one_notification(fd: RawFd, policy: &NotifierPolicy) {
     let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif as *mut _) };
 
@@ -842,7 +813,7 @@ fn process_one_notification(
         }
     }
 
-    let verdict = evaluate_syscall(&notif, policy, dynamic_allowlist, fd);
+    let verdict = evaluate_syscall(&notif, policy, fd);
 
     let resp = match verdict {
         Verdict::Allow => SeccompNotifResp {
@@ -886,22 +857,17 @@ enum Verdict {
 }
 
 /// Evaluate a syscall notification against the policy.
-fn evaluate_syscall(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
-) -> Verdict {
+fn evaluate_syscall(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
     let pid = notif.pid;
 
     if nr == libc::SYS_connect {
-        evaluate_connect(notif, policy, dynamic_allowlist, notifier_fd)
+        evaluate_connect(notif, policy, notifier_fd)
     } else if nr == libc::SYS_sendto {
-        evaluate_sendto(notif, policy, dynamic_allowlist, notifier_fd)
+        evaluate_sendto(notif, policy, notifier_fd)
     } else if nr == libc::SYS_sendmsg {
-        evaluate_sendmsg(notif, policy, dynamic_allowlist, notifier_fd)
+        evaluate_sendmsg(notif, policy, notifier_fd)
     } else if nr == libc::SYS_clone {
         evaluate_clone(args, pid)
     } else if nr == libc::SYS_clone3 {
@@ -1023,6 +989,101 @@ fn read_proc_string(pid: u32, addr: u64, max_len: usize) -> Result<String, Notif
     Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
+/// Read a NUL-terminated string from a child process's memory, with a
+/// `process_vm_readv` fallback and a backoff retry for `/proc/<pid>/mem`.
+///
+/// On some kernels (e.g. Ubuntu noble cloud kernels), `/proc/<pid>/mem`
+/// returns EIO when the worker is paused mid-`execve()` — the mm is in a
+/// transient state between the old and new program. `process_vm_readv`
+/// is implemented through a different kernel path (no per-fd mm-access
+/// check at open time) and frequently succeeds in this window. If both
+/// fail, retry the proc/mem read with backoff to give the kernel time to
+/// either commit the new mm or roll back. Used only for execve/execveat.
+fn read_proc_string_with_retry(
+    pid: u32,
+    addr: u64,
+    max_len: usize,
+) -> Result<String, NotifierError> {
+    // Fast path 1: try process_vm_readv. Works on most kernels.
+    if let Ok(s) = read_proc_string_vm(pid, addr, max_len) {
+        return Ok(s);
+    }
+
+    // Fast path 2: try /proc/<pid>/mem once without sleeping.
+    if let Ok(s) = read_proc_string(pid, addr, max_len) {
+        return Ok(s);
+    }
+
+    // Slow path: backoff loop alternating both mechanisms.
+    const RETRIES: u32 = 12;
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let mut last_err = None;
+    for _ in 0..RETRIES {
+        std::thread::sleep(SLEEP);
+        if let Ok(s) = read_proc_string_vm(pid, addr, max_len) {
+            return Ok(s);
+        }
+        match read_proc_string(pid, addr, max_len) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // SAFETY-UNWRAP: we only reach this line after the loop executed at
+    // least once and every iteration's Err branch sets last_err.
+    Err(last_err.expect("loop runs at least once"))
+}
+
+/// Read a string from another process's memory via `process_vm_readv(2)`.
+///
+/// This bypasses the `/proc/<pid>/mem` open + read sequence. The kernel
+/// performs the mm-access check at call time rather than at open time,
+/// which means it can succeed during the brief window where /proc/mem
+/// returns EIO mid-execve.
+fn read_proc_string_vm(pid: u32, addr: u64, max_len: usize) -> Result<String, NotifierError> {
+    if pid == 0 {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pid is 0",
+        )));
+    }
+    if max_len == 0 || max_len > MAX_PROC_MEM_READ {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_len {max_len} out of bounds"),
+        )));
+    }
+    if addr >= KERNEL_ADDR_BOUNDARY
+        || addr
+            .checked_add(max_len as u64)
+            .is_none_or(|end| end > KERNEL_ADDR_BOUNDARY)
+    {
+        return Err(NotifierError::ProcMem(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "address in kernel space",
+        )));
+    }
+
+    let mut buf = vec![0u8; max_len];
+    let local_iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: max_len,
+    };
+    let remote_iov = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: max_len,
+    };
+    // SAFETY: we pass valid iovecs sized to `max_len`; the kernel writes
+    // at most that many bytes into `buf` and returns the count.
+    let n = unsafe { libc::process_vm_readv(pid as i32, &local_iov, 1, &remote_iov, 1, 0) };
+    if n < 0 {
+        return Err(NotifierError::ProcMem(std::io::Error::last_os_error()));
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Syscall evaluators
 // ---------------------------------------------------------------------------
@@ -1033,12 +1094,7 @@ fn read_proc_string(pid: u32, addr: u64, max_len: usize) -> Result<String, Notif
 ///   args[0] = fd
 ///   args[1] = pointer to sockaddr
 ///   args[2] = addrlen
-fn evaluate_connect(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
-) -> Verdict {
+fn evaluate_connect(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let pid = notif.pid;
     let addr_ptr = notif.data.args[1];
     let addr_len = notif.data.args[2] as usize;
@@ -1068,7 +1124,33 @@ fn evaluate_connect(
         return Verdict::Deny(libc::EPERM as u32);
     }
 
-    classify_connect_addr(pid, &addr_bytes, addr_len, policy, dynamic_allowlist)
+    let verdict = classify_connect_addr(pid, &addr_bytes, addr_len, policy);
+    maybe_refresh_dynamic_allowlist_on_deny(policy, &verdict);
+    if matches!(verdict, Verdict::Deny(_)) {
+        classify_connect_addr(pid, &addr_bytes, addr_len, policy)
+    } else {
+        verdict
+    }
+}
+
+fn maybe_refresh_dynamic_allowlist_on_deny(policy: &NotifierPolicy, verdict: &Verdict) {
+    if !matches!(verdict, Verdict::Deny(_)) {
+        return;
+    }
+    let Some(cache) = &policy.dns_cache else {
+        return;
+    };
+
+    let mut refreshed = HashSet::new();
+    for domain in &policy.allowed_domains {
+        if let Some(ips) = cache.resolve_cached_or_lookup(domain) {
+            refreshed.extend(ips);
+        }
+    }
+
+    if let Ok(mut guard) = policy.dynamic_ips.write() {
+        *guard = refreshed;
+    }
 }
 
 /// Classify a connect() destination address and return a verdict.
@@ -1082,7 +1164,6 @@ fn classify_connect_addr(
     addr_bytes: &[u8],
     addr_len: usize,
     policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
 ) -> Verdict {
     // Parse the address family (first 2 bytes of sockaddr, native endian).
     let sa_family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
@@ -1101,6 +1182,10 @@ fn classify_connect_addr(
             }
             _ => {} // AF_UNIX, AF_UNSPEC, etc. — fall through to normal handling
         }
+    }
+
+    if policy.enforce_proxy_egress {
+        return classify_proxy_only_connect(pid, addr_bytes, addr_len, sa_family, policy);
     }
 
     match sa_family as i32 {
@@ -1161,11 +1246,8 @@ fn classify_connect_addr(
                 return Verdict::Deny(libc::EACCES as u32);
             }
 
-            if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
+            if policy.is_ip_allowed(ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv4 allowed");
-                Verdict::Allow
-            } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
-                tracing::info!(pid, %ip_addr, port, "connect: IPv4 allowed after domain re-resolution");
                 Verdict::Allow
             } else {
                 tracing::warn!(pid, %ip_addr, port, "connect: IPv4 denied by policy");
@@ -1206,11 +1288,8 @@ fn classify_connect_addr(
                 return Verdict::Deny(libc::EACCES as u32);
             }
 
-            if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
+            if policy.is_ip_allowed(ip_addr) {
                 tracing::debug!(pid, %ip_addr, port, "connect: IPv6 allowed");
-                Verdict::Allow
-            } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
-                tracing::info!(pid, %ip_addr, port, "connect: IPv6 allowed after domain re-resolution");
                 Verdict::Allow
             } else {
                 tracing::warn!(pid, %ip_addr, port, "connect: IPv6 denied by policy");
@@ -1234,19 +1313,72 @@ fn classify_connect_addr(
     }
 }
 
+fn classify_proxy_only_connect(
+    pid: u32,
+    addr_bytes: &[u8],
+    addr_len: usize,
+    sa_family: u16,
+    policy: &NotifierPolicy,
+) -> Verdict {
+    match sa_family as i32 {
+        libc::AF_UNSPEC => Verdict::Allow,
+        libc::AF_UNIX => Verdict::Allow,
+        libc::AF_INET => {
+            if addr_len < 8 {
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+            let port = u16::from_be_bytes([addr_bytes[2], addr_bytes[3]]);
+            let ip = Ipv4Addr::new(addr_bytes[4], addr_bytes[5], addr_bytes[6], addr_bytes[7]);
+            let ip_addr = IpAddr::V4(ip);
+
+            if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+                if ip_addr == dns_ip && port == 53 {
+                    return Verdict::Allow;
+                }
+            }
+
+            if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+                return Verdict::Allow;
+            }
+
+            tracing::warn!(pid, %ip_addr, port, "connect: denied (proxy-only egress mode)");
+            Verdict::Deny(libc::EACCES as u32)
+        }
+        libc::AF_INET6 => {
+            if addr_len < 24 {
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+            let port = u16::from_be_bytes([addr_bytes[2], addr_bytes[3]]);
+            let mut addr_buf = [0u8; 16];
+            addr_buf.copy_from_slice(&addr_bytes[8..24]);
+            let ip = Ipv6Addr::from(addr_buf);
+            let ip_addr = IpAddr::V6(ip);
+
+            if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+                if ip_addr == dns_ip && port == 53 {
+                    return Verdict::Allow;
+                }
+            }
+
+            if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+                return Verdict::Allow;
+            }
+
+            tracing::warn!(pid, %ip_addr, port, "connect: denied (proxy-only egress mode)");
+            Verdict::Deny(libc::EACCES as u32)
+        }
+        libc::AF_NETLINK => Verdict::Allow,
+        _ => Verdict::Deny(libc::EPERM as u32),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // sendto / sendmsg evaluators with DNS awareness
 // ---------------------------------------------------------------------------
 
 /// DNS port (standard).
-const DNS_PORT: u16 = 53;
-
 /// Minimum valid DNS packet size (header only).
-const DNS_HEADER_SIZE: usize = 12;
-
 /// Maximum DNS UDP message size we'll inspect.
-const DNS_MAX_INSPECT: usize = 512;
-
 /// Evaluate a `sendto()` syscall.
 ///
 /// `sendto(fd, buf, len, flags, dest_addr, addrlen)`
@@ -1264,44 +1396,21 @@ const DNS_MAX_INSPECT: usize = 512;
 /// For non-NULL dest_addr: if the destination is port 53, parse the DNS
 /// query and check the domain against the allowlist. For other ports,
 /// check the destination IP against the static + dynamic allowlist.
-fn evaluate_sendto(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
-) -> Verdict {
+fn evaluate_sendto(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let pid = notif.pid;
     let dest_addr_ptr = notif.data.args[4];
     let addr_len = notif.data.args[5] as usize;
 
-    // NULL dest_addr → connected socket, destination was checked at connect() time.
-    //
-    // However, some runtimes (notably Erlang/OTP's inet_res resolver) first
-    // connect() a UDP socket to the DNS server, then use sendto() with a
-    // NULL dest_addr to send the query. In this pattern, the DNS query
-    // content is never seen by the non-NULL path, so the dynamic allowlist
-    // is never populated with the resolved IPs.
-    //
-    // To handle this: when domain rules are configured, speculatively
-    // inspect the payload. If it looks like a valid DNS query for an
-    // allowed domain, resolve it synchronously so the dynamic allowlist
-    // is ready before the sandbox process gets the response and calls
-    // connect() to the resolved IP.
     if dest_addr_ptr == 0 {
-        if !policy.allowed_domains.is_empty() && policy.restrict_outbound {
-            try_inspect_connected_dns(notif, policy, dynamic_allowlist, notifier_fd);
-        }
         tracing::debug!(pid, "sendto: NULL dest_addr (connected socket), allowing");
         return Verdict::Allow;
     }
 
-    // Validate addr_len.
     if !(2..=128).contains(&addr_len) {
         tracing::warn!(pid, addr_len, "sendto: suspicious addr_len, denying");
         return Verdict::Deny(libc::EPERM as u32);
     }
 
-    // Read the sockaddr from the target process.
     let addr_bytes = match read_proc_mem(pid, dest_addr_ptr, addr_len) {
         Ok(b) => b,
         Err(e) => {
@@ -1310,37 +1419,29 @@ fn evaluate_sendto(
         }
     };
 
-    // TOCTOU check.
     if !is_notif_id_valid(notifier_fd, notif.id) {
         tracing::debug!(pid, "sendto: notification invalidated (TOCTOU)");
         return Verdict::Deny(libc::EPERM as u32);
     }
 
-    classify_sendto_addr(
-        notif,
-        &addr_bytes,
-        addr_len,
-        policy,
-        dynamic_allowlist,
-        notifier_fd,
-    )
+    classify_sendto_addr(pid, &addr_bytes, addr_len, policy)
 }
 
 /// Classify a sendto() destination address.
+///
+/// Pure function: takes the raw `sockaddr` bytes and the policy, returns
+/// a verdict. No process-state side effects — directly unit-testable
+/// with synthetic byte buffers.
 ///
 /// For DNS traffic (port 53), inspects the DNS query payload and checks
 /// the domain against the allowlist. For non-DNS traffic, delegates to
 /// the same IP classification as connect().
 fn classify_sendto_addr(
-    notif: &SeccompNotif,
+    pid: u32,
     addr_bytes: &[u8],
     addr_len: usize,
     policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
 ) -> Verdict {
-    let pid = notif.pid;
-
     // Parse address family.
     if addr_len < 2 {
         tracing::warn!(pid, addr_len, "sendto: addr too short, denying");
@@ -1414,13 +1515,21 @@ fn classify_sendto_addr(
         }
     };
 
-    // DNS traffic: check domain, trigger resolution.
-    if port == DNS_PORT {
-        return evaluate_dns_sendto(notif, policy, dynamic_allowlist, &ip_addr, notifier_fd);
+    if policy.enforce_proxy_egress {
+        if let Ok(dns_ip) = policy.dns_server_addr.parse::<IpAddr>() {
+            if ip_addr == dns_ip && port == 53 {
+                return Verdict::Allow;
+            }
+        }
+        if ip_addr.is_loopback() && Some(port) == policy.proxy_port {
+            return Verdict::Allow;
+        }
+
+        tracing::warn!(pid, %ip_addr, port, "sendto: denied (proxy-only egress mode)");
+        return Verdict::Deny(libc::EACCES as u32);
     }
 
-    // Non-DNS traffic: check IP against policy (same rules as connect).
-    classify_outbound_ip(pid, ip_addr, port, policy, dynamic_allowlist, "sendto")
+    classify_outbound_ip(pid, ip_addr, port, policy, "sendto")
 }
 
 /// Evaluate a `sendmsg()` syscall.
@@ -1432,12 +1541,7 @@ fn classify_sendto_addr(
 ///
 /// The destination address is in `msghdr.msg_name` / `msghdr.msg_namelen`.
 /// If `msg_name` is NULL, the socket was previously connected — allow.
-fn evaluate_sendmsg(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
-) -> Verdict {
+fn evaluate_sendmsg(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let pid = notif.pid;
 
     let msghdr_ptr = notif.data.args[1];
@@ -1458,38 +1562,89 @@ fn evaluate_sendmsg(
         }
     };
 
+    // SAFETY-UNWRAP: hdr_bytes is sized MSGHDR_SIZE >= 48, and we slice
+    // fixed 8-byte / 4-byte windows whose lengths exactly match the target
+    // arrays — try_into() cannot fail.
     let msg_name_ptr = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
+    // SAFETY-UNWRAP: same fixed-window guarantee as msg_name_ptr above.
     let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize;
-
-    // Defense-in-depth: block ancillary data (msg_control) on AF_INET/AF_INET6
-    // to prevent potential fd-injection attacks via SCM_RIGHTS. In practice the
-    // kernel already rejects SCM_RIGHTS on non-AF_UNIX sockets, but we block
-    // it anyway as belt-and-suspenders.
-    //
-    // Ancillary data on AF_UNIX sockets (or connected sockets with NULL msg_name)
-    // is permitted because it's used legitimately by runtimes like BEAM/Erlang
-    // (erl_child_setup receives fds from the emulator via SCM_RIGHTS over Unix
-    // sockets). All AF_UNIX sockets inside the sandbox are between sandbox-
-    // internal processes at the same privilege level — the supervisor does not
-    // expose any Unix socket endpoint.
-    //
-    // IMPORTANT: This check runs BEFORE the restrict_outbound early-return so
-    // that inet SCM_RIGHTS is always blocked regardless of outbound policy.
+    // SAFETY-UNWRAP: hdr_bytes is sized MSGHDR_SIZE >= 48; the 8-byte slice
+    // length matches u64 exactly.
     let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap());
+
+    // Read the msg_name bytes once if there's an address to inspect.
+    // Used for both the SCM_RIGHTS family check (when msg_controllen > 0)
+    // and the outbound destination classification.
+    let msg_name_bytes = if msg_name_ptr != 0 && (2..=128).contains(&msg_namelen) {
+        match read_proc_mem(pid, msg_name_ptr, msg_namelen) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "sendmsg: failed to read msg_name, denying");
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+        }
+    } else {
+        None
+    };
+
+    // TOCTOU check after all reads but before the verdict commits.
+    if !is_notif_id_valid(notifier_fd, notif.id) {
+        tracing::debug!(pid, "sendmsg: notification invalidated (TOCTOU)");
+        return Verdict::Deny(libc::EPERM as u32);
+    }
+
+    classify_sendmsg(
+        pid,
+        msg_name_ptr,
+        msg_namelen,
+        msg_controllen,
+        msg_name_bytes.as_deref(),
+        policy,
+    )
+}
+
+/// Pure verdict computation for sendmsg, given pre-read msghdr fields
+/// and (optionally) the msg_name buffer.
+///
+/// Defense-in-depth: ancillary data (`msg_controllen > 0`) on non-AF_UNIX
+/// sockets is rejected as a belt-and-suspenders guard against SCM_RIGHTS
+/// fd injection. The kernel itself rejects SCM_RIGHTS on non-AF_UNIX,
+/// but the early reject here gives a clear log line.
+///
+/// `msg_name_bytes` is `Some(buf)` when the caller successfully read the
+/// msg_name buffer (msg_name_ptr != 0 && msg_namelen in 2..=128). When
+/// `None`, we treat msg_name as effectively absent.
+fn classify_sendmsg(
+    pid: u32,
+    msg_name_ptr: u64,
+    msg_namelen: usize,
+    msg_controllen: u64,
+    msg_name_bytes: Option<&[u8]>,
+    policy: &NotifierPolicy,
+) -> Verdict {
+    // Ancillary data: SCM_RIGHTS fd-injection guard. Must run BEFORE the
+    // restrict_outbound early-return so the inet SCM_RIGHTS case is
+    // always rejected regardless of outbound policy.
     if msg_controllen > 0 {
-        // Determine the socket address family to decide whether to allow.
-        // NULL msg_name → connected socket (previously checked at connect time),
-        // which is safe for ancillary data (most likely AF_UNIX between internal
-        // processes).
         if msg_name_ptr != 0 && msg_namelen >= 2 {
-            let addr_bytes = match read_proc_mem(pid, msg_name_ptr, msg_namelen) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(pid, error = %e, "sendmsg: failed to read msg_name for SCM_RIGHTS check, denying");
-                    return Verdict::Deny(libc::EPERM as u32);
-                }
+            let Some(addr) = msg_name_bytes else {
+                tracing::warn!(
+                    pid,
+                    msg_controllen,
+                    "sendmsg: ancillary data with unreadable msg_name, denying"
+                );
+                return Verdict::Deny(libc::EPERM as u32);
             };
-            let sa_family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+            if addr.len() < 2 {
+                tracing::warn!(
+                    pid,
+                    msg_controllen,
+                    addr_len = addr.len(),
+                    "sendmsg: ancillary data with truncated msg_name, denying"
+                );
+                return Verdict::Deny(libc::EPERM as u32);
+            }
+            let sa_family = u16::from_ne_bytes([addr[0], addr[1]]);
             if sa_family != libc::AF_UNIX as u16 {
                 tracing::warn!(
                     pid,
@@ -1508,50 +1663,35 @@ fn evaluate_sendmsg(
         return Verdict::Allow;
     }
 
-    // When outbound restrictions are disabled (port-forwarding-only config),
-    // allow all sendmsg calls without inspecting the destination.
-    // Checked AFTER the SCM_RIGHTS block above.
+    // When outbound restrictions are disabled, allow without further
+    // inspection. Checked AFTER the SCM_RIGHTS block so AF_UNIX/AF_INET
+    // distinction still applies.
     if !policy.restrict_outbound {
         tracing::debug!(pid, "sendmsg: outbound unrestricted, allowing");
         return Verdict::Allow;
     }
 
-    // NULL msg_name → connected socket, destination was checked at connect() time.
+    // NULL msg_name → connected socket, destination was checked at
+    // connect() time.
     if msg_name_ptr == 0 {
         tracing::debug!(pid, "sendmsg: NULL msg_name (connected socket), allowing");
         return Verdict::Allow;
     }
 
-    // Validate.
+    // Validate msg_namelen bounds.
     if !(2..=128).contains(&msg_namelen) {
         tracing::warn!(pid, msg_namelen, "sendmsg: suspicious msg_namelen, denying");
         return Verdict::Deny(libc::EPERM as u32);
     }
 
-    // Read the sockaddr.
-    let addr_bytes = match read_proc_mem(pid, msg_name_ptr, msg_namelen) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "sendmsg: failed to read msg_name, denying");
-            return Verdict::Deny(libc::EPERM as u32);
-        }
+    let Some(addr_bytes) = msg_name_bytes else {
+        // Caller signalled "valid msg_name" via the ptr but didn't
+        // produce bytes — defensive deny.
+        tracing::warn!(pid, "sendmsg: msg_name unreadable, denying");
+        return Verdict::Deny(libc::EPERM as u32);
     };
 
-    // TOCTOU check.
-    if !is_notif_id_valid(notifier_fd, notif.id) {
-        tracing::debug!(pid, "sendmsg: notification invalidated (TOCTOU)");
-        return Verdict::Deny(libc::EPERM as u32);
-    }
-
-    // Reuse the sendto classification logic.
-    classify_sendto_addr(
-        notif,
-        &addr_bytes,
-        msg_namelen,
-        policy,
-        dynamic_allowlist,
-        notifier_fd,
-    )
+    classify_sendto_addr(pid, addr_bytes, msg_namelen, policy)
 }
 
 /// Shared IP classification for outbound traffic (connect, sendto, sendmsg).
@@ -1563,7 +1703,6 @@ fn classify_outbound_ip(
     ip_addr: IpAddr,
     port: u16,
     policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
     syscall_name: &str,
 ) -> Verdict {
     // Allow loopback.
@@ -1622,13 +1761,9 @@ fn classify_outbound_ip(
             return Verdict::Deny(libc::EACCES as u32);
         }
     }
-
-    // Check static policy + dynamic allowlist.
-    if policy.is_ip_allowed(ip_addr) || dynamic_allowlist.contains(&ip_addr) {
+    // Check static policy.
+    if policy.is_ip_allowed(ip_addr) {
         tracing::debug!(pid, %ip_addr, port, "{syscall_name}: allowed");
-        Verdict::Allow
-    } else if try_resolve_allowed_domains(ip_addr, policy, dynamic_allowlist) {
-        tracing::info!(pid, %ip_addr, port, "{syscall_name}: allowed after domain re-resolution");
         Verdict::Allow
     } else {
         tracing::warn!(pid, %ip_addr, port, "{syscall_name}: denied by policy");
@@ -1639,508 +1774,6 @@ fn classify_outbound_ip(
 // ---------------------------------------------------------------------------
 // DNS query inspection and supervisor-side resolution
 // ---------------------------------------------------------------------------
-
-/// Speculatively inspect a sendto() on a connected socket for DNS queries.
-///
-/// Some runtimes (notably Erlang/OTP's inet_res resolver) `connect()` a UDP
-/// socket to the DNS server first, then use `sendto(fd, buf, len, 0, NULL, 0)`
-/// to send the query. Because `dest_addr` is NULL, the normal DNS inspection
-/// path in `classify_sendto_addr()` is never reached, and the dynamic allowlist
-/// is never populated.
-///
-/// This function reads the payload and attempts to parse it as a DNS query.
-/// If it contains a valid query for an allowed domain, resolve it synchronously
-/// to populate the dynamic allowlist before the sandboxed process gets the DNS
-/// response and calls connect() to the resolved IP.
-///
-/// This is best-effort: if the payload isn't DNS or doesn't parse, we do nothing
-/// (the sendto is allowed regardless since the connected socket's destination
-/// was already checked at connect() time).
-fn try_inspect_connected_dns(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    notifier_fd: RawFd,
-) {
-    let pid = notif.pid;
-    let buf_ptr = notif.data.args[1];
-    let buf_len = notif.data.args[2] as usize;
-
-    // Too small for a DNS header — not DNS.
-    if buf_len < DNS_HEADER_SIZE {
-        return;
-    }
-
-    let read_len = buf_len.min(DNS_MAX_INSPECT);
-    let payload = match read_proc_mem(pid, buf_ptr, read_len) {
-        Ok(b) => b,
-        Err(_) => return, // Can't read — skip quietly.
-    };
-
-    // TOCTOU re-check.
-    if !is_notif_id_valid(notifier_fd, notif.id) {
-        return;
-    }
-
-    // Try to parse as DNS.
-    let domain = match extract_dns_query_name(&payload) {
-        Some(d) => d,
-        None => return, // Not a DNS query — skip.
-    };
-
-    // Check domain against policy and resolve if allowed.
-    if is_domain_allowed_by_policy(&domain, &policy.allowed_domains) {
-        tracing::debug!(
-            pid,
-            domain,
-            "sendto(connected): DNS query detected, resolving"
-        );
-        resolve_and_add(&domain, dynamic_allowlist, &policy.dns_server_addr);
-    } else {
-        tracing::debug!(
-            pid,
-            domain,
-            "sendto(connected): DNS query for denied domain (query still allowed, connect will be denied)"
-        );
-    }
-}
-
-/// Evaluate a sendto() that targets port 53 (DNS).
-///
-/// Reads the DNS query payload from the process's memory, extracts the
-/// queried domain name, and checks it against the domain allowlist.
-/// If allowed, the query is permitted and the supervisor resolves the
-/// domain synchronously, adding the resulting IPs to the dynamic allowlist
-/// before returning the verdict. This ensures the allowlist is populated
-/// before the sandboxed process receives the DNS response and calls
-/// connect() to the resolved IP.
-///
-/// If no domain rules are configured (empty `allowed_domains`), DNS
-/// traffic is subject to normal IP-based filtering.
-fn evaluate_dns_sendto(
-    notif: &SeccompNotif,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-    dns_server_ip: &IpAddr,
-    notifier_fd: RawFd,
-) -> Verdict {
-    let pid = notif.pid;
-    let buf_ptr = notif.data.args[1];
-    let buf_len = notif.data.args[2] as usize;
-
-    // If no domain rules are configured, fall through to IP-based check.
-    // This means DNS traffic to an allowed DNS server IP is permitted,
-    // but the sandbox can't reach non-allowed IPs regardless.
-    if policy.allowed_domains.is_empty() {
-        tracing::debug!(pid, "DNS sendto: no domain rules, checking IP");
-        return classify_outbound_ip(
-            pid,
-            *dns_server_ip,
-            DNS_PORT,
-            policy,
-            dynamic_allowlist,
-            "sendto(dns)",
-        );
-    }
-
-    // The DNS server IP (from the namespace's resolv.conf, set by pasta)
-    // must be reachable for DNS to work. Allow traffic to the DNS server
-    // itself — the domain check filters at the query level.
-    //
-    // Typical DNS servers: the default gateway (pasta mirrors host config),
-    // or loopback/link-local resolvers. These are already allowed by
-    // classify_outbound_ip's special-case rules. For external DNS servers
-    // (e.g., 8.8.8.8), we explicitly allow port 53 traffic here since
-    // the domain-level filtering provides the actual security boundary.
-
-    // Read the DNS query payload.
-    let read_len = buf_len.min(DNS_MAX_INSPECT);
-    if read_len < DNS_HEADER_SIZE {
-        tracing::warn!(
-            pid,
-            buf_len,
-            "DNS sendto: payload too small for DNS header, denying"
-        );
-        return Verdict::Deny(libc::EACCES as u32);
-    }
-
-    let payload = match read_proc_mem(pid, buf_ptr, read_len) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "DNS sendto: failed to read payload, denying");
-            return Verdict::Deny(libc::EACCES as u32);
-        }
-    };
-
-    // TOCTOU re-check after reading payload.
-    if !is_notif_id_valid(notifier_fd, notif.id) {
-        tracing::debug!(
-            pid,
-            "DNS sendto: notification invalidated after payload read"
-        );
-        return Verdict::Deny(libc::EPERM as u32);
-    }
-
-    // Extract the queried domain name.
-    let domain = match extract_dns_query_name(&payload) {
-        Some(d) => d,
-        None => {
-            tracing::warn!(pid, "DNS sendto: could not parse query name, denying");
-            return Verdict::Deny(libc::EACCES as u32);
-        }
-    };
-
-    // Check domain against the allowlist.
-    if is_domain_allowed_by_policy(&domain, &policy.allowed_domains) {
-        tracing::debug!(
-            pid,
-            domain,
-            "DNS sendto: domain allowed, resolving before release"
-        );
-
-        // Resolve the domain synchronously before returning the verdict.
-        //
-        // The sandboxed process is suspended in the seccomp notification —
-        // it cannot proceed until we return a verdict. By resolving here,
-        // the DynamicAllowlist is guaranteed to contain the IPs before the
-        // process receives the DNS response and calls connect().
-        //
-        // This eliminates the TOCTOU race where the process would get a
-        // DNS response, immediately connect(), and find the DynamicAllowlist
-        // not yet populated.
-        //
-        // The supervisor (PID 1) runs outside the seccomp filter, so its
-        // own DNS resolution (via getaddrinfo/sendto) is not intercepted.
-        resolve_and_add(&domain, dynamic_allowlist, &policy.dns_server_addr);
-
-        Verdict::Allow
-    } else {
-        tracing::warn!(pid, domain, "DNS sendto: domain denied by policy");
-        Verdict::Deny(libc::EACCES as u32)
-    }
-}
-
-/// Extract the query domain name from a DNS packet.
-///
-/// Parses the question section of a standard DNS query and returns the
-/// first QNAME as a lowercase dotted string (e.g., "example.com").
-///
-/// Returns `None` for malformed packets, zero-question packets, or
-/// packets using pointer compression in the question section.
-fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
-    if packet.len() < DNS_HEADER_SIZE {
-        return None;
-    }
-
-    // QDCOUNT is at bytes 4-5.
-    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
-    if qdcount == 0 {
-        return None;
-    }
-
-    // Question section starts at byte 12.
-    let mut pos = DNS_HEADER_SIZE;
-    let mut labels = Vec::new();
-
-    loop {
-        if pos >= packet.len() {
-            return None;
-        }
-
-        let label_len = packet[pos] as usize;
-        pos += 1;
-
-        if label_len == 0 {
-            break; // Root label — end of name.
-        }
-
-        // Pointer compression — not expected in queries, but handle gracefully.
-        if label_len >= 0xC0 {
-            return None;
-        }
-
-        if pos + label_len > packet.len() {
-            return None;
-        }
-
-        let label = std::str::from_utf8(&packet[pos..pos + label_len]).ok()?;
-        labels.push(label.to_lowercase());
-        pos += label_len;
-    }
-
-    if labels.is_empty() {
-        None
-    } else {
-        Some(labels.join("."))
-    }
-}
-
-/// Check if a domain is allowed by the domain allowlist.
-///
-/// Uses suffix matching: `"example.com"` allows both `example.com`
-/// and any subdomain like `www.example.com`.
-fn is_domain_allowed_by_policy(domain: &str, allowed_domains: &[String]) -> bool {
-    let normalized = domain.trim_end_matches('.');
-
-    for allowed in allowed_domains {
-        let allowed_normalized = allowed.trim_end_matches('.');
-        if normalized == allowed_normalized
-            || normalized.ends_with(&format!(".{allowed_normalized}"))
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Format a DNS server IP address as a socket address string with port 53.
-///
-/// IPv6 addresses are wrapped in brackets per RFC 2732 so that
-/// `SocketAddr::from_str` and `UdpSocket::send_to` parse them correctly:
-///   - IPv4: `"10.0.0.1"` → `"10.0.0.1:53"`
-///   - IPv6: `"2001:db8::1"` → `"[2001:db8::1]:53"`
-fn dns_socket_addr(addr: &str) -> String {
-    if addr.contains(':') {
-        // IPv6 — must bracket to form a valid socket address.
-        format!("[{}]:53", addr)
-    } else {
-        format!("{}:53", addr)
-    }
-}
-
-/// When a `connect()` to an unknown IP is about to be denied, try resolving
-/// all allowed domains and check if the target IP matches any of them.
-///
-/// This handles the TCP DNS case: the sandboxed process resolves a domain via
-/// TCP DNS (connect + write/read on port 53), which we don't intercept at the
-/// payload level. When it subsequently connects to the resolved IP, we don't
-/// recognize it. By re-resolving all allowed domains here, we can verify the
-/// IP belongs to an allowed domain and populate the dynamic allowlist.
-///
-/// The sandboxed process is suspended in the seccomp notification while this
-/// runs, so there is no TOCTOU race.
-///
-/// Returns `true` if the IP was found to belong to an allowed domain (and the
-/// allowlist was updated), `false` otherwise.
-fn try_resolve_allowed_domains(
-    target_ip: IpAddr,
-    policy: &NotifierPolicy,
-    dynamic_allowlist: &DynamicAllowlist,
-) -> bool {
-    // Only attempt if we have domain-based filtering configured.
-    if policy.allowed_domains.is_empty() {
-        return false;
-    }
-
-    let dns_server = dns_socket_addr(&policy.dns_server_addr);
-
-    for domain in &policy.allowed_domains {
-        // Query A records (IPv4).
-        let mut domain_ips: Vec<IpAddr> = Vec::new();
-        if let Some(ips) = dns_query_direct(domain, 1, &dns_server) {
-            domain_ips.extend(ips);
-        }
-        // Query AAAA records (IPv6).
-        if let Some(ips) = dns_query_direct(domain, 28, &dns_server) {
-            domain_ips.extend(ips);
-        }
-
-        if domain_ips.contains(&target_ip) {
-            tracing::info!(
-                domain,
-                %target_ip,
-                ips = ?domain_ips,
-                "connect: IP matched allowed domain via re-resolution"
-            );
-            // Add all IPs for this domain so subsequent connects are fast.
-            dynamic_allowlist.add_ips(domain_ips);
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Resolve a domain name and add the resulting IPs to the dynamic allowlist.
-///
-/// Sends DNS queries directly to the configured DNS server inside the
-/// namespace instead of using `getaddrinfo()`. This avoids glibc resolver
-/// caching issues — after fork, glibc may cache the host's nameserver
-/// address (e.g., `127.0.0.53`) which is unreachable inside the pasta
-/// namespace.
-///
-/// Sends both A (IPv4) and AAAA (IPv6) queries and adds all resolved IPs
-/// to the dynamic allowlist.
-fn resolve_and_add(domain: &str, dynamic_allowlist: &DynamicAllowlist, dns_server_addr: &str) {
-    let dns_server = dns_socket_addr(dns_server_addr);
-
-    let mut all_ips: Vec<IpAddr> = Vec::new();
-
-    // Query A records (IPv4).
-    if let Some(ips) = dns_query_direct(domain, 1, &dns_server) {
-        all_ips.extend(ips);
-    }
-
-    // Query AAAA records (IPv6).
-    if let Some(ips) = dns_query_direct(domain, 28, &dns_server) {
-        all_ips.extend(ips);
-    }
-
-    if all_ips.is_empty() {
-        tracing::warn!(domain, "resolver returned no addresses");
-    } else {
-        tracing::debug!(domain, ips = ?all_ips, "resolved domain, adding to dynamic allowlist");
-        dynamic_allowlist.add_ips(all_ips);
-    }
-}
-
-/// Send a direct DNS query and parse the response.
-///
-/// `qtype`: 1 = A (IPv4), 28 = AAAA (IPv6).
-/// `dns_server`: socket address in "ip:port" format (e.g., "10.0.0.1:53"
-/// or "[2001:db8::1]:53").
-/// Returns `None` on any error (timeout, parse failure, etc.).
-fn dns_query_direct(domain: &str, qtype: u16, dns_server: &str) -> Option<Vec<IpAddr>> {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-    use std::time::Duration;
-
-    // Build the DNS query packet.
-    let mut packet = Vec::with_capacity(64);
-
-    // Header: ID=0xCAFE, RD=1, QDCOUNT=1
-    packet.extend_from_slice(&[
-        0xCA, 0xFE, // ID
-        0x01, 0x00, // Flags: RD=1 (recursion desired)
-        0x00, 0x01, // QDCOUNT=1
-        0x00, 0x00, // ANCOUNT=0
-        0x00, 0x00, // NSCOUNT=0
-        0x00, 0x00, // ARCOUNT=0
-    ]);
-
-    // Encode domain as DNS labels.
-    for label in domain.split('.') {
-        if label.is_empty() {
-            continue;
-        }
-        if label.len() > 63 {
-            return None; // Label too long.
-        }
-        packet.push(label.len() as u8);
-        packet.extend_from_slice(label.as_bytes());
-    }
-    packet.push(0); // Root label terminator.
-
-    // QTYPE and QCLASS=IN(1).
-    packet.extend_from_slice(&qtype.to_be_bytes());
-    packet.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
-
-    // Send the query via UDP.
-    // Parse the server address to determine whether to bind an IPv4 or IPv6 socket.
-    // The dns_server string is already formatted by `dns_socket_addr()` — e.g.,
-    // "10.0.0.1:53" or "[2001:db8::1]:53".
-    let server_addr: SocketAddr = dns_server.parse().ok()?;
-    let bind_addr: SocketAddr = if server_addr.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let socket = UdpSocket::bind(bind_addr).ok()?;
-    socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    socket.send_to(&packet, server_addr).ok()?;
-
-    // Read the response.
-    let mut buf = [0u8; 512];
-    let len = socket.recv(&mut buf).ok()?;
-    if len < 12 {
-        return None; // Too short for DNS header.
-    }
-
-    // Verify response ID matches.
-    if buf[0] != 0xCA || buf[1] != 0xFE {
-        return None;
-    }
-
-    // Check QR bit (response) and RCODE.
-    let flags = u16::from_be_bytes([buf[2], buf[3]]);
-    if flags & 0x8000 == 0 {
-        return None; // Not a response.
-    }
-    let rcode = flags & 0x000F;
-    if rcode != 0 {
-        return None; // Error response (NXDOMAIN, SERVFAIL, etc.).
-    }
-
-    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-    if ancount == 0 {
-        return Some(Vec::new()); // No answers (but no error).
-    }
-
-    // Skip the question section.
-    let mut pos = 12;
-    // Skip QNAME.
-    pos = skip_dns_name(&buf[..len], pos)?;
-    pos += 4; // Skip QTYPE + QCLASS.
-
-    // Parse answer records.
-    let mut ips = Vec::new();
-    for _ in 0..ancount {
-        if pos >= len {
-            break;
-        }
-        // Skip NAME (may be a pointer).
-        pos = skip_dns_name(&buf[..len], pos)?;
-        if pos + 10 > len {
-            break;
-        }
-        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-        // Skip TYPE(2) + CLASS(2) + TTL(4).
-        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
-        pos += 10;
-
-        if pos + rdlength > len {
-            break;
-        }
-
-        if rtype == 1 && rdlength == 4 {
-            // A record: 4 bytes IPv4.
-            let ip = Ipv4Addr::new(buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
-            ips.push(IpAddr::V4(ip));
-        } else if rtype == 28 && rdlength == 16 {
-            // AAAA record: 16 bytes IPv6.
-            let mut addr_buf = [0u8; 16];
-            addr_buf.copy_from_slice(&buf[pos..pos + 16]);
-            ips.push(IpAddr::V6(Ipv6Addr::from(addr_buf)));
-        }
-        // Skip to next record.
-        pos += rdlength;
-    }
-
-    Some(ips)
-}
-
-/// Skip a DNS name (label sequence or pointer) and return the new position.
-fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
-    // DNS names are either a sequence of labels ending with a zero-length
-    // label, or end with a pointer (2 bytes starting with 0xC0).
-    loop {
-        if pos >= buf.len() {
-            return None;
-        }
-        let b = buf[pos];
-        if b == 0 {
-            // End of labels.
-            return Some(pos + 1);
-        }
-        if b & 0xC0 == 0xC0 {
-            // Pointer: 2 bytes total, skip both.
-            return Some(pos + 2);
-        }
-        // Regular label: skip length byte + label.
-        let label_len = b as usize;
-        pos += 1 + label_len;
-    }
-}
 
 /// Evaluate a `clone()` syscall.
 ///
@@ -2196,6 +1829,8 @@ fn evaluate_clone3(notif: &SeccompNotif, notifier_fd: RawFd) -> Verdict {
         return Verdict::Deny(libc::EPERM as u32);
     }
 
+    // SAFETY-UNWRAP: flags_bytes was just read as exactly 8 bytes; the
+    // try_into() to [u8; 8] cannot fail.
     let flags = u64::from_ne_bytes(flags_bytes.try_into().unwrap());
     let ns_flags = flags & NS_FLAGS_MASK;
     if ns_flags != 0 {
@@ -2330,7 +1965,7 @@ fn evaluate_execve(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: R
         return Verdict::Allow;
     }
 
-    let pathname = match read_proc_string(pid, pathname_ptr, 4096) {
+    let pathname = match read_proc_string_with_retry(pid, pathname_ptr, 4096) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(pid, error = %e, "execve: failed to read pathname, denying");
@@ -2385,7 +2020,7 @@ fn evaluate_execveat(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd:
     }
 
     // Read the pathname.
-    let pathname = match read_proc_string(pid, pathname_ptr, 4096) {
+    let pathname = match read_proc_string_with_retry(pid, pathname_ptr, 4096) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(pid, error = %e, "execveat: failed to read pathname, denying");
@@ -2457,6 +2092,8 @@ pub fn policy_from_config(
     config: &can_policy::SandboxConfig,
     resolved_ips: &[(String, Vec<IpAddr>)],
     dns_addr: &str,
+    dns_cache: Option<can_net::dns_cache::DnsCache>,
+    proxy_port: Option<u16>,
 ) -> NotifierPolicy {
     let mut allowed_ips: HashSet<IpAddr> = HashSet::new();
     let mut allowed_cidrs: Vec<(IpAddr, u8)> = Vec::new();
@@ -2487,6 +2124,10 @@ pub fn policy_from_config(
     if let Ok(ip) = dns_addr.parse::<IpAddr>() {
         allowed_ips.insert(ip);
     }
+    allowed_ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    allowed_ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    // SAFETY-UNWRAP: PASTA_DNS_ADDR is a const &str whose validity as an
+    // IP literal is checked by can_net::pasta tests.
     allowed_ips.insert(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap());
 
     // Allow the host's default gateway — pasta mirrors the host's
@@ -2520,23 +2161,50 @@ pub fn policy_from_config(
     }
 
     // Determine whether to restrict outbound IP connections.
-    // Only restrict when the user has explicitly configured domain or IP
-    // rules. Port-forwarding-only configs (no domains, no IPs) should
-    // allow all outbound traffic — the notifier is still useful for
-    // clone/socket/execve enforcement.
-    let restrict_outbound =
-        !config.network.allow_domains.is_empty() || !config.network.allow_ips.is_empty();
+    // Restrict when:
+    //   * an explicit allow list is configured (domains or IPs); the
+    //     supervisor enforces that list, OR
+    //   * the egress mode is `proxy-only` or `none`; these modes are
+    //     themselves restrictive (proxy-only allows only the local
+    //     proxy port; none allows nothing). Without this term,
+    //     `egress = "none"` with no allow lists falls through to the
+    //     "outbound unrestricted" branch and the supervisor allows
+    //     every connect — the exact bypass we're guarding against.
+    //
+    // Port-forwarding-only `direct` configs (no domains, no IPs, no
+    // explicit restriction) intentionally do NOT set this; the notifier
+    // is still useful for clone/socket/execve enforcement but allows
+    // raw outbound.
+    let egress_mode = config.network.egress();
+    let restrict_outbound = !config.network.allow_ips.is_empty()
+        || !config.network.allow_domains.is_empty()
+        || matches!(egress_mode, EgressMode::ProxyOnly | EgressMode::None);
 
     NotifierPolicy {
         allowed_ips,
         allowed_cidrs,
-        allowed_domains: config.network.allow_domains.clone(),
+
         allowed_exec_paths,
         allowed_exec_prefixes,
         allow_af_unix: true,
         allow_af_inet: true,
         restrict_outbound,
         dns_server_addr: dns_addr.to_string(),
+        allowed_domains: config.network.allow_domains.clone(),
+        dns_cache,
+        dynamic_ips: Arc::new(RwLock::new(HashSet::new())),
+        // `egress = "none"` and `egress = "proxy-only"` both restrict the
+        // worker to a tiny set of addresses; the difference is that
+        // proxy-only ALSO whitelists the proxy port. We route both
+        // through `classify_proxy_only_connect`, which checks
+        // `Some(port) == policy.proxy_port` — when egress is None the
+        // proxy isn't started and `proxy_port` is None, so no port
+        // matches and everything (except AF_UNIX/AF_UNSPEC) is denied.
+        // Without this, `egress = "none"` defaulted to ALLOW-ALL
+        // because `restrict_outbound` only fires when allow lists are
+        // non-empty.
+        enforce_proxy_egress: matches!(egress_mode, EgressMode::ProxyOnly | EgressMode::None),
+        proxy_port,
     }
 }
 
@@ -2556,1464 +2224,952 @@ fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn kernel_version_parsing() {
-        assert_eq!(parse_kernel_version("5.9.0-generic"), Some((5, 9)));
-        assert_eq!(parse_kernel_version("6.1.52"), Some((6, 1)));
-        assert_eq!(parse_kernel_version("4.19.128-lts"), Some((4, 19)));
-        assert_eq!(parse_kernel_version("5.15.0-76-generic"), Some((5, 15)));
-    }
-
-    #[test]
-    fn kernel_version_detection_returns_bool() {
-        // Just make sure it doesn't panic.
-        let _ = is_notifier_supported();
-    }
-
-    #[test]
-    fn notifier_filter_has_correct_structure() {
-        let filter = build_notifier_filter();
-        // arch_load, arch_cmp, arch_allow, nr_load, N checks, allow, user_notif
-        let expected = 3 + 1 + NOTIFIED_SYSCALLS.len() + 1 + 1;
-        assert_eq!(filter.len(), expected);
-
-        // Last instruction should be USER_NOTIF.
-        let last = filter.last().unwrap();
-        assert_eq!(last.code, (libc::BPF_RET | libc::BPF_K) as u16);
-        assert_eq!(last.k, SECCOMP_RET_USER_NOTIF);
-
-        // Second-to-last should be ALLOW.
-        let allow = &filter[filter.len() - 2];
-        assert_eq!(allow.k, libc::SECCOMP_RET_ALLOW);
-    }
-
-    #[test]
-    fn ip_in_cidr_v4() {
-        let net: IpAddr = "10.0.0.0".parse().unwrap();
-        let ip_in: IpAddr = "10.255.255.255".parse().unwrap();
-        let ip_out: IpAddr = "11.0.0.0".parse().unwrap();
-
-        assert!(ip_in_cidr(ip_in, net, 8));
-        assert!(!ip_in_cidr(ip_out, net, 8));
-    }
-
-    #[test]
-    fn ip_in_cidr_v4_exact() {
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(ip_in_cidr(ip, ip, 32));
-        assert!(!ip_in_cidr("192.168.1.2".parse().unwrap(), ip, 32));
-    }
-
-    #[test]
-    fn ip_in_cidr_v6() {
-        let net: IpAddr = "fd00::".parse().unwrap();
-        let ip_in: IpAddr = "fd00::1".parse().unwrap();
-        let ip_out: IpAddr = "fe80::1".parse().unwrap();
-
-        assert!(ip_in_cidr(ip_in, net, 8));
-        assert!(!ip_in_cidr(ip_out, net, 8));
-    }
-
-    #[test]
-    fn ip_in_cidr_zero_prefix() {
-        let any: IpAddr = "0.0.0.0".parse().unwrap();
-        let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        assert!(ip_in_cidr(ip, any, 0));
-    }
-
-    #[test]
-    fn ip_in_cidr_v4_v6_mismatch() {
-        let v4: IpAddr = "10.0.0.1".parse().unwrap();
-        let v6: IpAddr = "::1".parse().unwrap();
-        assert!(!ip_in_cidr(v4, v6, 8));
-    }
-
-    #[test]
-    fn policy_loopback_always_allowed() {
-        let policy = NotifierPolicy::default();
-        assert!(policy.is_ip_allowed("127.0.0.1".parse().unwrap()));
-        assert!(policy.is_ip_allowed("::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn policy_explicit_ip() {
-        let mut policy = NotifierPolicy::default();
-        policy.allowed_ips.insert("93.184.216.34".parse().unwrap());
-        assert!(policy.is_ip_allowed("93.184.216.34".parse().unwrap()));
-        assert!(!policy.is_ip_allowed("93.184.216.35".parse().unwrap()));
-    }
-
-    #[test]
-    fn policy_cidr_range() {
-        let mut policy = NotifierPolicy::default();
-        policy
-            .allowed_cidrs
-            .push(("172.16.0.0".parse().unwrap(), 12));
-        assert!(policy.is_ip_allowed("172.16.0.1".parse().unwrap()));
-        assert!(policy.is_ip_allowed("172.31.255.255".parse().unwrap()));
-        assert!(!policy.is_ip_allowed("172.32.0.0".parse().unwrap()));
-    }
-
-    #[test]
-    fn parse_cidr_valid() {
-        assert_eq!(
-            parse_cidr("10.0.0.0/8"),
-            Some(("10.0.0.0".parse().unwrap(), 8))
-        );
-        assert_eq!(
-            parse_cidr("192.168.1.0/24"),
-            Some(("192.168.1.0".parse().unwrap(), 24))
-        );
-    }
-
-    #[test]
-    fn parse_cidr_invalid() {
-        assert_eq!(parse_cidr("10.0.0.0"), None);
-        assert_eq!(parse_cidr("not-an-ip/8"), None);
-        assert_eq!(parse_cidr(""), None);
-    }
-
-    #[test]
-    fn clone_ns_flags_mask_is_complete() {
-        // Verify our mask covers all namespace flags.
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWNS, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWPID, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWNET, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWUSER, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWIPC, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWUTS, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWCGROUP, 0);
-        assert_ne!(NS_FLAGS_MASK & CLONE_NEWTIME, 0);
-    }
-
-    #[test]
-    fn seccomp_notif_struct_sizes() {
-        assert_eq!(std::mem::size_of::<SeccompNotif>(), 80);
-        assert_eq!(std::mem::size_of::<SeccompNotifResp>(), 24);
-    }
-
-    #[test]
-    fn policy_from_config_adds_pasta_addrs() {
-        use can_policy::SandboxConfig;
-        let config = SandboxConfig::default_deny();
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        // The pasta DNS address (link-local) must always be allowed.
-        assert!(policy.is_ip_allowed(can_net::pasta::PASTA_DNS_ADDR.parse().unwrap()));
-        // Note: default gateway depends on host, so we don't assert a specific IP.
-    }
-
-    #[test]
-    fn policy_from_config_with_resolved_ips() {
-        use can_policy::SandboxConfig;
-        let config = SandboxConfig::default_deny();
-        let resolved = vec![(
-            "example.com".to_string(),
-            vec!["93.184.216.34".parse::<IpAddr>().unwrap()],
-        )];
-        let policy = policy_from_config(&config, &resolved, can_net::pasta::PASTA_DNS_ADDR);
-        assert!(policy.is_ip_allowed("93.184.216.34".parse().unwrap()));
-    }
-
-    #[test]
-    fn policy_from_config_with_cidr() {
-        let mut config = can_policy::SandboxConfig::default_deny();
-        config.network.allow_ips = vec!["10.0.0.0/8".to_string()];
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert!(policy.is_ip_allowed("10.1.2.3".parse().unwrap()));
-        assert!(!policy.is_ip_allowed("11.0.0.0".parse().unwrap()));
-    }
-
-    // ---- Evaluator unit tests ----
-    //
-    // These test the pure evaluation logic using synthetic syscall arguments.
-    // They don't require actual seccomp filters or /proc/pid/mem.
-
-    #[test]
-    fn evaluate_clone_allows_plain_thread() {
-        // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
-        // This is what pthread_create uses — no namespace flags.
-        let flags: u64 = 0x0001_0F00; // typical thread flags
-        let args = [flags, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow, got Deny({e})"),
+    /// Build a fresh policy with a small allow_ips set so restrict_outbound
+    /// kicks in. Used as the default starting point for sendto/connect tests.
+    fn policy_restricting_to(allowed_ips: &[&str]) -> NotifierPolicy {
+        let mut p = NotifierPolicy::default();
+        p.restrict_outbound = true;
+        for ip in allowed_ips {
+            p.allowed_ips.insert(ip.parse().expect("test IP"));
         }
+        p
     }
 
-    #[test]
-    fn evaluate_clone_denies_newpid() {
-        let flags: u64 = CLONE_NEWPID;
-        let args = [flags, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for CLONE_NEWPID"),
-        }
-    }
-
-    #[test]
-    fn evaluate_clone_denies_newnet() {
-        let flags: u64 = CLONE_NEWNET;
-        let args = [flags, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for CLONE_NEWNET"),
-        }
-    }
-
-    #[test]
-    fn evaluate_clone_denies_newuser() {
-        let flags: u64 = CLONE_NEWUSER;
-        let args = [flags, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for CLONE_NEWUSER"),
-        }
-    }
-
-    #[test]
-    fn evaluate_clone_denies_combined_ns_flags() {
-        let flags: u64 = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET;
-        let args = [flags, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for combined NS flags"),
-        }
-    }
-
-    #[test]
-    fn evaluate_clone_allows_zero_flags() {
-        let args = [0u64, 0, 0, 0, 0, 0];
-        match evaluate_clone(&args, 1234) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for zero flags, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_allows_af_inet_stream() {
-        let policy = NotifierPolicy::default();
-        let args = [AF_INET, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_INET SOCK_STREAM, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_allows_af_inet6_dgram() {
-        let policy = NotifierPolicy::default();
-        let args = [AF_INET6, libc::SOCK_DGRAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_INET6 SOCK_DGRAM, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_allows_af_unix() {
-        let policy = NotifierPolicy::default();
-        let args = [AF_UNIX, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_UNIX, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_allows_af_netlink_route() {
-        let policy = NotifierPolicy::default();
-        // NETLINK_ROUTE (protocol 0) should be allowed with SOCK_DGRAM.
-        let args = [AF_NETLINK, libc::SOCK_DGRAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK NETLINK_ROUTE + SOCK_DGRAM"),
-        }
-        // SOCK_RAW with AF_NETLINK + NETLINK_ROUTE should also be allowed.
-        let args_raw = [AF_NETLINK, SOCK_RAW, 0, 0, 0, 0];
-        match evaluate_socket(&args_raw, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(_) => panic!("expected Allow for AF_NETLINK NETLINK_ROUTE + SOCK_RAW"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_denies_af_netlink_non_route() {
-        let policy = NotifierPolicy::default();
-        // NETLINK_AUDIT (protocol 9) should be denied.
-        let args_audit = [AF_NETLINK, libc::SOCK_DGRAM as u64, 9, 0, 0, 0];
-        match evaluate_socket(&args_audit, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_AUDIT"),
-        }
-        // NETLINK_KOBJECT_UEVENT (protocol 15) should be denied.
-        let args_uevent = [AF_NETLINK, libc::SOCK_DGRAM as u64, 15, 0, 0, 0];
-        match evaluate_socket(&args_uevent, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_KOBJECT_UEVENT"),
-        }
-        // NETLINK_CONNECTOR (protocol 11) should be denied.
-        let args_connector = [AF_NETLINK, libc::SOCK_DGRAM as u64, 11, 0, 0, 0];
-        match evaluate_socket(&args_connector, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for AF_NETLINK NETLINK_CONNECTOR"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_denies_sock_raw() {
-        let policy = NotifierPolicy::default();
-        let args = [AF_INET, SOCK_RAW, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for SOCK_RAW"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_respects_allow_af_unix_false() {
-        let policy = NotifierPolicy {
-            allow_af_unix: false,
-            ..Default::default()
-        };
-        let args = [AF_UNIX, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny when allow_af_unix is false"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_respects_allow_af_inet_false() {
-        let policy = NotifierPolicy {
-            allow_af_inet: false,
-            ..Default::default()
-        };
-        let args = [AF_INET, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny when allow_af_inet is false"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_denies_unknown_domain() {
-        let policy = NotifierPolicy::default();
-        let args = [99u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for unknown domain 99"),
-        }
-    }
-
-    #[test]
-    fn evaluate_socket_strips_cloexec_from_type() {
-        // SOCK_STREAM | SOCK_CLOEXEC should still be treated as SOCK_STREAM.
-        let policy = NotifierPolicy::default();
-        let sock_type = libc::SOCK_STREAM as u64 | libc::SOCK_CLOEXEC as u64;
-        let args = [AF_INET, sock_type, 0, 0, 0, 0];
-        match evaluate_socket(&args, 1234, &policy) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow for SOCK_STREAM|SOCK_CLOEXEC, got Deny({e})")
-            }
-        }
-    }
-
-    #[test]
-    fn notifier_filter_jump_offsets_correct() {
-        let filter = build_notifier_filter();
-        let n = NOTIFIED_SYSCALLS.len();
-
-        // Checks start at index 4 (after arch_load, arch_cmp, arch_allow, nr_load).
-        // For each check at position i (0-indexed within checks):
-        //   jt = (n - 1 - i) + 1 = n - i (skip remaining checks + ALLOW → USER_NOTIF)
-        //   jf = 0 (fall through)
-        for i in 0..n {
-            let instr = &filter[4 + i];
-            let expected_jt = (n - i) as u8;
-            assert_eq!(
-                instr.jt, expected_jt,
-                "check[{i}] jt: expected {expected_jt}, got {}",
-                instr.jt
-            );
-            assert_eq!(instr.jf, 0, "check[{i}] jf should be 0");
-        }
-    }
-
-    #[test]
-    fn notifier_filter_checks_correct_syscalls() {
-        let filter = build_notifier_filter();
-        // Extract the syscall numbers from the BPF check instructions.
-        let checked_nrs: Vec<u32> = (0..NOTIFIED_SYSCALLS.len())
-            .map(|i| filter[4 + i].k)
-            .collect();
-
-        let expected_nrs: Vec<u32> = NOTIFIED_SYSCALLS.iter().map(|(_, nr)| *nr as u32).collect();
-
-        assert_eq!(checked_nrs, expected_nrs);
-    }
-
-    #[test]
-    fn notified_syscalls_list_covers_expected() {
-        let names: Vec<&str> = NOTIFIED_SYSCALLS.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"connect"));
-        assert!(names.contains(&"clone"));
-        assert!(names.contains(&"clone3"));
-        assert!(names.contains(&"socket"));
-        assert!(names.contains(&"execve"));
-        assert!(names.contains(&"execveat"));
-        assert!(names.contains(&"sendto"));
-        assert!(names.contains(&"sendmsg"));
-    }
-
-    #[test]
-    fn policy_default_allows_af_unix_and_inet() {
-        let policy = NotifierPolicy::default();
-        assert!(policy.allow_af_unix);
-        assert!(policy.allow_af_inet);
-    }
-
-    #[test]
-    fn policy_non_loopback_non_listed_denied() {
-        let policy = NotifierPolicy::default();
-        // A random public IP should be denied by default.
-        assert!(!policy.is_ip_allowed("8.8.8.8".parse().unwrap()));
-    }
-
-    #[test]
-    fn ip_in_cidr_invalid_prefix_returns_false() {
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let net: IpAddr = "10.0.0.0".parse().unwrap();
-        // Prefix > 32 for IPv4 should return false.
-        assert!(!ip_in_cidr(ip, net, 33));
-    }
-
-    #[test]
-    fn ip_in_cidr_v6_invalid_prefix_returns_false() {
-        let ip: IpAddr = "fd00::1".parse().unwrap();
-        let net: IpAddr = "fd00::".parse().unwrap();
-        assert!(!ip_in_cidr(ip, net, 129));
-    }
-
-    // ---- is_exec_path_allowed unit tests ----
-
-    #[test]
-    fn exec_path_exact_match() {
-        let mut policy = NotifierPolicy::default();
-        policy
-            .allowed_exec_paths
-            .insert(PathBuf::from("/usr/bin/python3"));
-        assert!(is_exec_path_allowed(Path::new("/usr/bin/python3"), &policy));
-        assert!(!is_exec_path_allowed(
-            Path::new("/usr/bin/python2"),
-            &policy
-        ));
-    }
-
-    #[test]
-    fn exec_path_prefix_match() {
-        let mut policy = NotifierPolicy::default();
-        policy
-            .allowed_exec_prefixes
-            .push(PathBuf::from("/nix/store"));
-        assert!(is_exec_path_allowed(
-            Path::new("/nix/store/abc123/bin/mix"),
-            &policy
-        ));
-        assert!(is_exec_path_allowed(
-            Path::new("/nix/store/xyz/lib/erlang/bin/beam.smp"),
-            &policy
-        ));
-    }
-
-    #[test]
-    fn exec_path_prefix_rejects_partial_dir_match() {
-        let mut policy = NotifierPolicy::default();
-        policy
-            .allowed_exec_prefixes
-            .push(PathBuf::from("/nix/store"));
-        // "/nix/store-extra/bin" should NOT match "/nix/store/*".
-        assert!(!is_exec_path_allowed(
-            Path::new("/nix/store-extra/bin/foo"),
-            &policy
-        ));
-    }
-
-    #[test]
-    fn exec_path_prefix_rejects_exact_prefix_without_slash() {
-        let mut policy = NotifierPolicy::default();
-        policy
-            .allowed_exec_prefixes
-            .push(PathBuf::from("/nix/store"));
-        // The prefix directory itself (no trailing /) should not match.
-        assert!(!is_exec_path_allowed(Path::new("/nix/store"), &policy));
-    }
-
-    #[test]
-    fn exec_path_empty_policy_denies_nothing() {
-        let policy = NotifierPolicy::default();
-        // With empty paths AND prefixes, is_exec_path_allowed returns false.
-        // But evaluate_execve short-circuits to Allow when both are empty.
-        assert!(!is_exec_path_allowed(Path::new("/any/path"), &policy));
-    }
-
-    // ---- classify_connect_addr unit tests ----
-    //
-    // These test the address classification logic extracted from
-    // evaluate_connect() using synthetic sockaddr byte arrays.
-
-    /// Build a synthetic sockaddr_in byte array.
-    fn make_sockaddr_in(ip: Ipv4Addr, port: u16) -> Vec<u8> {
-        let family = (libc::AF_INET as u16).to_ne_bytes();
-        let port_bytes = port.to_be_bytes();
-        let octets = ip.octets();
-        let mut buf = vec![0u8; 16]; // sockaddr_in is 16 bytes
-        buf[0..2].copy_from_slice(&family);
-        buf[2..4].copy_from_slice(&port_bytes);
-        buf[4..8].copy_from_slice(&octets);
-        buf
-    }
-
-    /// Build a synthetic sockaddr_in6 byte array.
-    fn make_sockaddr_in6(ip: Ipv6Addr, port: u16) -> Vec<u8> {
-        let family = (libc::AF_INET6 as u16).to_ne_bytes();
-        let port_bytes = port.to_be_bytes();
-        let octets = ip.octets();
-        let mut buf = vec![0u8; 28]; // sockaddr_in6 is 28 bytes
-        buf[0..2].copy_from_slice(&family);
-        buf[2..4].copy_from_slice(&port_bytes);
-        // bytes 4-7 = flowinfo (zero)
-        buf[8..24].copy_from_slice(&octets);
-        // bytes 24-27 = scope_id (zero)
-        buf
-    }
-
-    /// Build a synthetic sockaddr with just a family (for AF_UNSPEC etc.).
-    fn make_sockaddr_family(family: i32) -> Vec<u8> {
-        let family_bytes = (family as u16).to_ne_bytes();
+    /// Build an AF_INET sockaddr_in: 16 bytes of `{family, port_be, ip[4], zero[8]}`.
+    fn sockaddr_in(ip: [u8; 4], port: u16) -> Vec<u8> {
         let mut buf = vec![0u8; 16];
-        buf[0..2].copy_from_slice(&family_bytes);
+        buf[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[4..8].copy_from_slice(&ip);
         buf
     }
 
+    /// Build an AF_INET6 sockaddr_in6: 28 bytes.
+    fn sockaddr_in6(ip: [u8; 16], port: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 28];
+        buf[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        // flowinfo (offset 4, 4 bytes) left zero.
+        buf[8..24].copy_from_slice(&ip);
+        // scope_id (offset 24, 4 bytes) left zero.
+        buf
+    }
+
+    fn sockaddr_family_only(family: libc::sa_family_t) -> Vec<u8> {
+        family.to_ne_bytes().to_vec()
+    }
+
+    // -----------------------------------------------------------------
+    // classify_sendto_addr — happy paths
+    // -----------------------------------------------------------------
+
     #[test]
-    fn connect_af_unspec_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_family(libc::AF_UNSPEC);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_UNSPEC, got Deny({e})"),
-        }
+    fn sendto_af_unspec_always_allowed() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = sockaddr_family_only(libc::AF_UNSPEC as u16);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 2, &policy),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn connect_af_unix_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_family(libc::AF_UNIX);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_UNIX, got Deny({e})"),
-        }
+    fn sendto_af_unix_always_allowed() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = sockaddr_family_only(libc::AF_UNIX as u16);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 2, &policy),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn connect_ipv4_unspecified_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::UNSPECIFIED, 0);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for 0.0.0.0, got Deny({e})"),
-        }
+    fn sendto_af_netlink_always_allowed() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = sockaddr_family_only(libc::AF_NETLINK as u16);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 2, &policy),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn connect_ipv6_unspecified_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in6(Ipv6Addr::UNSPECIFIED, 0);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for ::, got Deny({e})"),
-        }
+    fn sendto_allowed_inet_passes_through_classify_outbound() {
+        let policy = policy_restricting_to(&["1.2.3.4"]);
+        let bytes = sockaddr_in([1, 2, 3, 4], 443);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn connect_ipv4_loopback_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::LOCALHOST, 8080);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for 127.0.0.1, got Deny({e})"),
-        }
+    fn sendto_disallowed_inet_denied() {
+        let policy = policy_restricting_to(&["1.2.3.4"]);
+        let bytes = sockaddr_in([5, 6, 7, 8], 443);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn connect_ipv6_loopback_allowed() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in6(Ipv6Addr::LOCALHOST, 8080);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for ::1, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn connect_pasta_dns_addr_allowed() {
-        let policy = NotifierPolicy::default();
-        let dns_ip: Ipv4Addr = can_net::pasta::PASTA_DNS_ADDR.parse().unwrap();
-        let addr = make_sockaddr_in(dns_ip, 53);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow for pasta DNS {dns_ip}, got Deny({e})")
-            }
-        }
-    }
-
-    #[test]
-    fn connect_other_link_local_denied() {
-        // AWS metadata endpoint 169.254.169.254 should be denied.
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::new(169, 254, 169, 254), 80);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for 169.254.169.254"),
-        }
-    }
-
-    #[test]
-    fn connect_ipv4_multicast_denied() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::new(224, 0, 0, 1), 5353);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for multicast 224.0.0.1"),
-        }
-    }
-
-    #[test]
-    fn connect_ipv6_multicast_denied() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in6("ff02::1".parse().unwrap(), 5353);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for IPv6 multicast ff02::1"),
-        }
-    }
-
-    #[test]
-    fn connect_ipv4_broadcast_denied() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::BROADCAST, 1234);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for broadcast 255.255.255.255"),
-        }
-    }
-
-    #[test]
-    fn connect_ipv6_link_local_denied() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in6("fe80::1".parse().unwrap(), 80);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for IPv6 link-local fe80::1"),
-        }
-    }
-
-    #[test]
-    fn connect_unknown_family_denied() {
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_family(99);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for unknown family 99"),
-        }
-    }
-
-    #[test]
-    fn connect_policy_allowed_ip() {
+    fn sendto_unrestricted_allows_arbitrary_inet() {
         let mut policy = NotifierPolicy::default();
-        policy.allowed_ips.insert("93.184.216.34".parse().unwrap());
-        let addr = make_sockaddr_in(Ipv4Addr::new(93, 184, 216, 34), 443);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for policy-allowed IP, got Deny({e})"),
-        }
+        policy.restrict_outbound = false;
+        let bytes = sockaddr_in([1, 1, 1, 1], 80);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // classify_sendto_addr — malformed / hostile input
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sendto_rejects_addr_shorter_than_family_field() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = vec![0x02]; // only one byte; can't even read sa_family
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 1, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn connect_policy_denied_ip() {
+    fn sendto_rejects_truncated_sockaddr_in() {
+        let policy = policy_restricting_to(&["1.2.3.4"]);
+        // Family set to AF_INET but only 4 bytes — port read would
+        // succeed but the ip read needs offsets 4..8.
+        let mut bytes = vec![0u8; 4];
+        bytes[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&80u16.to_be_bytes());
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 4, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendto_rejects_truncated_sockaddr_in6() {
+        let policy = policy_restricting_to(&[]);
+        // Family AF_INET6 but length < 24 → ip can't be parsed.
+        let mut bytes = vec![0u8; 16];
+        bytes[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendto_unknown_family_denied() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = sockaddr_family_only(0xbeef);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 2, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Proxy-only / egress=none mode
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sendto_proxy_only_allows_dns_server() {
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.enforce_proxy_egress = true;
+        policy.dns_server_addr = "169.254.0.53".to_string();
+        let bytes = sockaddr_in([169, 254, 0, 53], 53);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendto_proxy_only_allows_loopback_to_proxy_port() {
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.enforce_proxy_egress = true;
+        policy.proxy_port = Some(8080);
+        let bytes = sockaddr_in([127, 0, 0, 1], 8080);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendto_proxy_only_denies_loopback_to_other_port() {
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.enforce_proxy_egress = true;
+        policy.proxy_port = Some(8080);
+        let bytes = sockaddr_in([127, 0, 0, 1], 12345);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendto_egress_none_denies_loopback_when_no_proxy_port() {
+        // egress=none policy: enforce_proxy_egress true, proxy_port None.
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.enforce_proxy_egress = true;
+        policy.proxy_port = None;
+        let bytes = sockaddr_in([127, 0, 0, 1], 8080);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendto_proxy_only_denies_arbitrary_inet() {
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.enforce_proxy_egress = true;
+        policy.proxy_port = Some(8080);
+        let bytes = sockaddr_in([1, 2, 3, 4], 443);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 16, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // IPv6
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sendto_inet6_allowed_when_in_policy() {
+        let policy = policy_restricting_to(&["::1"]);
+        let mut ip = [0u8; 16];
+        ip[15] = 1; // ::1
+        let bytes = sockaddr_in6(ip, 443);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 28, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // classify_sendmsg — ancillary data (SCM_RIGHTS) defense-in-depth
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sendmsg_ancillary_on_af_unix_allowed() {
         let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::new(8, 8, 8, 8), 53);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for non-allowed IP 8.8.8.8"),
-        }
+        let unix_name = sockaddr_family_only(libc::AF_UNIX as u16);
+        assert!(matches!(
+            classify_sendmsg(
+                42,
+                0xdead_beef, // msg_name_ptr non-NULL
+                unix_name.len(),
+                32, // msg_controllen > 0
+                Some(&unix_name),
+                &policy,
+            ),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn connect_af_inet_too_short_denied() {
+    fn sendmsg_ancillary_on_af_inet_denied() {
         let policy = NotifierPolicy::default();
-        // AF_INET with only 4 bytes (less than required 8).
-        let family = (libc::AF_INET as u16).to_ne_bytes();
-        let mut addr = vec![0u8; 4];
-        addr[0..2].copy_from_slice(&family);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for truncated AF_INET sockaddr"),
-        }
+        let inet_name = sockaddr_in([1, 2, 3, 4], 80);
+        assert!(matches!(
+            classify_sendmsg(
+                42,
+                0xdead_beef,
+                inet_name.len(),
+                32,
+                Some(&inet_name),
+                &policy,
+            ),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn connect_af_inet6_too_short_denied() {
+    fn sendmsg_ancillary_on_af_inet6_denied() {
         let policy = NotifierPolicy::default();
-        // AF_INET6 with only 16 bytes (less than required 24).
-        let family = (libc::AF_INET6 as u16).to_ne_bytes();
-        let mut addr = vec![0u8; 16];
-        addr[0..2].copy_from_slice(&family);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for truncated AF_INET6 sockaddr"),
+        let inet6_name = sockaddr_in6([0u8; 16], 80);
+        assert!(matches!(
+            classify_sendmsg(
+                42,
+                0xdead_beef,
+                inet6_name.len(),
+                32,
+                Some(&inet6_name),
+                &policy,
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendmsg_ancillary_with_null_msg_name_allowed() {
+        // Connected socket: msg_name_ptr == 0, ancillary data permitted
+        // because the destination was already vetted at connect() time
+        // (most likely an AF_UNIX socket between internal processes).
+        let policy = NotifierPolicy::default();
+        assert!(matches!(
+            classify_sendmsg(42, 0, 0, 32, None, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendmsg_ancillary_with_unreadable_msg_name_denied() {
+        // Caller said msg_name_ptr != 0 + msg_namelen >= 2 but failed to
+        // read the bytes. We must defensively deny rather than risk
+        // letting an SCM_RIGHTS payload through.
+        let policy = NotifierPolicy::default();
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 16, 32, None, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendmsg_ancillary_with_truncated_msg_name_denied() {
+        // Caller managed to read only 1 byte; we can't determine family.
+        let policy = NotifierPolicy::default();
+        let truncated = vec![0x01];
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 16, 32, Some(&truncated), &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // classify_sendmsg — non-ancillary path
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sendmsg_no_ancillary_unrestricted_allows() {
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = false;
+        let bytes = sockaddr_in([1, 1, 1, 1], 80);
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendmsg_no_ancillary_null_msg_name_allowed() {
+        let policy = policy_restricting_to(&[]);
+        assert!(matches!(
+            classify_sendmsg(42, 0, 0, 0, None, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendmsg_no_ancillary_inet_to_allowed_ip_passes() {
+        let policy = policy_restricting_to(&["1.2.3.4"]);
+        let bytes = sockaddr_in([1, 2, 3, 4], 443);
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn sendmsg_no_ancillary_inet_to_disallowed_ip_denied() {
+        let policy = policy_restricting_to(&["1.2.3.4"]);
+        let bytes = sockaddr_in([5, 6, 7, 8], 443);
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn sendmsg_no_ancillary_oversized_namelen_denied() {
+        let policy = policy_restricting_to(&[]);
+        let bytes = sockaddr_in([1, 2, 3, 4], 80);
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 1024, 0, Some(&bytes), &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // is_exec_path_allowed — exec policy checks
+    // -----------------------------------------------------------------
+
+    fn exec_policy(paths: &[&str], prefixes: &[&str]) -> NotifierPolicy {
+        let mut p = NotifierPolicy::default();
+        for s in paths {
+            p.allowed_exec_paths.insert(PathBuf::from(s));
         }
-    }
-
-    #[test]
-    fn policy_from_config_splits_prefix_rules() {
-        let mut config = can_policy::SandboxConfig::default_deny();
-        config.process.allow_execve = vec![
-            PathBuf::from("/usr/bin/python3"),
-            PathBuf::from("/nix/store/*"),
-        ];
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        // Exact path should be in allowed_exec_paths.
-        // "/usr/bin/python3" may or may not canonicalize depending on fs,
-        // but "/nix/store/*" should produce a prefix, not an exact path.
-        assert_eq!(policy.allowed_exec_prefixes.len(), 1);
-        // The prefix should be "/nix/store" (without the /*).
-        assert_eq!(policy.allowed_exec_prefixes[0], PathBuf::from("/nix/store"));
-        // Exact paths count: at least 1 ("/usr/bin/python3" or its canonical).
-        assert!(!policy.allowed_exec_paths.is_empty());
-    }
-
-    // ---- DNS query name extraction tests ----
-
-    /// Build a minimal DNS query packet for testing.
-    fn build_test_query(domain: &str) -> Vec<u8> {
-        let mut packet = Vec::new();
-        // Header: ID=0x1234, QR=0, OPCODE=0, RD=1
-        packet.extend_from_slice(&[
-            0x12, 0x34, // ID
-            0x01, 0x00, // Flags: RD=1
-            0x00, 0x01, // QDCOUNT=1
-            0x00, 0x00, // ANCOUNT=0
-            0x00, 0x00, // NSCOUNT=0
-            0x00, 0x00, // ARCOUNT=0
-        ]);
-        // Question: encode domain name as labels.
-        for label in domain.split('.') {
-            packet.push(label.len() as u8);
-            packet.extend_from_slice(label.as_bytes());
+        for s in prefixes {
+            p.allowed_exec_prefixes.push(PathBuf::from(s));
         }
-        packet.push(0); // Root label
-        // QTYPE=A (1), QCLASS=IN (1)
-        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-        packet
+        p
     }
 
     #[test]
-    fn dns_extract_simple_domain() {
-        let query = build_test_query("example.com");
-        assert_eq!(
-            extract_dns_query_name(&query),
-            Some("example.com".to_string())
-        );
+    fn exec_exact_match_allowed() {
+        let p = exec_policy(&["/usr/bin/python3.12"], &[]);
+        assert!(is_exec_path_allowed(Path::new("/usr/bin/python3.12"), &p));
     }
 
     #[test]
-    fn dns_extract_subdomain() {
-        let query = build_test_query("www.example.com");
-        assert_eq!(
-            extract_dns_query_name(&query),
-            Some("www.example.com".to_string())
-        );
+    fn exec_exact_no_match_denied() {
+        let p = exec_policy(&["/usr/bin/python3.12"], &[]);
+        assert!(!is_exec_path_allowed(Path::new("/usr/bin/python3.11"), &p));
+        assert!(!is_exec_path_allowed(Path::new("/bin/python3.12"), &p));
     }
 
     #[test]
-    fn dns_extract_single_label() {
-        let query = build_test_query("localhost");
-        assert_eq!(
-            extract_dns_query_name(&query),
-            Some("localhost".to_string())
-        );
+    fn exec_empty_policy_denies_everything() {
+        let p = exec_policy(&[], &[]);
+        assert!(!is_exec_path_allowed(Path::new("/usr/bin/sh"), &p));
+        assert!(!is_exec_path_allowed(Path::new("/bin/echo"), &p));
     }
 
     #[test]
-    fn dns_extract_deep_subdomain() {
-        let query = build_test_query("a.b.c.d.example.com");
-        assert_eq!(
-            extract_dns_query_name(&query),
-            Some("a.b.c.d.example.com".to_string())
-        );
+    fn exec_prefix_match_with_boundary_allowed() {
+        let p = exec_policy(&[], &["/nix/store"]);
+        assert!(is_exec_path_allowed(
+            Path::new("/nix/store/abc-foo/bin/mix"),
+            &p,
+        ));
+        assert!(is_exec_path_allowed(Path::new("/nix/store/x/y"), &p));
     }
 
     #[test]
-    fn dns_extract_case_insensitive() {
-        let query = build_test_query("Example.COM");
-        assert_eq!(
-            extract_dns_query_name(&query),
-            Some("example.com".to_string())
-        );
+    fn exec_prefix_match_requires_boundary_not_partial() {
+        // Critical: prefix "/nix/store" must NOT match "/nix/storage" —
+        // the next char after the prefix MUST be '/'. Anything else
+        // (including end-of-string) is a partial directory name match
+        // and a known sandbox-escape pattern.
+        let p = exec_policy(&[], &["/nix/store"]);
+        assert!(!is_exec_path_allowed(Path::new("/nix/storage/x"), &p));
+        assert!(!is_exec_path_allowed(Path::new("/nix/storex"), &p));
+        // Exactly the prefix itself with no trailing slash is also NOT
+        // a match — would need to be an exec path which by definition
+        // has a binary name component after the directory.
+        assert!(!is_exec_path_allowed(Path::new("/nix/store"), &p));
     }
 
     #[test]
-    fn dns_extract_short_packet_returns_none() {
-        let packet = [0u8; 4];
-        assert_eq!(extract_dns_query_name(&packet), None);
+    fn exec_prefix_does_not_subsume_unrelated_paths() {
+        let p = exec_policy(&[], &["/nix/store"]);
+        assert!(!is_exec_path_allowed(Path::new("/usr/bin/sh"), &p));
+        assert!(!is_exec_path_allowed(Path::new("/home/user/bin"), &p));
     }
 
     #[test]
-    fn dns_extract_zero_qdcount_returns_none() {
-        let mut query = build_test_query("example.com");
-        query[4] = 0;
-        query[5] = 0; // QDCOUNT=0
-        assert_eq!(extract_dns_query_name(&query), None);
+    fn exec_exact_path_and_prefix_can_coexist() {
+        let p = exec_policy(&["/usr/bin/python3.12"], &["/home/user/.local/bin"]);
+        assert!(is_exec_path_allowed(Path::new("/usr/bin/python3.12"), &p,));
+        assert!(is_exec_path_allowed(
+            Path::new("/home/user/.local/bin/myscript"),
+            &p,
+        ));
+        assert!(!is_exec_path_allowed(Path::new("/etc/shadow"), &p));
     }
 
     #[test]
-    fn dns_extract_truncated_label_returns_none() {
-        // Build a packet that claims a label of length 10 but only has 3 bytes.
-        let mut packet = vec![0u8; DNS_HEADER_SIZE + 2];
-        packet[4] = 0x00;
-        packet[5] = 0x01; // QDCOUNT=1
-        packet[DNS_HEADER_SIZE] = 10; // label_len = 10, but only 1 byte follows
-        packet[DNS_HEADER_SIZE + 1] = b'a';
-        assert_eq!(extract_dns_query_name(&packet), None);
+    fn exec_multiple_prefixes_short_circuit_correctly() {
+        let p = exec_policy(&[], &["/a", "/b", "/c/d"]);
+        assert!(is_exec_path_allowed(Path::new("/a/x"), &p));
+        assert!(is_exec_path_allowed(Path::new("/b/y"), &p));
+        assert!(is_exec_path_allowed(Path::new("/c/d/z"), &p));
+        // /c alone doesn't match — only /c/d
+        assert!(!is_exec_path_allowed(Path::new("/c/x"), &p));
+    }
+
+    // -----------------------------------------------------------------
+    // evaluate_clone — namespace flag rejection
+    // -----------------------------------------------------------------
+
+    fn clone_args(flags: u64) -> [u64; 6] {
+        [flags, 0, 0, 0, 0, 0]
     }
 
     #[test]
-    fn dns_extract_pointer_compression_returns_none() {
-        // Pointer compression byte (0xC0+) should cause None in query names.
-        let mut packet = vec![0u8; DNS_HEADER_SIZE + 2];
-        packet[4] = 0x00;
-        packet[5] = 0x01; // QDCOUNT=1
-        packet[DNS_HEADER_SIZE] = 0xC0; // pointer
-        packet[DNS_HEADER_SIZE + 1] = 0x00;
-        assert_eq!(extract_dns_query_name(&packet), None);
+    fn clone_no_flags_allowed() {
+        // bare fork (clone with flags = 0) is the everyday case
+        assert!(matches!(evaluate_clone(&clone_args(0), 42), Verdict::Allow));
     }
 
     #[test]
-    fn dns_extract_header_only_no_question_returns_none() {
-        // Header with QDCOUNT=1 but no actual question data.
-        let mut packet = vec![0u8; DNS_HEADER_SIZE];
-        packet[4] = 0x00;
-        packet[5] = 0x01;
-        assert_eq!(extract_dns_query_name(&packet), None);
-    }
-
-    // ---- Domain matching tests ----
-
-    #[test]
-    fn domain_allowed_exact_match() {
-        let allowed = vec!["example.com".to_string()];
-        assert!(is_domain_allowed_by_policy("example.com", &allowed));
+    fn clone_thread_flags_allowed() {
+        // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
+        // → standard pthread_create flags, no NS bits
+        let flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x0001_0000;
+        assert!(matches!(
+            evaluate_clone(&clone_args(flags), 42),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn domain_allowed_subdomain_match() {
-        let allowed = vec!["example.com".to_string()];
-        assert!(is_domain_allowed_by_policy("www.example.com", &allowed));
+    fn clone_newuser_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWUSER), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_allowed_deep_subdomain_match() {
-        let allowed = vec!["example.com".to_string()];
-        assert!(is_domain_allowed_by_policy("a.b.c.example.com", &allowed));
+    fn clone_newns_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWNS), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_denied_different_domain() {
-        let allowed = vec!["example.com".to_string()];
-        assert!(!is_domain_allowed_by_policy("evil.com", &allowed));
+    fn clone_newpid_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWPID), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_denied_partial_suffix() {
-        // "notexample.com" should NOT match "example.com".
-        let allowed = vec!["example.com".to_string()];
-        assert!(!is_domain_allowed_by_policy("notexample.com", &allowed));
+    fn clone_newnet_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWNET), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_allowed_trailing_dot_normalized() {
-        let allowed = vec!["example.com.".to_string()];
-        assert!(is_domain_allowed_by_policy("example.com", &allowed));
-        assert!(is_domain_allowed_by_policy("example.com.", &allowed));
+    fn clone_newipc_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWIPC), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_allowed_multiple_domains() {
-        let allowed = vec!["example.com".to_string(), "github.com".to_string()];
-        assert!(is_domain_allowed_by_policy("api.github.com", &allowed));
-        assert!(is_domain_allowed_by_policy("example.com", &allowed));
-        assert!(!is_domain_allowed_by_policy("evil.com", &allowed));
+    fn clone_newuts_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWUTS), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn domain_denied_empty_allowlist() {
-        let allowed: Vec<String> = vec![];
-        assert!(!is_domain_allowed_by_policy("example.com", &allowed));
-    }
-
-    // ---- DynamicAllowlist tests ----
-
-    #[test]
-    fn dynamic_allowlist_new_is_empty() {
-        let al = DynamicAllowlist::new();
-        assert!(!al.contains(&"1.2.3.4".parse().unwrap()));
+    fn clone_newcgroup_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWCGROUP), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn dynamic_allowlist_add_and_contains() {
-        let al = DynamicAllowlist::new();
-        let ip: IpAddr = "93.184.216.34".parse().unwrap();
-        al.add_ips(vec![ip]);
-        assert!(al.contains(&ip));
+    fn clone_newtime_denied() {
+        assert!(matches!(
+            evaluate_clone(&clone_args(CLONE_NEWTIME), 42),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn dynamic_allowlist_add_multiple() {
-        let al = DynamicAllowlist::new();
-        let ips: Vec<IpAddr> = vec![
-            "1.2.3.4".parse().unwrap(),
-            "5.6.7.8".parse().unwrap(),
-            "::1".parse().unwrap(),
-        ];
-        al.add_ips(ips.clone());
-        for ip in &ips {
-            assert!(al.contains(ip));
-        }
-    }
-
-    #[test]
-    fn dynamic_allowlist_not_contains_unlisted() {
-        let al = DynamicAllowlist::new();
-        al.add_ips(vec!["1.2.3.4".parse().unwrap()]);
-        assert!(!al.contains(&"5.6.7.8".parse().unwrap()));
-    }
-
-    #[test]
-    fn dynamic_allowlist_clone_shares_state() {
-        let al = DynamicAllowlist::new();
-        let al2 = al.clone();
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        al.add_ips(vec![ip]);
-        // Clone should see the same data (Arc-shared).
-        assert!(al2.contains(&ip));
-    }
-
-    #[test]
-    fn dynamic_allowlist_thread_safety() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let al = Arc::new(DynamicAllowlist::new());
-        let mut handles = vec![];
-
-        // Spawn 10 threads, each adding a unique IP.
-        for i in 0..10u8 {
-            let al = Arc::clone(&al);
-            handles.push(thread::spawn(move || {
-                let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
-                al.add_ips(vec![ip]);
-            }));
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        // All IPs should be present.
-        for i in 0..10u8 {
-            let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
-            assert!(al.contains(&ip), "expected 10.0.0.{i} in allowlist");
-        }
-    }
-
-    // ---- resolve_and_add synchronous behavior test ----
-
-    #[test]
-    fn skip_dns_name_regular_labels() {
-        // "example.com" encoded: \x07example\x03com\x00
-        let buf = b"\x07example\x03com\x00";
-        assert_eq!(skip_dns_name(buf, 0), Some(13));
-    }
-
-    #[test]
-    fn skip_dns_name_pointer() {
-        // Pointer at offset 0: 0xC0 0x0C → points to offset 12.
-        let buf = [0xC0, 0x0C];
-        assert_eq!(skip_dns_name(&buf, 0), Some(2));
-    }
-
-    #[test]
-    fn skip_dns_name_label_then_pointer() {
-        // "www" label + pointer: \x03www\xC0\x0C
-        let buf = b"\x03www\xC0\x0C";
-        assert_eq!(skip_dns_name(buf, 0), Some(6));
-    }
-
-    #[test]
-    fn skip_dns_name_empty_returns_none_past_end() {
-        let buf: &[u8] = &[];
-        assert_eq!(skip_dns_name(buf, 0), None);
-    }
-
-    #[test]
-    fn dns_query_direct_to_real_resolver() {
-        // This test sends a real DNS query to the system resolver.
-        // Skip if we can't determine the system nameserver.
-        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
-            Ok(c) => c,
-            Err(_) => return, // Can't read resolv.conf, skip test.
-        };
-        let nameserver = resolv.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with("nameserver") {
-                line.split_whitespace().nth(1).map(String::from)
-            } else {
-                None
-            }
-        });
-        let Some(ns) = nameserver else { return };
-        let dns_server = format!("{ns}:53");
-
-        // Query A record for a well-known domain.
-        let result = dns_query_direct("example.com", 1, &dns_server);
-        // example.com should have at least one A record.
-        if let Some(ips) = result {
+    fn clone_combined_ns_flags_denied() {
+        // Each combination of namespace flags must fail, not just the
+        // single-flag cases. Otherwise a `CLONE_NEWUSER | CLONE_NEWNS`
+        // call could slip through a per-flag exception.
+        for combo in [
+            CLONE_NEWUSER | CLONE_NEWNS,
+            CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET,
+            CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS,
+        ] {
             assert!(
-                !ips.is_empty(),
-                "example.com should resolve to at least one IPv4 address"
+                matches!(evaluate_clone(&clone_args(combo), 42), Verdict::Deny(_)),
+                "expected combo {combo:#x} to be denied",
             );
-            for ip in &ips {
-                assert!(ip.is_ipv4(), "A query should return IPv4 addresses");
-            }
         }
-        // Note: don't fail if DNS is unreachable in the test environment.
     }
 
-    // ---- classify_outbound_ip tests ----
+    #[test]
+    fn clone_ns_flag_mixed_with_thread_flags_denied() {
+        // Adversarial recipe: mix CLONE_VM | CLONE_THREAD (legitimate
+        // thread flags) with CLONE_NEWUSER. Whole call must deny.
+        let flags = 0x100 | 0x0001_0000 | CLONE_NEWUSER;
+        assert!(matches!(
+            evaluate_clone(&clone_args(flags), 42),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // evaluate_socket — domain/type/protocol filtering
+    // -----------------------------------------------------------------
+
+    fn sock_args(domain: u64, sock_type: u64, protocol: u64) -> [u64; 6] {
+        [domain, sock_type, protocol, 0, 0, 0]
+    }
 
     #[test]
-    fn outbound_ip_loopback_allowed() {
+    fn socket_af_inet_tcp_allowed() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(1, "127.0.0.1".parse().unwrap(), 80, &policy, &al, "test") {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for loopback, got Deny({e})"),
-        }
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_INET, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn outbound_ip_unspecified_allowed() {
+    fn socket_af_inet_udp_allowed() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(1, "0.0.0.0".parse().unwrap(), 0, &policy, &al, "test") {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for unspecified, got Deny({e})"),
-        }
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_INET, libc::SOCK_DGRAM as u64, 0), 42, &policy),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn outbound_ip_multicast_denied() {
+    fn socket_af_inet6_tcp_allowed() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(1, "224.0.0.1".parse().unwrap(), 5353, &policy, &al, "test") {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for multicast"),
-        }
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_INET6, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn outbound_ip_broadcast_denied() {
+    fn socket_af_inet_sock_raw_denied() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(
-            1,
-            "255.255.255.255".parse().unwrap(),
-            1234,
-            &policy,
-            &al,
-            "test",
-        ) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for broadcast"),
-        }
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_INET, SOCK_RAW, libc::IPPROTO_ICMP as u64),
+                42,
+                &policy
+            ),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn outbound_ip_pasta_dns_allowed() {
+    fn socket_af_inet6_sock_raw_denied() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        let dns_ip: IpAddr = can_net::pasta::PASTA_DNS_ADDR.parse().unwrap();
-        match classify_outbound_ip(1, dns_ip, 53, &policy, &al, "test") {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for pasta DNS, got Deny({e})"),
-        }
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_INET6, SOCK_RAW, 0), 42, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn outbound_ip_link_local_denied() {
+    fn socket_af_packet_denied() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(
-            1,
-            "169.254.169.254".parse().unwrap(),
-            80,
-            &policy,
-            &al,
-            "test",
-        ) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for link-local"),
-        }
+        const AF_PACKET: u64 = 17;
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_PACKET, SOCK_RAW, 0), 42, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn outbound_ip_static_policy_allows() {
+    fn socket_af_netlink_route_allowed() {
+        let policy = NotifierPolicy::default();
+        const NETLINK_ROUTE: u64 = 0;
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE), 42, &policy),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn socket_af_netlink_audit_denied() {
+        let policy = NotifierPolicy::default();
+        const NETLINK_AUDIT: u64 = 9;
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT), 42, &policy),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn socket_af_netlink_kobject_uevent_denied() {
+        let policy = NotifierPolicy::default();
+        const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT),
+                42,
+                &policy
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn socket_af_unix_allowed_when_policy_allows() {
         let mut policy = NotifierPolicy::default();
-        policy.allowed_ips.insert("93.184.216.34".parse().unwrap());
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(
-            1,
-            "93.184.216.34".parse().unwrap(),
-            443,
-            &policy,
-            &al,
-            "test",
-        ) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for policy IP, got Deny({e})"),
-        }
+        policy.allow_af_unix = true;
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_UNIX, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Allow
+        ));
     }
 
     #[test]
-    fn outbound_ip_dynamic_allowlist_allows() {
+    fn socket_af_unix_denied_when_policy_disallows() {
+        let mut policy = NotifierPolicy::default();
+        policy.allow_af_unix = false;
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_UNIX, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn socket_af_inet_denied_when_policy_disallows() {
+        let mut policy = NotifierPolicy::default();
+        policy.allow_af_inet = false;
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_INET, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn socket_unknown_domain_denied() {
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        al.add_ips(vec!["93.184.216.34".parse().unwrap()]);
-        match classify_outbound_ip(
-            1,
-            "93.184.216.34".parse().unwrap(),
-            443,
-            &policy,
-            &al,
-            "test",
-        ) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for dynamic-allowed IP, got Deny({e})"),
-        }
+        // AF_BLUETOOTH (31) and friends — not on any allow list
+        const AF_BLUETOOTH: u64 = 31;
+        assert!(matches!(
+            evaluate_socket(
+                &sock_args(AF_BLUETOOTH, libc::SOCK_STREAM as u64, 0),
+                42,
+                &policy
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Dynamic-allowlist refresh — closes-the-loop integration
+    // -----------------------------------------------------------------
+
+    /// First call to classify_connect_addr is denied. The
+    /// maybe_refresh_dynamic_allowlist_on_deny side effect populates
+    /// dynamic_ips from cache. The retry then allows.
+    ///
+    /// This is the core "domain → dynamic IP → connect allowed" path
+    /// — broken in this flow, the supervisor never honours a recipe's
+    /// allow_domains for direct connects.
+    #[test]
+    fn dynamic_allowlist_refresh_closes_the_loop() {
+        use can_net::dns_cache::DnsCache;
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        // Recipe-equivalent state: a supervisor restricting outbound,
+        // with one allowed domain and no static IP entries. The cache
+        // is pre-seeded as if a prior DNS query had resolved
+        // "example.test" → 203.0.113.42.
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.allowed_domains = vec!["example.test".to_string()];
+        let cache = DnsCache::new(Duration::from_secs(60));
+        let mut seeded = HashSet::new();
+        seeded.insert("203.0.113.42".parse().unwrap());
+        cache.insert_for_testing("example.test", seeded, Duration::from_secs(60));
+        policy.dns_cache = Some(cache);
+
+        let addr = sockaddr_in([203, 0, 113, 42], 443);
+
+        // Step 1: dynamic_ips is empty → first verdict must be Deny.
+        let v1 = classify_connect_addr(42, &addr, 16, &policy);
+        assert!(
+            matches!(v1, Verdict::Deny(_)),
+            "expected initial deny when dynamic_ips empty, got {v1:?}",
+        );
+
+        // Step 2: refresh fires on the deny. dynamic_ips now contains
+        // the cached IP.
+        maybe_refresh_dynamic_allowlist_on_deny(&policy, &v1);
+        let dynamic_now: HashSet<IpAddr> = policy.dynamic_ips.read().unwrap().clone();
+        assert!(
+            dynamic_now.contains(&"203.0.113.42".parse().unwrap()),
+            "dynamic_ips not populated after refresh: {dynamic_now:?}",
+        );
+
+        // Step 3: re-classify the same address. Now allowed.
+        let v2 = classify_connect_addr(42, &addr, 16, &policy);
+        assert!(
+            matches!(v2, Verdict::Allow),
+            "expected allow after refresh, got {v2:?}",
+        );
     }
 
     #[test]
-    fn outbound_ip_denied_when_not_in_either_list() {
+    fn dynamic_allowlist_refresh_skips_when_verdict_is_allow() {
+        // Sanity: refresh must be a no-op on Allow. Otherwise we'd be
+        // hitting DNS on every successful connect.
+        use can_net::dns_cache::DnsCache;
+        use std::time::Duration;
+
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.allowed_domains = vec!["something.test".to_string()];
+        policy.dns_cache = Some(DnsCache::new(Duration::from_secs(60)));
+
+        maybe_refresh_dynamic_allowlist_on_deny(&policy, &Verdict::Allow);
+        assert!(
+            policy.dynamic_ips.read().unwrap().is_empty(),
+            "dynamic_ips should not be touched on Allow",
+        );
+    }
+
+    #[test]
+    fn dynamic_allowlist_refresh_noop_without_cache() {
+        // Edge case: policy with allowed_domains but no dns_cache
+        // (recipe layer hasn't populated one). Refresh must not panic.
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.allowed_domains = vec!["x.test".to_string()];
+        policy.dns_cache = None;
+
+        let denied = Verdict::Deny(libc::EACCES as u32);
+        maybe_refresh_dynamic_allowlist_on_deny(&policy, &denied);
+        assert!(policy.dynamic_ips.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dynamic_allowlist_replaced_atomically_on_each_refresh() {
+        // Each refresh REPLACES dynamic_ips with the current union of
+        // all allowed domains' cache entries — not appends. This pins
+        // the semantics: a domain that fell out of the cache (TTL
+        // expired) stops being in dynamic_ips.
+        use can_net::dns_cache::DnsCache;
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        let mut policy = NotifierPolicy::default();
+        policy.restrict_outbound = true;
+        policy.allowed_domains = vec!["a.test".to_string(), "b.test".to_string()];
+        let cache = DnsCache::new(Duration::from_secs(60));
+        let mut a_ips = HashSet::new();
+        a_ips.insert("1.1.1.1".parse().unwrap());
+        let mut b_ips = HashSet::new();
+        b_ips.insert("2.2.2.2".parse().unwrap());
+        cache.insert_for_testing("a.test", a_ips, Duration::from_secs(60));
+        cache.insert_for_testing("b.test", b_ips, Duration::from_secs(60));
+        policy.dns_cache = Some(cache);
+
+        // Pre-populate dynamic_ips with a stale entry. Refresh must
+        // overwrite it.
+        policy
+            .dynamic_ips
+            .write()
+            .unwrap()
+            .insert("9.9.9.9".parse().unwrap());
+
+        maybe_refresh_dynamic_allowlist_on_deny(&policy, &Verdict::Deny(libc::EACCES as u32));
+
+        let after: HashSet<IpAddr> = policy.dynamic_ips.read().unwrap().clone();
+        assert!(after.contains(&"1.1.1.1".parse().unwrap()));
+        assert!(after.contains(&"2.2.2.2".parse().unwrap()));
+        assert!(
+            !after.contains(&"9.9.9.9".parse().unwrap()),
+            "stale entry should have been replaced, not unioned",
+        );
+        assert_eq!(after.len(), 2);
+    }
+
+    #[test]
+    fn socket_sock_type_with_flags_masked_correctly() {
+        // The kernel encodes SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC
+        // (0x80000) into the sock_type argument. SOCK_TYPE_MASK = 0x0F.
+        // SOCK_STREAM=1 → 1 | SOCK_CLOEXEC stays SOCK_STREAM after mask.
+        // The SOCK_RAW check must still fire even with these flags set.
         let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        match classify_outbound_ip(1, "8.8.8.8".parse().unwrap(), 53, &policy, &al, "test") {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for non-allowed IP"),
-        }
-    }
 
-    // ---- classify_sendto_addr tests ----
-    //
-    // These require a SeccompNotif which we can't easily construct without
-    // real seccomp. Instead, we test the underlying classify_outbound_ip
-    // and the DNS functions separately.
+        // SOCK_STREAM | SOCK_CLOEXEC → still allowed
+        let stream_with_cloexec = (libc::SOCK_STREAM as u64) | 0x0008_0000;
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_INET, stream_with_cloexec, 0), 42, &policy),
+            Verdict::Allow
+        ));
 
-    // ---- policy_from_config with allowed_domains ----
-
-    #[test]
-    fn policy_from_config_includes_allowed_domains() {
-        let mut config = can_policy::SandboxConfig::default_deny();
-        config.network.allow_domains = vec!["example.com".to_string(), "github.com".to_string()];
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert_eq!(policy.allowed_domains.len(), 2);
-        assert!(policy.allowed_domains.contains(&"example.com".to_string()));
-        assert!(policy.allowed_domains.contains(&"github.com".to_string()));
+        // SOCK_RAW | SOCK_CLOEXEC → still denied for AF_INET
+        let raw_with_cloexec = SOCK_RAW | 0x0008_0000;
+        assert!(matches!(
+            evaluate_socket(&sock_args(AF_INET, raw_with_cloexec, 0), 42, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn policy_from_config_empty_domains() {
-        let config = can_policy::SandboxConfig::default_deny();
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert!(policy.allowed_domains.is_empty());
-    }
-
-    // ---- connect uses dynamic allowlist ----
-
-    #[test]
-    fn connect_dynamic_allowlist_allows_ip() {
-        let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        al.add_ips(vec!["93.184.216.34".parse().unwrap()]);
-        let addr = make_sockaddr_in(Ipv4Addr::new(93, 184, 216, 34), 443);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &al) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow via dynamic allowlist, got Deny({e})"),
-        }
+    fn exec_root_prefix_allows_everything_under_root() {
+        // Edge case: a prefix of "/" matches everything because every
+        // absolute path starts with "/" and has a '/' as the next char.
+        // This is intentional — a recipe authoring "/*" essentially
+        // disables exec filtering. Documented behaviour; pin it here.
+        let p = exec_policy(&[], &[""]);
+        assert!(is_exec_path_allowed(Path::new("/anything"), &p));
+        assert!(is_exec_path_allowed(Path::new("/etc/shadow"), &p));
     }
 
     #[test]
-    fn connect_dynamic_allowlist_does_not_allow_unlisted() {
-        let policy = NotifierPolicy::default();
-        let al = DynamicAllowlist::new();
-        al.add_ips(vec!["93.184.216.34".parse().unwrap()]);
-        let addr = make_sockaddr_in(Ipv4Addr::new(8, 8, 8, 8), 53);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &al) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny for IP not in dynamic allowlist"),
-        }
-    }
-
-    // ---- restrict_outbound tests ----
-
-    #[test]
-    fn policy_from_config_restrict_outbound_with_domains() {
-        let mut config = can_policy::SandboxConfig::default_deny();
-        config.network.allow_domains = vec!["example.com".to_string()];
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert!(
-            policy.restrict_outbound,
-            "restrict_outbound should be true when domains are configured"
-        );
+    fn sendmsg_no_ancillary_zero_namelen_denied() {
+        let policy = policy_restricting_to(&[]);
+        // msg_name_ptr != 0 but namelen == 0; caller passed None.
+        // restrict_outbound branch checks (2..=128).contains(0) == false
+        // and denies.
+        assert!(matches!(
+            classify_sendmsg(42, 0xdead_beef, 0, 0, None, &policy),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]
-    fn policy_from_config_restrict_outbound_with_ips() {
-        let mut config = can_policy::SandboxConfig::default_deny();
-        config.network.allow_ips = vec!["1.2.3.4".to_string()];
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert!(
-            policy.restrict_outbound,
-            "restrict_outbound should be true when IPs are configured"
-        );
-    }
-
-    #[test]
-    fn policy_from_config_no_restrict_outbound_ports_only() {
-        let config = can_policy::SandboxConfig::default_deny();
-        // No domains, no IPs — port-forwarding-only config.
-        let policy = policy_from_config(&config, &[], can_net::pasta::PASTA_DNS_ADDR);
-        assert!(
-            !policy.restrict_outbound,
-            "restrict_outbound should be false when no domains or IPs are configured"
-        );
-    }
-
-    #[test]
-    fn connect_unrestricted_allows_any_ipv4() {
-        let policy = NotifierPolicy {
-            restrict_outbound: false,
-            ..Default::default()
-        };
-        // Arbitrary public IP that is not in any allowlist.
-        let addr = make_sockaddr_in(Ipv4Addr::new(198, 51, 100, 1), 443);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow with restrict_outbound=false, got Deny({e})")
-            }
-        }
-    }
-
-    #[test]
-    fn connect_unrestricted_allows_any_ipv6() {
-        let policy = NotifierPolicy {
-            restrict_outbound: false,
-            ..Default::default()
-        };
-        let addr = make_sockaddr_in6("2001:db8::1".parse().unwrap(), 80);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow with restrict_outbound=false, got Deny({e})")
-            }
-        }
-    }
-
-    #[test]
-    fn connect_unrestricted_still_allows_af_unix() {
-        let policy = NotifierPolicy {
-            restrict_outbound: false,
-            ..Default::default()
-        };
-        let addr = make_sockaddr_family(libc::AF_UNIX);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => panic!("expected Allow for AF_UNIX, got Deny({e})"),
-        }
-    }
-
-    #[test]
-    fn connect_restricted_denies_unlisted_ip() {
-        // restrict_outbound defaults to true, but be explicit for clarity.
-        let policy = NotifierPolicy::default();
-        let addr = make_sockaddr_in(Ipv4Addr::new(198, 51, 100, 1), 443);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Deny(_) => {}
-            Verdict::Allow => panic!("expected Deny with restrict_outbound=true and no allowlist"),
-        }
-    }
-
-    #[test]
-    fn connect_unrestricted_allows_multicast() {
-        // When outbound is unrestricted, even multicast should be allowed
-        // (the user chose not to restrict network at all).
-        let policy = NotifierPolicy {
-            restrict_outbound: false,
-            ..Default::default()
-        };
-        let addr = make_sockaddr_in(Ipv4Addr::new(224, 0, 0, 1), 5353);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow with restrict_outbound=false, got Deny({e})")
-            }
-        }
-    }
-
-    #[test]
-    fn connect_unrestricted_allows_link_local() {
-        let policy = NotifierPolicy {
-            restrict_outbound: false,
-            ..Default::default()
-        };
-        let addr = make_sockaddr_in(Ipv4Addr::new(169, 254, 169, 254), 80);
-        match classify_connect_addr(1, &addr, addr.len(), &policy, &DynamicAllowlist::new()) {
-            Verdict::Allow => {}
-            Verdict::Deny(e) => {
-                panic!("expected Allow with restrict_outbound=false, got Deny({e})")
-            }
-        }
-    }
-
-    // ---- try_resolve_allowed_domains tests ----
-
-    #[test]
-    fn try_resolve_returns_false_when_no_domains() {
-        let policy = NotifierPolicy::default(); // no allowed_domains
-        let al = DynamicAllowlist::new();
-        assert!(
-            !try_resolve_allowed_domains("8.8.8.8".parse().unwrap(), &policy, &al),
-            "should return false when allowed_domains is empty"
-        );
-    }
-
-    #[test]
-    fn try_resolve_finds_ip_for_allowed_domain() {
-        // This test uses real DNS — skip if we can't determine a nameserver.
-        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let nameserver = resolv.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with("nameserver") {
-                line.split_whitespace().nth(1).map(String::from)
-            } else {
-                None
-            }
-        });
-        let Some(ns) = nameserver else { return };
-
-        // Resolve example.com to get a real IP.
-        let dns_server = format!("{ns}:53");
-        let Some(ips) = dns_query_direct("example.com", 1, &dns_server) else {
-            return; // DNS unreachable in test env
-        };
-        let Some(target_ip) = ips.first() else {
-            return;
-        };
-
-        let policy = NotifierPolicy {
-            allowed_domains: vec!["example.com".to_string()],
-            dns_server_addr: ns.clone(),
-            ..Default::default()
-        };
-        let al = DynamicAllowlist::new();
-
-        let found = try_resolve_allowed_domains(*target_ip, &policy, &al);
-        assert!(
-            found,
-            "should find IP {target_ip} via re-resolution of example.com"
-        );
-        assert!(
-            al.contains(target_ip),
-            "IP should be added to dynamic allowlist"
-        );
-    }
-
-    #[test]
-    fn try_resolve_returns_false_for_non_matching_ip() {
-        // This test uses real DNS — skip if we can't determine a nameserver.
-        let resolv = match std::fs::read_to_string("/etc/resolv.conf") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let nameserver = resolv.lines().find_map(|line| {
-            let line = line.trim();
-            if line.starts_with("nameserver") {
-                line.split_whitespace().nth(1).map(String::from)
-            } else {
-                None
-            }
-        });
-        let Some(ns) = nameserver else { return };
-
-        let policy = NotifierPolicy {
-            allowed_domains: vec!["example.com".to_string()],
-            dns_server_addr: ns,
-            ..Default::default()
-        };
-        let al = DynamicAllowlist::new();
-
-        // 192.0.2.1 is TEST-NET-1, should not resolve to example.com.
-        let found = try_resolve_allowed_domains("192.0.2.1".parse().unwrap(), &policy, &al);
-        assert!(!found, "TEST-NET IP should not match any allowed domain");
-    }
-
-    #[test]
-    fn dns_socket_addr_ipv4() {
-        assert_eq!(dns_socket_addr("10.0.0.1"), "10.0.0.1:53");
-        assert_eq!(dns_socket_addr("169.254.0.1"), "169.254.0.1:53");
-        assert_eq!(dns_socket_addr("8.8.8.8"), "8.8.8.8:53");
-    }
-
-    #[test]
-    fn dns_socket_addr_ipv6() {
-        assert_eq!(dns_socket_addr("2001:db8::1"), "[2001:db8::1]:53");
-        assert_eq!(dns_socket_addr("::1"), "[::1]:53");
-        assert_eq!(dns_socket_addr("fe80::1%eth0"), "[fe80::1%eth0]:53");
-    }
-
-    #[test]
-    fn dns_socket_addr_parses_as_socketaddr() {
-        use std::net::SocketAddr;
-
-        // IPv4 result must parse as a valid SocketAddr.
-        let v4 = dns_socket_addr("10.0.0.1");
-        let parsed: SocketAddr = v4.parse().expect("IPv4 dns_socket_addr should parse");
-        assert_eq!(parsed.port(), 53);
-        assert!(parsed.is_ipv4());
-
-        // IPv6 result must parse as a valid SocketAddr.
-        let v6 = dns_socket_addr("2001:db8::1");
-        let parsed: SocketAddr = v6.parse().expect("IPv6 dns_socket_addr should parse");
-        assert_eq!(parsed.port(), 53);
-        assert!(parsed.is_ipv6());
+    fn sendto_inet6_denied_when_not_in_policy() {
+        let policy = policy_restricting_to(&["2001:db8::1"]);
+        // 2001:db8::2 — different IP
+        let mut ip = [0u8; 16];
+        ip[0] = 0x20;
+        ip[1] = 0x01;
+        ip[2] = 0x0d;
+        ip[3] = 0xb8;
+        ip[15] = 2;
+        let bytes = sockaddr_in6(ip, 443);
+        assert!(matches!(
+            classify_sendto_addr(42, &bytes, 28, &policy),
+            Verdict::Deny(_)
+        ));
     }
 }

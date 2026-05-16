@@ -1,0 +1,36 @@
+[recipe]
+name = "tool:cargo"
+description = "cargo: registry cache + config; credentials.toml denied (use CARGO_REGISTRIES_* env)"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.cargo/config.toml",
+    "$HOME/.cargo/config",
+]
+allow_write = [
+    "$HOME/.cargo/registry",
+    "$HOME/.cargo/git",
+    "$HOME/.cargo/advisory-db",
+]
+deny = [
+    "$HOME/.cargo/credentials.toml",
+    "$HOME/.cargo/credentials",
+]
+
+[network]
+allow_domains = [
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+]
+
+[process]
+env_passthrough = [
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+    "CARGO_NET_GIT_FETCH_WITH_CLI",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+]

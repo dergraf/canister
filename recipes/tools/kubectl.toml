@@ -1,0 +1,23 @@
+[recipe]
+name = "tool:kubectl"
+description = "kubectl: config + cache; token files via KUBECONFIG env only"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.kube/config",
+    "$HOME/.kube/cache",
+]
+deny = [
+    "$HOME/.kube/credentials",
+    "$HOME/.kube/*.key",
+    "$HOME/.kube/*.pem",
+]
+
+[process]
+env_passthrough = [
+    "KUBECONFIG",
+    "KUBERNETES_SERVICE_HOST",
+    "KUBERNETES_SERVICE_PORT",
+    "KUBECTL_EXTERNAL_DIFF",
+]

@@ -121,10 +121,12 @@ require_sudo() {
 }
 
 # Skip the entire test file with a reason.
+# Uses exit code 77 (autoconf's "skip" convention) so the runner can tell
+# the difference between a clean pass and a deliberate skip.
 skip_all() {
     local reason="$1"
     echo -e "${YELLOW}SKIP${RESET} $(basename "$0"): ${reason}"
-    exit 0
+    exit 77
 }
 
 # ---------------------------------------------------------------------------

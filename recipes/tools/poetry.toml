@@ -1,0 +1,35 @@
+[recipe]
+name = "tool:poetry"
+description = "poetry: config + cache; auth.toml denied (use POETRY_HTTP_BASIC_* env)"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/pypoetry/config.toml",
+]
+allow_write = [
+    "$HOME/.cache/pypoetry",
+    "$HOME/.local/share/pypoetry",
+]
+deny = [
+    "$HOME/.config/pypoetry/auth.toml",
+    "$HOME/.pypirc",
+]
+
+[network]
+allow_domains = [
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+
+[process]
+env_passthrough = [
+    "POETRY_HOME",
+    "POETRY_CACHE_DIR",
+    "POETRY_VIRTUALENVS_IN_PROJECT",
+    "POETRY_VIRTUALENVS_CREATE",
+    "POETRY_HTTP_BASIC_PYPI_USERNAME",
+    "POETRY_HTTP_BASIC_PYPI_PASSWORD",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+]

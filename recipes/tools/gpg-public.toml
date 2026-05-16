@@ -1,0 +1,33 @@
+[recipe]
+name = "tool:gpg-public"
+description = "gpg: public keyring + trustdb only; private keys denied"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.gnupg/pubring.kbx",
+    "$HOME/.gnupg/pubring.gpg",
+    "$HOME/.gnupg/trustdb.gpg",
+    "$HOME/.gnupg/gpg.conf",
+    "$HOME/.gnupg/gpg-agent.conf",
+    "$HOME/.gnupg/dirmngr.conf",
+    "$HOME/.gnupg/crls.d",
+]
+deny = [
+    "$HOME/.gnupg/private-keys-v1.d",
+    "$HOME/.gnupg/secring.gpg",
+    "$HOME/.gnupg/random_seed",
+]
+
+[network]
+allow_domains = [
+    "keys.openpgp.org",
+    "keyserver.ubuntu.com",
+]
+
+[process]
+env_passthrough = [
+    "GNUPGHOME",
+    "GPG_AGENT_INFO",
+    "GPG_TTY",
+]

@@ -1,0 +1,23 @@
+[recipe]
+name = "tool:podman-config"
+description = "podman: CLI config + containers dir; registry auth denied"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/containers/containers.conf",
+    "$HOME/.config/containers/registries.conf",
+    "$HOME/.config/containers/policy.json",
+    "$HOME/.config/containers/storage.conf",
+]
+deny = [
+    "$HOME/.config/containers/auth.json",
+]
+
+[process]
+env_passthrough = [
+    "CONTAINERS_CONF",
+    "CONTAINERS_REGISTRIES_CONF",
+    "CONTAINER_HOST",
+    "REGISTRY_AUTH_FILE",
+]

@@ -13,17 +13,26 @@ SKIPPED=0
 FAILURES=()
 
 for test_file in "${TESTS_DIR}"/t_*.sh; do
-    if bash "$test_file"; then
-        (( PASSED++ )) || true
-    else
-        exit_code=$?
-        if [[ $exit_code -eq 0 ]]; then
+    output_file=$(mktemp)
+    set +e
+    bash "$test_file" >"$output_file" 2>&1
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
+            (( PASSED++ )) || true
+            ;;
+        77)
+            # Exit 77 = skip_all() from lib.sh (autoconf convention).
             (( SKIPPED++ )) || true
-        else
+            ;;
+        *)
             (( FAILED++ )) || true
-            FAILURES+=("$(basename "$test_file")")
-        fi
-    fi
+            FAILURES+=("$(basename "$test_file") (exit $rc)")
+            ;;
+    esac
+    cat "$output_file"
+    rm -f "$output_file"
     echo ""
 done
 

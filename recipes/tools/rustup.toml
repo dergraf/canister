@@ -1,0 +1,28 @@
+[recipe]
+name = "tool:rustup"
+description = "rustup: toolchain + update config; read-only except for toolchain installs"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.rustup/settings.toml",
+    "$HOME/.rustup/toolchains",
+]
+allow_write = [
+    "$HOME/.rustup/downloads",
+    "$HOME/.rustup/tmp",
+    "$HOME/.rustup/update-hashes",
+]
+
+[network]
+allow_domains = [
+    "static.rust-lang.org",
+]
+
+[process]
+env_passthrough = [
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTUP_DIST_SERVER",
+    "RUSTUP_UPDATE_ROOT",
+]

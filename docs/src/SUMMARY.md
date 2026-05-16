@@ -9,6 +9,7 @@
 - [Getting Started](guide/getting-started.md)
 - [Configuration](guide/configuration.md)
 - [Seccomp Filtering](guide/seccomp.md)
+- [Data Loss Prevention](guide/dlp.md)
 
 # Reference
 

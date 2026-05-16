@@ -1,0 +1,33 @@
+[recipe]
+name = "tool:uv"
+description = "uv: cache + config; auth tokens via env"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/uv",
+]
+allow_write = [
+    "$HOME/.cache/uv",
+    "$HOME/.local/share/uv",
+]
+deny = [
+    "$HOME/.pypirc",
+]
+
+[network]
+allow_domains = [
+    "pypi.org",
+    "files.pythonhosted.org",
+]
+
+[process]
+env_passthrough = [
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_CACHE_DIR",
+    "UV_PYTHON",
+    "UV_PYTHON_PREFERENCE",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+]

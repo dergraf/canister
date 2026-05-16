@@ -1,0 +1,13 @@
+# Network direct mode — direct outbound allowed.
+# Used by: t_network.sh
+
+[filesystem]
+allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+
+[network]
+egress = "direct"
+
+[process]
+env_passthrough = ["PATH", "HOME"]
+
+[syscalls]

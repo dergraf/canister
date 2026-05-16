@@ -1,0 +1,45 @@
+# Canister tool recipe — git
+#
+# Mounts the standard git configuration files so that `git` running inside
+# the sandbox honours the user's identity, aliases, and global hooks. Does
+# NOT mount credential stores — those would let the sandboxed process
+# read forge tokens off disk. For private-repo HTTPS access, prefer SSH
+# (compose with `tool:ssh-agent` and rely on SSH_AUTH_SOCK rather than
+# on-disk keys).
+#
+# No `allow_domains` here: git remotes are user-defined (github.com,
+# gitlab.com, an internal forge, …). Pair this recipe with a
+# forge-specific one (e.g., `tool:gh` for github.com) or set
+# `[network] allow_domains = [...]` in your canister.toml.
+#
+# Composes with: any recipe; meant to be one component of a larger sandbox
+# (e.g., `tools = ["git", "gh"]` in canister.toml).
+
+[recipe]
+name = "tool:git"
+description = "git: read user identity + aliases from ~/.gitconfig; credential helpers blocked"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.gitconfig",
+    "$HOME/.config/git",
+]
+# Credential stores (file-backed or via credential helper output). Even
+# though the user may have configured a credential helper that talks to
+# the OS keychain rather than disk, the on-disk fallback files are still
+# common; deny them so a recipe-level mistake can't leak the token.
+deny = [
+    "$HOME/.git-credentials",
+    "$HOME/.config/git/credentials",
+]
+
+[process]
+env_passthrough = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_NOSYSTEM",
+]

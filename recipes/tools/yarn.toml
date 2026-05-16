@@ -1,0 +1,33 @@
+[recipe]
+name = "tool:yarn"
+description = "yarn: cache + config; auth tokens denied (use YARN_NPM_AUTH_TOKEN env)"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.yarnrc",
+    "$HOME/.yarnrc.yml",
+]
+allow_write = [
+    "$HOME/.yarn",
+    "$HOME/.cache/yarn",
+]
+deny = [
+    "$HOME/.npmrc",
+]
+
+[network]
+allow_domains = [
+    "registry.yarnpkg.com",
+    "registry.npmjs.org",
+]
+
+[process]
+env_passthrough = [
+    "YARN_NPM_AUTH_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "NPM_CONFIG_REGISTRY",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+]

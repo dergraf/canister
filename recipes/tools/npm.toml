@@ -1,0 +1,56 @@
+# Canister tool recipe — npm
+#
+# Mounts the npm cache and per-user config so `npm install` works
+# against the public registry. Does NOT mount ~/.npmrc by default
+# because it commonly contains _authToken entries for private
+# registries; mounting it would let a malicious dependency read the
+# token off disk.
+#
+# For public-registry workflows this recipe is sufficient. For private
+# registries:
+#   * preferred: pass NPM_TOKEN / NODE_AUTH_TOKEN via env_passthrough,
+#     and add the private registry domain to `[network] allow_domains`
+#     in your canister.toml so egress to other hosts is blocked.
+#   * fallback: add `[filesystem] allow = ["$HOME/.npmrc"]` in your
+#     canister.toml, accepting that any in-sandbox process can read
+#     the token from disk.
+
+[recipe]
+name = "tool:npm"
+description = "npm: cache + per-project config; ~/.npmrc denied (use NPM_TOKEN env)"
+version = "1"
+
+[filesystem]
+# Cache and per-user config dir (XDG layout). Cache is writable so
+# `npm install` can populate it.
+allow_write = [
+    "$HOME/.npm",
+    "$HOME/.config/npm",
+]
+deny = [
+    "$HOME/.npmrc",
+    # Older npm versions stored auth alongside the cache.
+    "$HOME/.npm/_auth",
+    "$HOME/.npm/_authToken",
+]
+
+[network]
+# Default to the public registry. Users targeting private registries
+# add their registry host to `[network] allow_domains` in canister.toml
+# (lists are unioned across recipes). Only enforced when the sandbox
+# uses `egress = "proxy-only"`.
+allow_domains = [
+    "registry.npmjs.org",
+]
+
+[process]
+env_passthrough = [
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_CACHE",
+    "NPM_CONFIG_PREFIX",
+    "NPM_CONFIG_REGISTRY",
+    "NODE_PATH",
+    "NODE_OPTIONS",
+]

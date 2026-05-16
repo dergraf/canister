@@ -1039,4 +1039,221 @@ mod tests {
     fn is_supported_returns_bool() {
         let _ = is_supported();
     }
+
+    // ---------------------------------------------------------------------
+    // Ordering invariants — security-critical. A misordered filter is a
+    // sandbox escape (kernel evaluates BPF in order), so each of these
+    // tests pins one of the structural guarantees the filter generator
+    // makes.
+    // ---------------------------------------------------------------------
+
+    /// The x32 ABI on x86_64 shares syscall numbers with i386 but
+    /// represents arguments differently. If we don't kill on a non-native
+    /// arch BEFORE loading the syscall number, an attacker can invoke
+    /// `read`-numbered syscall via x32 ABI and bypass our checks. The
+    /// kill must be reached on a non-native arch without ever inspecting
+    /// the syscall number.
+    #[test]
+    fn arch_check_kills_before_any_syscall_inspection() {
+        for mode in [SeccompMode::AllowList, SeccompMode::DenyList] {
+            let profile = default_profile();
+            let filter = build_filter(&profile, DenyAction::KillProcess, mode).unwrap();
+
+            // Slot 0: load arch from seccomp_data offset.
+            assert_eq!(
+                filter[0].code,
+                (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                "{mode:?}: slot 0 must be BPF_LD",
+            );
+            assert_eq!(filter[0].k, OFFSET_ARCH, "{mode:?}: slot 0 must load arch");
+
+            // Slot 1: compare against AUDIT_ARCH_NATIVE; if native, skip
+            // exactly one instruction (the kill) and continue. jt=1 means
+            // the kill at slot 2 is the next-but-one instruction.
+            assert_eq!(
+                filter[1].code,
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                "{mode:?}: slot 1 must be a JEQ on arch",
+            );
+            assert_eq!(filter[1].k, AUDIT_ARCH_NATIVE, "{mode:?}: arch constant");
+            assert_eq!(filter[1].jt, 1, "{mode:?}: native arch must skip the kill");
+
+            // Slot 2: unconditional return KILL_PROCESS for non-native arch.
+            assert_eq!(
+                filter[2].code,
+                (libc::BPF_RET | libc::BPF_K) as u16,
+                "{mode:?}: slot 2 must be a return",
+            );
+            assert_eq!(
+                filter[2].k,
+                libc::SECCOMP_RET_KILL_PROCESS,
+                "{mode:?}: non-native arch MUST kill (no errno fallback)",
+            );
+
+            // Slot 3: load syscall number. Anything that examines `nr`
+            // appears at slot 3 or later — proving nothing inspects the
+            // syscall number before the arch check has gated execution.
+            assert_eq!(
+                filter[3].code,
+                (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                "{mode:?}: slot 3 must be BPF_LD (syscall number)",
+            );
+            assert_eq!(filter[3].k, OFFSET_NR, "{mode:?}: slot 3 must load nr");
+        }
+    }
+
+    /// Allow-list layout is `[...checks...] [DENY] [ALLOW]`. A misorder
+    /// here — e.g. the DENY appearing inside the check block — would
+    /// short-circuit the entire allow list. Verify there's exactly one
+    /// return-deny and one return-allow, and they're the last two slots
+    /// in that order.
+    #[test]
+    fn allow_list_has_no_return_after_default_deny() {
+        let profile = default_profile();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList).unwrap();
+
+        // Count return statements; there must be exactly 3:
+        //   slot 2  -> non-native arch kill
+        //   slot N-2 -> default deny
+        //   slot N-1 -> matched allow
+        let ret_code = (libc::BPF_RET | libc::BPF_K) as u16;
+        let return_slots: Vec<usize> = filter
+            .iter()
+            .enumerate()
+            .filter(|(_, ins)| ins.code == ret_code)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(
+            return_slots,
+            vec![2, filter.len() - 2, filter.len() - 1],
+            "allow-list returns must be at slots [arch_kill, default_deny, allow]"
+        );
+        assert_eq!(
+            filter[filter.len() - 2].k,
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "second-to-last must be default deny",
+        );
+        assert_eq!(
+            filter[filter.len() - 1].k,
+            libc::SECCOMP_RET_ALLOW,
+            "last must be the allow target",
+        );
+    }
+
+    /// Deny-list layout is `[...checks...] [ALLOW] [DENY]`. Same
+    /// invariant in the inverse: there must be exactly one default-allow
+    /// followed by the deny target, with no other returns mixed in.
+    #[test]
+    fn deny_list_has_no_return_after_default_allow() {
+        let profile = default_profile();
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
+
+        let ret_code = (libc::BPF_RET | libc::BPF_K) as u16;
+        let return_slots: Vec<usize> = filter
+            .iter()
+            .enumerate()
+            .filter(|(_, ins)| ins.code == ret_code)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(
+            return_slots,
+            vec![2, filter.len() - 2, filter.len() - 1],
+            "deny-list returns must be at slots [arch_kill, default_allow, deny]"
+        );
+        assert_eq!(
+            filter[filter.len() - 2].k,
+            libc::SECCOMP_RET_ALLOW,
+            "second-to-last must be default allow",
+        );
+        assert_eq!(
+            filter[filter.len() - 1].k,
+            libc::SECCOMP_RET_KILL_PROCESS,
+            "last must be the deny target",
+        );
+    }
+
+    /// Syscalls on the absolute deny list (`unshare`, `setns`,
+    /// `memfd_create`, `mount`, `pivot_root`, etc.) are load-bearing for
+    /// the sandbox boundary — they must NEVER be reachable through
+    /// `allow_extra`. This test takes the union of the absolute deny set
+    /// and asserts each one stays denied after a recipe tries to
+    /// allow-list it.
+    #[test]
+    fn absolute_deny_syscalls_never_re_enabled_by_allow_extra() {
+        // The set the README/docs / recipes/default.toml document as
+        // unconditional denies. Sandbox-escape-relevant subset.
+        let absolute_denies = [
+            "unshare",
+            "setns",
+            "memfd_create",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "chroot",
+            "kexec_load",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "reboot",
+            "syslog",
+            "settimeofday",
+            "swapon",
+            "swapoff",
+            "acct",
+            "execveat",
+        ];
+
+        let profile = profile_with_overrides(&absolute_denies, &[]);
+
+        for name in &absolute_denies {
+            assert!(
+                !profile.allow_syscalls.contains(&name.to_string()),
+                "{name} leaked into allow list via allow_extra; sandbox boundary broken",
+            );
+            assert!(
+                profile.deny_syscalls.contains(&name.to_string()),
+                "{name} disappeared from deny list",
+            );
+        }
+    }
+
+    /// Defense in depth: even in deny-list mode (where the absolute deny
+    /// list IS the filter), an attempt to "allow" an absolute-deny
+    /// syscall must not strip it from `deny_syscalls`. We expose this by
+    /// building the actual BPF filter and asserting the syscall numbers
+    /// appear among the check operands.
+    #[test]
+    fn absolute_deny_syscalls_present_in_deny_list_filter_even_with_override() {
+        let profile = profile_with_overrides(&["unshare", "setns", "mount"], &[]);
+        let filter =
+            build_filter(&profile, DenyAction::KillProcess, SeccompMode::DenyList).unwrap();
+
+        let unshare_nr = syscall_number("unshare").unwrap() as u32;
+        let setns_nr = syscall_number("setns").unwrap() as u32;
+        let mount_nr = syscall_number("mount").unwrap() as u32;
+
+        let check_operands: Vec<u32> = filter
+            .iter()
+            .filter(|ins| {
+                ins.code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
+                    && ins.k != AUDIT_ARCH_NATIVE
+            })
+            .map(|ins| ins.k)
+            .collect();
+
+        for (name, nr) in [
+            ("unshare", unshare_nr),
+            ("setns", setns_nr),
+            ("mount", mount_nr),
+        ] {
+            assert!(
+                check_operands.contains(&nr),
+                "{name} (syscall #{nr}) not present as a JEQ operand in deny-list filter",
+            );
+        }
+    }
 }

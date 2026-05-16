@@ -1,0 +1,23 @@
+[recipe]
+name = "tool:docker-config"
+description = "docker: CLI config (aliases, plugins); registry auth denied"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.docker/config.json",
+    "$HOME/.docker/cli-plugins",
+    "$HOME/.docker/contexts",
+]
+deny = [
+    "$HOME/.docker/credentials",
+    "$HOME/.docker/plaintext-credentials.json",
+]
+
+[process]
+env_passthrough = [
+    "DOCKER_CONFIG",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_BUILDKIT",
+]

@@ -110,7 +110,7 @@ recipes = ["elixir", "nix"]
 command = "mix test"
 
 [sandbox.test.network]
-deny_all = true
+egress = "proxy-only"
 
 [sandbox.ci]
 description = "CI — strict, no network"
@@ -149,7 +149,7 @@ composed recipes using the same merge semantics from ADR-0002:
 | Sub-table | Description |
 |---|---|
 | `[sandbox.<name>.filesystem]` | Additional paths, writable mounts |
-| `[sandbox.<name>.network]` | Additional domains, IPs, deny_all override |
+| `[sandbox.<name>.network]` | Additional domains, IPs, egress override |
 | `[sandbox.<name>.process]` | Additional env vars, execve rules |
 | `[sandbox.<name>.resources]` | Resource limit overrides |
 | `[sandbox.<name>.syscalls]` | Additional allow_extra / deny_extra |

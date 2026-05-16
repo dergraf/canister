@@ -26,6 +26,7 @@ allow_extra = ["ptrace", "memfd_create"]
 deny = ["/etc/shadow", "/root"]
 
 [network]
+egress = "proxy-only"
 # Allow hex.pm for dependency fetching and common Elixir registries.
 allow_domains = [
     "hex.pm",
@@ -33,7 +34,6 @@ allow_domains = [
     "builds.hex.pm",
     "github.com",
 ]
-deny_all = true
 
 [process]
 # BEAM spawns many lightweight processes via OS threads; the default

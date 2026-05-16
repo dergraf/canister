@@ -3,8 +3,8 @@
 Canister uses TOML configuration files with strict schema validation. Unknown
 fields are rejected at parse time.
 
-When no config file is provided (`can run -- command`), a **default deny-all**
-policy is used: no filesystem access, no network, default seccomp baseline.
+When no config file is provided (`can run -- command`), default policy uses
+**proxy-only egress** with strict filesystem defaults and the default seccomp baseline.
 
 ## Table of Contents
 
@@ -21,9 +21,11 @@ policy is used: no filesystem access, no network, default seccomp baseline.
 - [recipe (metadata)](#recipe-metadata)
 - [filesystem](#filesystem)
 - [network](#network)
+- [network.dlp](#networkdlp)
 - [process](#process)
 - [resources](#resources)
 - [syscalls](#syscalls)
+- [proxy](#proxy)
 - [Strict Mode](#strict-mode)
 - [Monitor Mode](#monitor-mode)
 - [Inspecting the Resolved Policy](#inspecting-the-resolved-policy)
@@ -85,7 +87,7 @@ Each sandbox can include optional override sections that merge on top of the
 composed recipes. These use the same schema as recipe files:
 
 - `[sandbox.<name>.filesystem]` — `allow`, `allow_write`, `deny`
-- `[sandbox.<name>.network]` — `allow_domains`, `allow_ips`, `deny_all`, `ports`
+- `[sandbox.<name>.network]` — `egress`, `allow_domains`, `allow_ips`, `ports`
 - `[sandbox.<name>.process]` — `max_pids`, `allow_execve`, `env_passthrough`
 - `[sandbox.<name>.resources]` — `memory_mb`, `cpu_percent`
 - `[sandbox.<name>.syscalls]` — `allow_extra`, `deny_extra`, `seccomp_mode`, `notifier`
@@ -195,8 +197,8 @@ When multiple recipes are merged, each field type follows a specific strategy:
 |---|---|---|
 | `Vec` fields (paths, domains, syscalls, env vars) | **Union** — deduplicated, order preserved | Two recipes allowing `/a` and `/b` → `["/a", "/b"]` |
 | `strict` (`Option<bool>`) | **OR** — any `Some(true)` wins, can never be loosened | Recipe A: `strict = true`, Recipe B: omitted → `true` |
-| `deny_all` (`Option<bool>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `deny_all = true`, Recipe B: `deny_all = false` → `false` |
-| `seccomp_mode` (`Option<SeccompMode>`) | **Last-Some-wins** | Same as `deny_all` |
+| `egress` (`Option<EgressMode>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `egress = "proxy-only"`, Recipe B: `egress = "direct"` → `direct` |
+| `seccomp_mode` (`Option<SeccompMode>`) | **Last-Some-wins** | Same as `egress` |
 | Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-Some-wins** | Recipe A: `max_pids = 64`, Recipe B: `max_pids = 128` → `128` |
 | `RecipeMeta` | **Overlay** — later recipe's metadata wins if present | — |
 
@@ -357,20 +359,20 @@ explicitly allowed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `egress` | `"proxy-only" \| "none" \| "direct"` | `"proxy-only"` | Outbound networking mode |
 | `allow_domains` | `string[]` | `[]` | Allowed domain names |
 | `allow_ips` | `string[]` | `[]` | Allowed IPs or CIDR ranges (IPv4 and IPv6) |
-| `deny_all` | `bool` | `true` | Deny all network except explicitly allowed |
 | `ports` | `string[]` | `[]` | Port forwarding specs (`[ip:]hostPort:containerPort[/protocol]`) |
 
 **Network mode determination:**
 
-The combination of fields determines which isolation mode is used:
+The effective egress mode determines isolation behavior:
 
-| `deny_all` | Allowlists | Mode | Description |
-|------------|------------|------|-------------|
-| `true` | empty | **None** | No network. Empty network namespace, loopback only. |
-| `true` | non-empty | **Filtered** | Connectivity via pasta. Domains pre-resolved. |
-| `false` | any | **Full** | No isolation. Shares host network namespace. |
+| `egress` | Mode | Description |
+|----------|------|-------------|
+| `none` | **None** | No outbound network. Empty network namespace, loopback only. |
+| `proxy-only` | **Filtered** | Outbound traffic must go through local proxy (kernel-enforced). |
+| `direct` | **Full/Filtered** | Direct outbound. If allowlists/ports are set, filtered mode is used for policy checks; otherwise full host network namespace. |
 
 Specifying `ports` automatically upgrades None mode to Filtered
 mode (port forwarding requires a functional network namespace with pasta).
@@ -415,8 +417,8 @@ the namespace. DNS is handled via a link-local address:
 
 ```toml
 [network]
+egress = "proxy-only"
 allow_domains = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
-deny_all = true
 ```
 
 **Port forwarding (`ports`):**
@@ -433,8 +435,8 @@ can run -p 127.0.0.1:3000:3000 -p 5432:5432/tcp -- my-app
 ```toml
 # Config usage
 [network]
+egress = "proxy-only"
 ports = ["8080:80", "127.0.0.1:3000:3000", "5353:53/udp"]
-deny_all = true
 ```
 
 Syntax: `[ip:]hostPort:containerPort[/protocol]`
@@ -445,6 +447,84 @@ Syntax: `[ip:]hostPort:containerPort[/protocol]`
 | `hostPort` | Yes | — | Port on the host |
 | `containerPort` | Yes | — | Port inside the sandbox |
 | `protocol` | No | `tcp` | `tcp` or `udp` |
+
+---
+
+## `[network.dlp]`
+
+Data Loss Prevention layer running inside the L7 egress proxy. Scans
+outbound HTTP traffic for credential patterns (GitHub PATs, npm tokens,
+AWS keys, Slack tokens, SSH private keys, generic bearer tokens) and
+enforces per-detector domain scoping — each token type may only flow to
+its built-in *home domains* for that service. Even when
+`allow_domains` permits a destination, a GitHub PAT bound for
+`registry.npmjs.org` will be blocked. See [DLP](DLP.md) for the full
+threat model and detector list.
+
+DLP only runs when traffic is inspectable, i.e. when
+`network.egress = "proxy-only"`.
+
+```toml
+[network.dlp]
+enabled = true
+canary_tokens = true              # default when DLP is enabled
+max_decode_depth = 32             # base64/hex/percent recursion cap
+decompress = true                 # gzip/deflate/brotli before scan
+dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
+session_entropy_budget = 8192     # cumulative high-entropy bytes/session
+
+[network.dlp.extra_scopes]
+github_pat = ["github.corp.example.com"]
+npm_token  = ["npm.internal.example.com"]
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Enable DLP scanning. Implicitly `true` under `--strict` when `egress = "proxy-only"`. |
+| `canary_tokens` | `bool` | `true` when DLP enabled | Inject fake credentials into the sandbox env and treat any outbound appearance as exfiltration. |
+| `max_decode_depth` | `usize` | `32` | Encoding chain recursion depth (base64 / hex / percent). |
+| `decompress` | `bool` | `true` | Inflate gzip / deflate / brotli bodies before scanning. |
+| `dns_entropy_threshold` | `f64` | `4.5` | Shannon entropy per DNS label above which the hostname is blocked. |
+| `session_entropy_budget` | `u64` | `8192` | Cumulative high-entropy bytes allowed across one sandbox session before further requests are blocked. |
+| `extra_scopes` | `map<string, string[]>` | `{}` | Extend built-in home domains per detector for self-hosted services. Unioned with built-ins, never replaces them. |
+
+### Built-in scopes
+
+| Detector | Home domains |
+|---|---|
+| `github_pat` | `github.com`, `*.github.com` |
+| `npm_token` | `registry.npmjs.org` |
+| `aws_access_key` | `*.amazonaws.com` |
+| `slack_token` | `*.slack.com` |
+| `bearer_token` | *(any destination already in `allow_domains`)* |
+| `ssh_private_key`, `canary_token` | *(none — always block)* |
+| `generic_high_entropy` | *(warn only, block in `--strict`)* |
+
+### Merge semantics
+
+| Field | Merge rule |
+|---|---|
+| `enabled` | OR — any `Some(true)` wins (security escalation, never reversed) |
+| `canary_tokens` | OR |
+| `extra_scopes` | per-detector domain union (never narrows) |
+| `max_decode_depth`, `decompress`, `dns_entropy_threshold`, `session_entropy_budget` | last-Some-wins |
+
+A downstream recipe can never disable DLP that an upstream recipe
+enabled, nor shrink the scope set.
+
+### Interaction with `--strict` / `--monitor`
+
+- `--strict` implicitly enables DLP (when `egress = "proxy-only"`) and
+  promotes `generic_high_entropy` from `warn` to `block`.
+- `--monitor` logs DLP findings at `warn!` level but forwards the
+  request, adding an `x-canister-dlp-warning` header so the sandboxed
+  process can observe what would have been blocked.
+
+On block, the proxy returns `451 Unavailable For Legal Reasons` with
+headers `x-canister-error: dlp-blocked` and
+`x-canister-dlp-detector: <name>`.
 
 ---
 
@@ -646,6 +726,38 @@ description.
 
 ---
 
+## `[proxy]`
+
+L7 proxy settings used by proxy-only egress mode.
+
+```toml
+[proxy]
+max_buffered_body_bytes = 8388608   # 8 MiB (default)
+upstream_request_timeout_ms = 30000  # 30 s (default)
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `max_buffered_body_bytes` | `usize` | `8388608` | Max bytes buffered for DLP body scanning |
+| `upstream_request_timeout_ms` | `u64` | `30000` | Upstream request timeout in milliseconds |
+
+### Enforcement semantics
+
+When `network.egress = "proxy-only"`:
+
+- sandboxed processes may only open outbound INET/INET6 connections to:
+  - loopback proxy endpoint (`127.0.0.1:<proxy_port>` / `::1:<proxy_port>`)
+  - configured DNS server on port 53
+- direct outbound internet access is denied by seccomp USER_NOTIF policy
+  even if `HTTP_PROXY`/`HTTPS_PROXY` env vars are unset.
+
+This makes seccomp-notify the first-line defense and proxy the forwarding path
+for legitimate traffic.
+
+---
+
 ## Strict Mode
 
 Strict mode (`--strict` or `strict = true` in config) tightens all enforcement
@@ -752,7 +864,7 @@ deny = ["/etc/shadow", "/etc/gshadow"]
 
 [network]
 allow_domains = ["hex.pm", "repo.hex.pm", "builds.hex.pm"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 allow_execve = ["/nix/store/*"]
@@ -788,7 +900,7 @@ Equivalent to:
 ```toml
 [filesystem]
 [network]
-deny_all = true
+egress = "none"
 [syscalls]
 ```
 
@@ -807,11 +919,11 @@ allow = [
 deny = ["/etc/shadow", "/root"]
 
 [network]
+egress = "proxy-only"
 allow_domains = [
     "pypi.org",
     "files.pythonhosted.org",
 ]
-deny_all = true
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "VIRTUAL_ENV"]
@@ -831,11 +943,11 @@ allow = [
 ]
 
 [network]
+egress = "proxy-only"
 allow_domains = [
     "registry.npmjs.org",
     "nodejs.org",
 ]
-deny_all = true
 
 [process]
 env_passthrough = ["PATH", "HOME", "NODE_ENV"]
@@ -851,7 +963,7 @@ filesystem- and syscall-restricted.
 allow = ["/tmp/workspace"]
 
 [network]
-deny_all = false
+egress = "direct"
 ```
 
 ### Air-gapped
@@ -864,7 +976,7 @@ allow = ["/tmp/workspace"]
 deny  = ["/etc", "/root", "/home"]
 
 [network]
-deny_all = true
+egress = "none"
 ```
 
 ### Strict CI
@@ -879,7 +991,7 @@ strict = true
 allow = ["/tmp/workspace"]
 
 [network]
-deny_all = true
+egress = "none"
 
 [process]
 max_pids = 64
@@ -916,7 +1028,7 @@ deny = ["/etc/shadow", "/root"]
 
 [network]
 allow_domains = ["hex.pm", "repo.hex.pm", "builds.hex.pm"]
-deny_all = true
+egress = "proxy-only"
 
 [process]
 max_pids = 256

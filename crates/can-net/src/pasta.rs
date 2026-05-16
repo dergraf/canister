@@ -274,11 +274,22 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
 
     // Disable host loopback access for security:
     // prevents the sandbox from reaching host services via gateway→loopback mapping.
-    // Newer pasta versions use `--map-host-loopback none`, older use `--no-map-gw`.
-    if pasta_supports_option("--map-host-loopback") {
-        cmd.arg("--map-host-loopback").arg("none");
-    } else {
+    //
+    // Three pasta variants in the wild:
+    //   1. Old: only `--no-map-gw`.
+    //   2. Transitional (e.g. Fedora 42 default): both flags appear in
+    //      --help but `--map-host-loopback` rejects `none` as an address
+    //      ("Invalid address to remap to host: none").
+    //   3. New: `--map-host-loopback none` works.
+    //
+    // Prefer `--no-map-gw` when available — it has stable disable semantics
+    // across both old and transitional pastas. Fall back to
+    // `--map-host-loopback none` only when `--no-map-gw` has actually been
+    // removed.
+    if pasta_supports_option("--no-map-gw") {
         cmd.arg("--no-map-gw");
+    } else if pasta_supports_option("--map-host-loopback") {
+        cmd.arg("--map-host-loopback").arg("none");
     }
 
     // Port forwarding setup.

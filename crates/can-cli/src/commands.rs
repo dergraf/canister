@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use can_policy::config::EgressMode;
 use can_policy::profile::baseline_search_dirs;
 use can_policy::{
     Manifest, RecipeFile, SandboxConfig, SandboxDef, SeccompProfile, discover_manifest,
@@ -16,10 +17,46 @@ use can_sandbox::mac::{self, PolicyStatus};
 ///
 /// Rules:
 /// - If the argument contains `/` or ends with `.toml`, treat as a file path.
+/// - If the argument starts with `tool:`, search `tools/{rest}.toml` across
+///   `baseline_search_dirs()`. Tool recipes are a curated namespace of
+///   small per-tool config bundles (npm, gh, kubectl, …) shipped via the
+///   community recipe registry.
 /// - Otherwise, search for `{name}.toml` across `baseline_search_dirs()`.
 ///
 /// Returns the resolved path, or an error if the name is not found.
-fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
+    // tool:NAME → search `tools/NAME.toml` across the recipe search path.
+    // Checked BEFORE the file-path branch so that `tool:foo/bar` produces
+    // a clear "tool name must be a bare identifier" error rather than a
+    // confusing "file not found: tool:foo/bar".
+    if let Some(tool_name) = arg.strip_prefix("tool:") {
+        anyhow::ensure!(
+            !tool_name.is_empty(),
+            "invalid recipe name: bare 'tool:' has no tool name"
+        );
+        anyhow::ensure!(
+            !tool_name.contains(':') && !tool_name.contains('/'),
+            "invalid tool name '{tool_name}': must be a bare identifier (no ':' or '/')"
+        );
+        let filename = format!("{tool_name}.toml");
+        for dir in baseline_search_dirs() {
+            let candidate = dir.join("tools").join(&filename);
+            if candidate.is_file() {
+                tracing::debug!(name = arg, path = %candidate.display(), "resolved tool recipe");
+                return Ok(candidate);
+            }
+        }
+        anyhow::bail!(
+            "tool recipe '{arg}' not found. Searched for 'tools/{filename}' in:\n{}\n\n\
+             Run `can init` to install the curated tool recipe set.",
+            baseline_search_dirs()
+                .iter()
+                .map(|d| format!("  {}", d.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     // Treat as file path if it contains a separator or ends with .toml.
     if arg.contains('/') || arg.ends_with(".toml") {
         let path = PathBuf::from(arg);
@@ -107,6 +144,7 @@ fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<Sandbox
             path = %path.display(),
             "loaded recipe"
         );
+        tracing::debug!("loaded recipe {:?}", arg);
 
         merged = merged.merge(recipe);
     }
@@ -186,8 +224,12 @@ fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile
 /// 1. `base.toml` — essential OS filesystem mounts (always loaded)
 /// 2. Auto-detected recipes — matched by `match_prefix` against the
 ///    resolved command binary path
-/// 3. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
-/// 4. Manifest overrides (filesystem, network, etc. from the sandbox definition)
+/// 3. `tools = [...]` — each entry `foo` is expanded to `tool:foo` and
+///    resolved via the `tools/` sub-namespace, merged left-to-right.
+///    Composed BEFORE explicit `recipes` so users can override tool
+///    defaults from a project recipe.
+/// 4. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
+/// 5. Manifest overrides (filesystem, network, etc. from the sandbox definition)
 fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
     // 1. Start with base.toml.
     let mut merged = resolve_base().context("loading base.toml")?;
@@ -223,7 +265,25 @@ fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
         }
     }
 
-    // 3. Merge recipes listed in the manifest.
+    // 3. Expand `tools = [...]` into `tool:<name>` entries and merge.
+    for tool in &def.tools {
+        let arg = format!("tool:{tool}");
+        let path = resolve_recipe_path(&arg)?;
+        let recipe = RecipeFile::from_file(&path)
+            .with_context(|| format!("loading tool recipe: {}", path.display()))?;
+        tracing::info!(
+            recipe = recipe.display_name(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+            ),
+            path = %path.display(),
+            "loaded tool recipe (from manifest)"
+        );
+        merged = merged.merge(recipe);
+    }
+
+    // 4. Merge recipes listed in the manifest.
     for recipe_name in &def.recipes {
         let path = resolve_recipe_path(recipe_name)?;
         let recipe = RecipeFile::from_file(&path)
@@ -300,6 +360,9 @@ pub fn up(
         }
     };
 
+    // SAFETY-UNWRAP: sandbox_name was just resolved from this manifest's
+    // entries (either by explicit lookup or by taking the first key), so
+    // get() is guaranteed to return Some.
     let def = manifest.get(&sandbox_name).unwrap();
 
     // Print sandbox info.
@@ -423,7 +486,12 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
 
     // Network.
     println!("[network]");
-    println!("  deny_all: {}", config.network.deny_all());
+    let egress = match config.network.egress() {
+        EgressMode::None => "none",
+        EgressMode::ProxyOnly => "proxy-only",
+        EgressMode::Direct => "direct",
+    };
+    println!("  egress: {egress}");
     if !config.network.allow_domains.is_empty() {
         println!("  allow_domains: {:?}", config.network.allow_domains);
     }
@@ -509,7 +577,7 @@ pub fn show(recipe_args: &[String], command: Vec<String>) -> Result<i32> {
 
     // Resolve Option fields to their effective values so the output is
     // fully explicit — no hidden defaults.
-    config.network.deny_all = Some(config.network.deny_all());
+    config.network.egress = Some(config.network.egress());
     config.syscalls.seccomp_mode = Some(config.syscalls.seccomp_mode());
 
     let toml_str =
@@ -573,6 +641,8 @@ pub fn run(
     let (cmd, args) = command
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
+
+    tracing::debug!("effective egress mode: {:?}", config.network.egress());
 
     let opts = SandboxOpts {
         command: cmd.clone(),
@@ -997,9 +1067,101 @@ fn print_monitor_exit_summary(exit_code: i32, config: &SandboxConfig) {
         eprintln!("  your current policy is likely compatible. Remove --monitor to enforce.");
     } else {
         eprintln!();
-        eprintln!("  Tip: Using default deny-all policy. Consider creating a recipe file");
+        eprintln!("  Tip: Using default proxy-only policy. Consider creating a recipe file");
         eprintln!("  with appropriate allow lists based on the observations above.");
     }
 
     eprintln!("--- End Monitor Summary ---");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The validation branches of `resolve_recipe_path` (rejecting malformed
+    // `tool:` names, treating paths-with-slashes as files) don't depend on
+    // the recipe search path, so they can be unit-tested deterministically.
+    // The "happy path" lookup is covered by tests/integration/t_recipes.sh
+    // which exercises real recipe directories.
+
+    #[test]
+    fn resolve_recipe_path_rejects_bare_tool_prefix() {
+        let err = resolve_recipe_path("tool:").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bare 'tool:'"),
+            "expected bare-tool error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipe_path_rejects_tool_name_with_colon() {
+        let err = resolve_recipe_path("tool:foo:bar").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be a bare identifier"),
+            "expected bare-identifier error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipe_path_rejects_tool_name_with_slash() {
+        // `tool:foo/bar` could be confused with a relative path. Reject it
+        // explicitly so users get a clear error rather than a confusing
+        // "recipe file not found".
+        let err = resolve_recipe_path("tool:foo/bar").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be a bare identifier"),
+            "expected bare-identifier error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipe_path_treats_dotslash_toml_as_file_not_tool() {
+        // Regression: a literal file path containing the substring "tool:"
+        // would only be possible via a leading `./` or absolute path,
+        // both of which hit the file-path branch first. This pins the
+        // ordering: file-path check wins over tool-prefix check.
+        let err = resolve_recipe_path("./tool:foo.toml").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recipe file not found"),
+            "expected file-not-found error (file branch took over), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipe_path_missing_tool_recipe_mentions_init_hint() {
+        // When the curated tool recipe isn't installed, the error must
+        // tell the user how to fix it (`can init`) rather than leaving
+        // them to figure out the conventional `tools/` layout.
+        let err = resolve_recipe_path("tool:definitely-no-such-tool").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("can init"),
+            "expected init hint in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("tools/definitely-no-such-tool.toml"),
+            "expected searched-filename in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipe_path_missing_bare_name_does_not_mention_init_hint() {
+        // The bare-name error path is distinct from the tool error path —
+        // pin that we don't leak the tool-specific hint into the generic
+        // recipe-not-found message.
+        let err = resolve_recipe_path("definitely-no-such-recipe").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("can init"),
+            "init hint should not appear for non-tool recipes, got: {msg}"
+        );
+        assert!(
+            msg.contains("definitely-no-such-recipe.toml"),
+            "expected filename in error, got: {msg}"
+        );
+    }
 }

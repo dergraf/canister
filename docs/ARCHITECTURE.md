@@ -86,6 +86,27 @@ canister/
 Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 `can-net`. `can-policy` and `can-log` have no internal dependencies.
 
+### Outbound Defense Model (Filtered + Proxy + DLP)
+
+When proxy is enabled with enforcement, outbound networking follows a three-layer model:
+
+1. **Kernel first-line (seccomp USER_NOTIF):** sandboxed processes may only connect to
+   local proxy loopback endpoint and DNS server; all other direct outbound INET/INET6
+   traffic is denied.
+2. **Proxy second-line (user space):** proxy validates destination against allow policy
+   and forwards via L7 HTTP interception path or L4 CONNECT passthrough path.
+3. **DLP third-line (content scanning):** when `[network.dlp]` is enabled (implicit
+   under `--strict` + `proxy-only`), the L7 path scans request headers, URI, and body
+   for credential patterns (GitHub PATs, npm tokens, AWS keys, SSH keys, etc.) and
+   enforces per-detector domain scoping. A GitHub PAT bound for `registry.npmjs.org`
+   is blocked even though npm is in `allow_domains`. Bodies are decompressed
+   (gzip/deflate/brotli) and decoded (base64/hex/percent, up to 32 layers) before
+   pattern matching. See [DLP.md](DLP.md) for the threat model, detector list, and
+   canary-token / session-entropy-budget mechanisms.
+
+This prevents bypass by unsetting proxy environment variables, and prevents
+exfiltration of credentials that the sandbox legitimately needs read access to.
+
 ---
 
 ## Execution Flow

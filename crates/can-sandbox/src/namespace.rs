@@ -12,8 +12,10 @@ use nix::unistd::{ForkResult, Pid, fork, pipe};
 /// Set to -1 when no child exists.
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
 
+use can_net::dns_cache::DnsCache;
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
+use can_policy::config::EgressMode;
 
 use crate::{
     SandboxOpts, cgroups, notifier, overlay, process, resolve_command, seccomp, to_cstring,
@@ -112,6 +114,20 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let net_mode = NetworkMode::from_config(&opts.config.network);
     tracing::debug!(?net_mode, "network isolation mode");
 
+    // Initialize CA for the proxy when egress mode requires proxy path.
+    // Done before forking so both parent (proxy thread) and child (cert file injection)
+    // have access to it without IPC.
+    let mut proxy_ca = None;
+    if matches!(opts.config.network.egress(), EgressMode::ProxyOnly) {
+        match can_proxy::ca::DynamicCa::generate() {
+            Ok(ca) => {
+                tracing::debug!("generated dynamic CA for proxy");
+                proxy_ca = Some(std::sync::Arc::new(ca));
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to generate proxy CA"),
+        }
+    }
+
     // Determine whether to enable the seccomp notifier.
     let notifier_enabled = resolve_notifier_enabled(&opts.config.syscalls, opts.monitor);
 
@@ -137,6 +153,30 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
         } else {
             Vec::new()
         };
+
+    let dns_cache =
+        if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
+            let cache = DnsCache::new(std::time::Duration::from_secs(15));
+            for domain in &opts.config.network.allow_domains {
+                let _ = cache.resolve_cached_or_lookup(domain);
+            }
+            Some(cache)
+        } else {
+            None
+        };
+
+    let dlp_config = opts.config.network.dlp.as_ref();
+    let dlp_enabled = dlp_config.map(|d| d.is_enabled()).unwrap_or(false)
+        || opts.config.network.egress() == can_policy::config::EgressMode::ProxyOnly;
+    let canary_enabled = dlp_enabled && dlp_config.map(|d| d.canary_tokens()).unwrap_or(true);
+    let canary_set = if canary_enabled {
+        let set = can_dlp::CanarySet::generate();
+        tracing::info!("DLP canary tokens generated");
+        Some(set)
+    } else {
+        None
+    };
+    let canary_values: Vec<String> = canary_set.as_ref().map(|c| c.values()).unwrap_or_default();
 
     // Create pipes for parent-child synchronization.
     //
@@ -198,11 +238,21 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             // the network namespace (setns(CLONE_NEWNET)).
             let mut net_state = NetworkState::new();
             let mut dns_addr = can_net::pasta::PASTA_DNS_ADDR.to_string();
+            let mut proxy_port = 0u16;
             if net_mode == NetworkMode::Filtered {
-                match setup_parent_network(child.as_raw() as u32, &opts.config, &mut net_state) {
-                    Ok(addr) => {
+                match setup_parent_network(
+                    child.as_raw() as u32,
+                    &opts.config,
+                    &mut net_state,
+                    proxy_ca.clone(),
+                    dns_cache.clone(),
+                    opts.monitor,
+                    canary_values.clone(),
+                ) {
+                    Ok((addr, port)) => {
                         dns_addr = addr;
-                        tracing::debug!(dns = %dns_addr, "parent network setup complete");
+                        proxy_port = port;
+                        tracing::debug!(dns = %dns_addr, proxy_port, "parent network setup complete");
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "parent network setup failed");
@@ -211,15 +261,17 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 }
             }
 
-            // Signal child that network is ready, including the DNS address.
-            // Protocol: u16 length (big-endian) + DNS address string bytes.
-            let dns_bytes = dns_addr.as_bytes();
-            let len_bytes = (dns_bytes.len() as u16).to_be_bytes();
+            // Signal child that network is ready. See `pipe_protocol`
+            // module for the framed wire format.
             let mut net_w = std::fs::File::from(network_done.1);
-            net_w
-                .write_all(&len_bytes)
-                .map_err(NamespaceError::UidMap)?;
-            net_w.write_all(dns_bytes).map_err(NamespaceError::UidMap)?;
+            crate::pipe_protocol::write_handshake(
+                &mut net_w,
+                &crate::pipe_protocol::NetworkHandshake {
+                    proxy_port,
+                    dns_addr: dns_addr.clone(),
+                },
+            )
+            .map_err(NamespaceError::UidMap)?;
             drop(net_w);
 
             // Forward SIGTERM/SIGINT to the child process so that killing
@@ -258,6 +310,9 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 opts.strict,
                 notifier_enabled,
                 &resolved_ips,
+                proxy_ca,
+                dns_cache,
+                canary_set.as_ref(),
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -274,15 +329,19 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 ///
 /// `child_pid` is the PID of the sandboxed child process. pasta is
 /// invoked with `--userns /proc/<pid>/ns/user` and `--netns /proc/<pid>/ns/net`.
-/// DNS resolution is handled by the seccomp notifier's domain-aware
-/// filtering — no separate DNS proxy is needed.
+/// DNS resolution is handled by seccomp notifier domain-aware filtering
+/// plus a shared TTL-aware DNS cache used by proxy/notifier components.
 ///
 /// Returns the DNS address configured inside the namespace by pasta.
 fn setup_parent_network(
     child_pid: u32,
     config: &SandboxConfig,
     state: &mut NetworkState,
-) -> Result<String, can_net::NetError> {
+    proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
+    _dns_cache: Option<DnsCache>,
+    monitor: bool,
+    canary_values: Vec<String>,
+) -> Result<(String, u16), can_net::NetError> {
     if !can_net::pasta::is_available() {
         tracing::warn!(
             "pasta not found. Filtered network mode requires pasta. \
@@ -300,7 +359,112 @@ fn setup_parent_network(
     let (pasta_child, dns_addr) = can_net::pasta::start(&pasta_config)?;
     state.pasta_child = Some(pasta_child);
 
-    Ok(dns_addr)
+    let mut proxy_port = 0;
+    if let Some(ca) = proxy_ca {
+        // We must use fork() rather than std::thread::spawn because setns(CLONE_NEWUSER)
+        // requires the process to be single-threaded.
+        let (rx_fd, tx_fd) = nix::unistd::pipe().map_err(can_net::NetError::Namespace)?;
+
+        match unsafe { nix::unistd::fork() }.map_err(can_net::NetError::Namespace)? {
+            nix::unistd::ForkResult::Child => {
+                drop(rx_fd);
+
+                // If parent dies, kill the proxy
+                set_pdeathsig(libc::SIGKILL);
+
+                // Join user ns
+                let user_fd = match std::fs::File::open(format!("/proc/{}/ns/user", child_pid)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("proxy process: failed to open user ns: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = nix::sched::setns(user_fd, nix::sched::CloneFlags::CLONE_NEWUSER) {
+                    tracing::error!("proxy process: setns CLONE_NEWUSER failed: {}", e);
+                    std::process::exit(1);
+                }
+
+                // Join net ns
+                let net_fd = match std::fs::File::open(format!("/proc/{}/ns/net", child_pid)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("proxy process: failed to open net ns: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = nix::sched::setns(net_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
+                    tracing::error!("proxy process: setns CLONE_NEWNET failed: {}", e);
+                    std::process::exit(1);
+                }
+
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("proxy process: failed to build tokio runtime: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                rt.block_on(async {
+                    let proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
+                        .with_network(config.network.clone())
+                        .with_proxy_config(config.proxy.clone())
+                        .with_strict(config.strict)
+                        .with_monitor(monitor)
+                        .with_canaries(canary_values);
+                    let server = match can_proxy::server::ProxyServer::new(proxy_server_config) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("proxy process: failed to start proxy server: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!("proxy process: failed to bind proxy listener: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                    tracing::debug!("proxy process: bound to port {}", port);
+
+                    let mut tx_file = std::fs::File::from(tx_fd);
+                    if let Err(e) = std::io::Write::write_all(&mut tx_file, &port.to_be_bytes()) {
+                        tracing::error!("proxy process: failed to send port to parent: {}", e);
+                    }
+                    drop(tx_file);
+
+                    if let Err(e) = server.run(listener).await {
+                        tracing::error!("proxy process: proxy server run error: {}", e);
+                    }
+                });
+                std::process::exit(0);
+            }
+            nix::unistd::ForkResult::Parent { child: proxy_pid } => {
+                drop(tx_fd);
+                state.proxy_pid = Some(proxy_pid);
+
+                let mut rx_file = std::fs::File::from(rx_fd);
+                let mut buf = [0u8; 2];
+                if let Ok(()) = std::io::Read::read_exact(&mut rx_file, &mut buf) {
+                    proxy_port = u16::from_be_bytes(buf);
+                    if proxy_port > 0 {
+                        tracing::info!("Proxy started inside netns on port {}", proxy_port);
+                    }
+                } else {
+                    tracing::error!("parent: failed to recv proxy port from proxy process");
+                }
+            }
+        }
+    }
+
+    Ok((dns_addr, proxy_port))
 }
 
 /// Child process entry point.
@@ -332,6 +496,9 @@ fn child_entry(
     strict: bool,
     notifier_enabled: bool,
     resolved_ips: &[(String, Vec<std::net::IpAddr>)],
+    proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
+    dns_cache: Option<DnsCache>,
+    canary_set: Option<&can_dlp::CanarySet>,
 ) -> Result<(), NamespaceError> {
     // Build clone flags for the first unshare: user + PID [+ net] namespaces.
     //
@@ -389,28 +556,18 @@ fn child_entry(
     // Wait for parent to start pasta and complete network setup.
     // The parent spawns pasta with --userns + --netns pointing at our
     // /proc/<pid>/ns/* paths. Pasta joins our user namespace first (to
-    // acquire CAP_SYS_ADMIN), then our network namespace.
-    //
-    // The parent also sends the DNS address that pasta configured inside
-    // the namespace. Protocol: u16 length (big-endian) + DNS address bytes.
+    // acquire CAP_SYS_ADMIN), then our network namespace. Once the
+    // proxy is also up, the parent emits the framed handshake; see
+    // `pipe_protocol` for the wire format.
     let mut net_r = std::fs::File::from(network_read);
-    let mut len_buf = [0u8; 2];
-    net_r
-        .read_exact(&mut len_buf)
+    let crate::pipe_protocol::NetworkHandshake {
+        proxy_port,
+        dns_addr,
+    } = crate::pipe_protocol::read_handshake(&mut net_r, can_net::pasta::PASTA_DNS_ADDR)
         .map_err(NamespaceError::UidMap)?;
-    let dns_len = u16::from_be_bytes(len_buf) as usize;
-    let dns_addr = if dns_len > 0 && dns_len < 256 {
-        let mut dns_buf = vec![0u8; dns_len];
-        net_r
-            .read_exact(&mut dns_buf)
-            .map_err(NamespaceError::UidMap)?;
-        String::from_utf8(dns_buf).unwrap_or_else(|_| can_net::pasta::PASTA_DNS_ADDR.to_string())
-    } else {
-        can_net::pasta::PASTA_DNS_ADDR.to_string()
-    };
     drop(net_r);
 
-    tracing::debug!(dns = %dns_addr, "network ready, continuing sandbox setup");
+    tracing::debug!(dns = %dns_addr, proxy_port, "network ready, continuing sandbox setup");
 
     // Now create the mount namespace. This is done as a second unshare() call
     // after pasta has started so that /proc/<child_pid>/ns/* paths remain
@@ -428,12 +585,20 @@ fn child_entry(
     // The supervisor runs as PID 1 inside the same user + PID namespace
     // as the sandboxed processes, so /proc/<pid>/mem access works.
     let supervisor_context = if notifier_enabled {
-        let policy = notifier::policy_from_config(config, resolved_ips, &dns_addr);
-        let dynamic_allowlist = notifier::DynamicAllowlist::new();
+        let policy = notifier::policy_from_config(
+            config,
+            resolved_ips,
+            &dns_addr,
+            dns_cache,
+            if proxy_port > 0 {
+                Some(proxy_port)
+            } else {
+                None
+            },
+        );
         tracing::info!(
             allowed_ips = policy.allowed_ips.len(),
             allowed_cidrs = policy.allowed_cidrs.len(),
-            allowed_domains = policy.allowed_domains.len(),
             allowed_exec_paths = policy.allowed_exec_paths.len(),
             allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
             "notifier policy built for supervisor"
@@ -441,7 +606,7 @@ fn child_entry(
         match notifier::create_fd_channel() {
             Ok((recv_fd, send_fd)) => {
                 tracing::debug!("created notifier fd channel (worker → PID-1 supervisor)");
-                Some((policy, dynamic_allowlist, recv_fd, send_fd))
+                Some((policy, recv_fd, send_fd))
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to create notifier fd channel");
@@ -562,6 +727,16 @@ fn child_entry(
         }
     }
 
+    // Write proxy CA to filesystem if provided.
+    let mut ca_cert_path = None;
+    if let Some(ca) = proxy_ca {
+        let ca_path = "/tmp/.canister-ca.crt";
+        match std::fs::write(ca_path, &ca.ca_cert_pem) {
+            Ok(_) => ca_cert_path = Some(ca_path.to_string()),
+            Err(e) => tracing::warn!("failed to write CA cert to {}: {}", ca_path, e),
+        }
+    }
+
     // Drop capabilities from the bounding set and clear effective/permitted.
     //
     // Inside a user namespace the process starts with ALL capabilities
@@ -613,6 +788,11 @@ fn child_entry(
     if notifier_enabled {
         // Retrieve the send end of the fd channel that was stashed by
         // enter_pid_namespace_supervised in the worker child.
+        // SAFETY-UNWRAP: NOTIFIER_SEND_FD is a process-local Mutex set by
+        // the same setup path before this point; only mutex poisoning could
+        // cause failure here, which would itself indicate a panic that
+        // already aborts the process. The expect() also encodes the
+        // setup-time invariant for readers.
         let send_fd = NOTIFIER_SEND_FD
             .lock()
             .unwrap()
@@ -679,7 +859,7 @@ fn child_entry(
 
     // Filter environment variables according to policy.
     // In monitor mode, log what would be stripped but pass full env through.
-    let filtered_env = if monitor {
+    let mut filtered_env = if monitor {
         let would_filter = process::filter_environment(&config.process);
         let full_env = process::full_environment();
         let stripped_count = full_env.len().saturating_sub(would_filter.len());
@@ -695,6 +875,39 @@ fn child_entry(
     } else {
         process::filter_environment(&config.process)
     };
+
+    if proxy_port > 0 {
+        let proxy_url = format!("http://127.0.0.1:{}", proxy_port);
+        if let Ok(e) = CString::new(format!("HTTP_PROXY={}", proxy_url)) {
+            filtered_env.push(e);
+        }
+        if let Ok(e) = CString::new(format!("HTTPS_PROXY={}", proxy_url)) {
+            filtered_env.push(e);
+        }
+        if let Ok(e) = CString::new(format!("http_proxy={}", proxy_url)) {
+            filtered_env.push(e);
+        }
+        if let Ok(e) = CString::new(format!("https_proxy={}", proxy_url)) {
+            filtered_env.push(e);
+        }
+
+        if let Some(path) = ca_cert_path {
+            if let Ok(e) = CString::new(format!("SSL_CERT_FILE={}", path)) {
+                filtered_env.push(e);
+            }
+            if let Ok(e) = CString::new(format!("NODE_EXTRA_CA_CERTS={}", path)) {
+                filtered_env.push(e);
+            }
+        }
+    }
+
+    if let Some(canaries) = canary_set {
+        for (key, val) in canaries.env_vars() {
+            if let Ok(e) = CString::new(format!("{key}={val}")) {
+                filtered_env.push(e);
+            }
+        }
+    }
 
     tracing::info!(
         command = %command_path.display(),
@@ -933,7 +1146,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 ///
 /// # Supervisor architecture
 ///
-/// When `supervisor_context` is `Some((policy, dynamic_allowlist, recv_fd, send_fd))`:
+/// When `supervisor_context` is `Some((policy, recv_fd, send_fd))`:
 /// - The intermediate process closes `send_fd`, receives the notifier fd
 ///   from the inner child via `recv_fd`, starts the supervisor thread,
 ///   waits for the inner child, then shuts down the supervisor.
@@ -983,12 +1196,7 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 /// - When it exits, the kernel kills all remaining processes in the
 ///   PID namespace
 fn enter_pid_namespace_supervised(
-    supervisor_context: Option<(
-        notifier::NotifierPolicy,
-        notifier::DynamicAllowlist,
-        OwnedFd,
-        OwnedFd,
-    )>,
+    supervisor_context: Option<(notifier::NotifierPolicy, OwnedFd, OwnedFd)>,
     dns_addr: &str,
 ) -> Result<(), NamespaceError> {
     // SAFETY: fork is safe here because we're in the child process after the
@@ -1033,7 +1241,7 @@ fn enter_pid_namespace_supervised(
                     );
                     Ok(())
                 }
-                Some((policy, dynamic_allowlist, recv_fd, send_fd)) => {
+                Some((policy, recv_fd, send_fd)) => {
                     // PID 1 becomes the supervisor. Fork a worker child.
                     //
                     // SAFETY: still single-threaded in the forked child.
@@ -1073,7 +1281,6 @@ fn enter_pid_namespace_supervised(
                                     let code = notifier::run_supervisor_with_child(
                                         notifier_fd,
                                         &policy,
-                                        &dynamic_allowlist,
                                         worker,
                                     );
                                     std::process::exit(code);
@@ -1096,6 +1303,8 @@ fn enter_pid_namespace_supervised(
 
                             // Stash the send fd for later — child_entry will
                             // retrieve it after installing the seccomp filter.
+                            // SAFETY-UNWRAP: process-local Mutex; poisoning
+                            // would require a prior panic that already aborts.
                             *NOTIFIER_SEND_FD.lock().unwrap() = Some(send_fd);
 
                             tracing::debug!(

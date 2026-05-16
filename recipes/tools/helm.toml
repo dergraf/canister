@@ -1,0 +1,24 @@
+[recipe]
+name = "tool:helm"
+description = "helm: config + cache + data dirs; repository credentials via env"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/helm",
+]
+allow_write = [
+    "$HOME/.cache/helm",
+    "$HOME/.local/share/helm",
+]
+
+[process]
+env_passthrough = [
+    "HELM_HOME",
+    "HELM_CACHE_HOME",
+    "HELM_CONFIG_HOME",
+    "HELM_DATA_HOME",
+    "HELM_DRIVER",
+    "HELM_NAMESPACE",
+    "KUBECONFIG",
+]

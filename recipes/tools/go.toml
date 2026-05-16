@@ -1,0 +1,34 @@
+[recipe]
+name = "tool:go"
+description = "go: GOPATH + module cache + config; GONOSUMCHECK/GOFLAGS via env"
+version = "1"
+
+[filesystem]
+allow = [
+    "$HOME/.config/go/env",
+]
+allow_write = [
+    "$HOME/go",
+    "$HOME/.cache/go-build",
+]
+
+[network]
+allow_domains = [
+    "proxy.golang.org",
+    "sum.golang.org",
+    "storage.googleapis.com",
+]
+
+[process]
+env_passthrough = [
+    "GOPATH",
+    "GOROOT",
+    "GOBIN",
+    "GOPROXY",
+    "GONOSUMCHECK",
+    "GONOSUMDB",
+    "GOPRIVATE",
+    "GOFLAGS",
+    "GOMODCACHE",
+    "CGO_ENABLED",
+]

@@ -178,6 +178,29 @@ enum RecipeAction {
         /// recipes would be auto-detected based on `match_prefix`.
         command: Vec<String>,
     },
+
+    /// Explain what a recipe does in human-readable form.
+    ///
+    /// Shows the recipe's declared paths (read-only, writable, denied),
+    /// which paths actually exist on the host, allowed domains, and
+    /// environment variables. Useful for debugging "why can't my tool
+    /// find its config?".
+    Explain {
+        /// Recipe name or path. Can be repeated.
+        #[arg(short, long, required = true)]
+        recipe: Vec<String>,
+    },
+
+    /// Suggest recipes for a command.
+    ///
+    /// Resolves the command binary and recommends tool recipes based on
+    /// binary name matching and `match_prefix` patterns. Output is a
+    /// ready-to-paste `tools = [...]` or `recipes = [...]` line.
+    Suggest {
+        /// The command to look up (not executed).
+        #[arg(required = true)]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -221,6 +244,8 @@ fn main() -> ExitCode {
         Commands::Recipe { action } => match action {
             RecipeAction::List => recipes::list(),
             RecipeAction::Show { recipe, command } => commands::show(&recipe, command),
+            RecipeAction::Explain { recipe } => recipes::explain(&recipe),
+            RecipeAction::Suggest { command } => recipes::suggest(&command),
         },
         Commands::Init {
             repo,

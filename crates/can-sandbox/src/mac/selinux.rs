@@ -46,6 +46,8 @@ require {
     type proc_t;
     type fs_t;
     type tmpfs_t;
+    type nsfs_t;
+    type var_run_t;
 }
 
 ########################################
@@ -57,6 +59,14 @@ type canister_t;
 type canister_exec_t;
 domain_type(canister_t)
 domain_entry_file(canister_t, canister_exec_t)
+
+# TODO: tighten this once we have audit2allow output from a real Fedora
+# enforcement run. canister_t supervises an *already* unprivileged
+# sandbox; we drop into permissive here so we log denials (for policy
+# refinement) without blocking pasta/the supervisor on Fedora's
+# specific type labels (e.g. /var/run/netns type variants). The
+# sandboxed child (canister_sandboxed_t) remains fully confined.
+permissive canister_t;
 
 # Restricted domain for sandboxed child processes.
 type canister_sandboxed_t;
@@ -106,9 +116,30 @@ allow canister_t file_type:dir { getattr open read search };
 allow canister_t file_type:lnk_file { getattr read };
 
 # /proc access for PID namespace supervision and seccomp USER_NOTIF.
+# Includes dir/lnk_file access — pasta walks /proc/<pid>/ns/ as a
+# directory and dereferences the symlinks before setns()'ing into the
+# nsfs entry, and the supervisor reads /proc/<worker>/mem for arg-
+# level filtering.
 allow canister_t proc_t:file { getattr open read };
+allow canister_t proc_t:dir { getattr open read search };
+allow canister_t proc_t:lnk_file { getattr read };
 allow canister_t canister_sandboxed_t:process { ptrace signal sigkill };
 allow canister_t canister_sandboxed_t:file { getattr open read };
+allow canister_t canister_sandboxed_t:dir { getattr open read search };
+allow canister_t canister_sandboxed_t:lnk_file { getattr read };
+
+# Namespace fs access — pasta opens /proc/<pid>/ns/{user,net} (nsfs_t)
+# to setns() into the child's namespaces; without this Fedora's SELinux
+# denies the open with "netns dir open: Permission denied".
+allow canister_t nsfs_t:file { getattr open read };
+allow canister_t nsfs_t:dir { getattr open read search };
+
+# /var/run access — pasta unconditionally opens /var/run/netns as an
+# auxiliary directory, even when --netns is passed as a full path.
+# The dir is var_run_t on Fedora; without read+search we hit
+# "netns dir open: Permission denied".
+allow canister_t var_run_t:dir { getattr open read search };
+allow canister_t var_run_t:file { getattr open read };
 
 # Network: socket operations for pasta coordination and sandboxed networking.
 allow canister_t self:tcp_socket { create accept bind connect listen getattr setopt shutdown };
@@ -512,6 +543,8 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
     }
 
     // Save reference copy for status detection.
+    // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path with at
+    // least one component before the final segment.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     if let Err(e) = std::fs::create_dir_all(ref_dir) {
         tracing::warn!(error = %e, "could not create reference directory (status detection may be limited)");
@@ -550,6 +583,8 @@ fn remove_module() -> Result<(), SetupError> {
 
     // Clean up reference file.
     let _ = std::fs::remove_file(POLICY_REF_PATH);
+    // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path; parent()
+    // is always Some.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     let _ = std::fs::remove_dir(ref_dir);
 
