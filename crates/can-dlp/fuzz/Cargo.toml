@@ -1,0 +1,47 @@
+[package]
+name = "can-dlp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+can-dlp = { path = ".." }
+
+[[bin]]
+name = "fuzz_decode_layers"
+path = "fuzz_targets/fuzz_decode_layers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_normalize"
+path = "fuzz_targets/fuzz_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_unescape"
+path = "fuzz_targets/fuzz_unescape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_detectors"
+path = "fuzz_targets/fuzz_detectors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_full_scanner"
+path = "fuzz_targets/fuzz_full_scanner.rs"
+test = false
+doc = false
+bench = false

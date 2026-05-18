@@ -6,18 +6,33 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "experimental-h2c")]
 use tracing::error;
+use tracing::warn;
 
-pub fn build_upstream_uri(
-    req: &Request<hyper::body::Incoming>,
+/// Header the sandboxed worker used to be able to set to switch the proxy's
+/// upstream scheme. Now ignored — kept as a constant for the
+/// `client_header_ignored` warning log.
+const LEGACY_SCHEME_HEADER: &str = "x-canister-upstream-scheme";
+
+pub fn build_upstream_uri<B>(
+    req: &Request<B>,
     host: &str,
     default_scheme: &'static str,
+    recipe_scheme: Option<&str>,
 ) -> Result<(hyper::Uri, String), String> {
-    let original_scheme = req
-        .headers()
-        .get("x-canister-upstream-scheme")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_else(|| req.uri().scheme_str().unwrap_or(default_scheme))
-        .to_string();
+    // Refuse to be steered by a client-controlled header. The sandboxed
+    // process can no longer pick `h2c` (or anything else) by setting
+    // `x-canister-upstream-scheme` — that's a recipe-level decision now
+    // (R11 in the DLP plan). If we see the header, log a warning so the
+    // configurer notices their app is trying to use the old mechanism.
+    if req.headers().contains_key(LEGACY_SCHEME_HEADER) {
+        warn!(
+            "ignoring client-supplied {} header; set [proxy] upstream_scheme in the recipe instead",
+            LEGACY_SCHEME_HEADER
+        );
+    }
+
+    let inferred = req.uri().scheme_str().unwrap_or(default_scheme);
+    let original_scheme = recipe_scheme.unwrap_or(inferred).to_string();
 
     let authority = req
         .uri()
@@ -38,7 +53,7 @@ pub fn build_upstream_uri(
     let scheme = if original_scheme == "h2c" {
         "http"
     } else {
-        req.uri().scheme_str().unwrap_or(default_scheme)
+        inferred
     };
 
     let uri = format!("{}://{}{}", scheme, authority, path_and_query)
@@ -100,4 +115,47 @@ pub async fn forward_h2c_request(
     _req: Request<BoxBody<Bytes, hyper::Error>>,
 ) -> Result<Response<hyper::body::Incoming>, String> {
     Err("h2c forwarding disabled (build with feature: experimental-h2c)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Empty;
+
+    #[test]
+    fn client_header_no_longer_drives_scheme() {
+        // R11 regression: a sandboxed worker that sets
+        // `x-canister-upstream-scheme: h2c` must NOT cause the proxy to
+        // emit h2c upstream. The recipe is the only source of truth.
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/api")
+            .header(LEGACY_SCHEME_HEADER, "h2c")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let (_uri, scheme) = build_upstream_uri(&req, "example.com", "http", None).unwrap();
+        assert_eq!(scheme, "http", "client header must not influence scheme");
+    }
+
+    #[test]
+    fn recipe_scheme_overrides_inferred() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/api")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let (_uri, scheme) = build_upstream_uri(&req, "example.com", "http", Some("h2c")).unwrap();
+        assert_eq!(scheme, "h2c");
+    }
+
+    #[test]
+    fn no_recipe_uses_request_uri_scheme() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://example.com/api")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let (_uri, scheme) = build_upstream_uri(&req, "example.com", "http", None).unwrap();
+        assert_eq!(scheme, "https");
+    }
 }

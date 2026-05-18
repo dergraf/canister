@@ -206,9 +206,13 @@ async fn start_dlp_proxy(
     canaries: Vec<String>,
 ) -> SocketAddr {
     let ca = Arc::new(DynamicCa::generate().unwrap());
+    // All DLP tests target an upstream bound to 127.0.0.1, so the network
+    // policy needs to allow that IP literal. allow_domains is for FQDNs
+    // (DLP credential scoping); allow_ips gates IP-literal egress.
     let network = NetworkConfig {
         egress: Some(EgressMode::ProxyOnly),
         allow_domains,
+        allow_ips: vec!["127.0.0.1".to_string()],
         dlp: None,
         ..Default::default()
     };
@@ -281,7 +285,7 @@ async fn dlp_blocks_github_pat_in_header_to_wrong_host() {
         res.headers()
             .get("x-canister-dlp-detector")
             .and_then(|v| v.to_str().ok()),
-        Some("GithubPat"),
+        Some("github_pat"),
     );
 }
 
@@ -322,7 +326,7 @@ async fn dlp_blocks_ssh_private_key_in_header() {
         res.headers()
             .get("x-canister-dlp-detector")
             .and_then(|v| v.to_str().ok()),
-        Some("SshPrivateKey"),
+        Some("ssh_private_key"),
     );
 }
 
@@ -424,7 +428,7 @@ async fn dlp_canary_token_always_blocked() {
         res.headers()
             .get("x-canister-dlp-detector")
             .and_then(|v| v.to_str().ok()),
-        Some("CanaryToken"),
+        Some("canary_token"),
     );
 }
 

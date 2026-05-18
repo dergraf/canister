@@ -23,8 +23,23 @@ set -euo pipefail
 # Root of the canister project (two levels up from tests/integration/)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# Binary location — prefer release build, fall back to debug
-if [[ -x "${REPO_ROOT}/target/release/can" ]]; then
+# Binary location.
+# - Honour CAN_BIN env override (CI / multi-build matrices).
+# - Otherwise prefer whichever build is newer. `can setup` installs an
+#   AppArmor profile bound to a specific binary path, so when both builds
+#   exist locally only one of them is allowed to call unshare(CLONE_NEWUSER)
+#   on kernels with apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04+).
+#   Picking the newer build matches "the one the developer just rebuilt
+#   and ran `can setup` against."
+if [[ -n "${CAN_BIN:-}" ]]; then
+    CAN="${CAN_BIN}"
+elif [[ -x "${REPO_ROOT}/target/release/can" && -x "${REPO_ROOT}/target/debug/can" ]]; then
+    if [[ "${REPO_ROOT}/target/debug/can" -nt "${REPO_ROOT}/target/release/can" ]]; then
+        CAN="${REPO_ROOT}/target/debug/can"
+    else
+        CAN="${REPO_ROOT}/target/release/can"
+    fi
+elif [[ -x "${REPO_ROOT}/target/release/can" ]]; then
     CAN="${REPO_ROOT}/target/release/can"
 elif [[ -x "${REPO_ROOT}/target/debug/can" ]]; then
     CAN="${REPO_ROOT}/target/debug/can"
