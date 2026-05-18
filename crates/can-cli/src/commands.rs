@@ -303,7 +303,7 @@ fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
     }
 
     // 4. Apply manifest-level overrides as the final layer.
-    let overrides = Manifest::sandbox_as_recipe(def);
+    let overrides: can_policy::RecipeFile = def.into();
     merged = merged.merge(overrides);
 
     merged
