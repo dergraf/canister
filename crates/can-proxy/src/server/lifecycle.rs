@@ -31,6 +31,10 @@ pub struct ProxyServerConfig {
     pub strict: bool,
     pub monitor: bool,
     pub canaries: Vec<String>,
+    /// In-netns address that pasta maps to host:127.0.0.1. Set by
+    /// the sandbox after `setns()` when `network.allow_host_loopback`
+    /// is `true`; used to resolve the `host.canister.local` alias.
+    pub host_loopback_target: Option<std::net::IpAddr>,
 }
 
 impl ProxyServerConfig {
@@ -42,6 +46,7 @@ impl ProxyServerConfig {
             strict: false,
             monitor: false,
             canaries: Vec::new(),
+            host_loopback_target: None,
         }
     }
 
@@ -69,6 +74,11 @@ impl ProxyServerConfig {
         self.canaries = canaries;
         self
     }
+
+    pub fn with_host_loopback_target(mut self, target: std::net::IpAddr) -> Self {
+        self.host_loopback_target = Some(target);
+        self
+    }
 }
 
 pub struct ProxyServer {
@@ -83,10 +93,11 @@ impl ProxyServer {
     pub fn new(config: ProxyServerConfig) -> Result<Self, ProxyError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let outbound_policy = match &config.network {
+        let mut outbound_policy = match &config.network {
             Some(network) => OutboundPolicy::from_config(network),
             None => OutboundPolicy::default(),
         };
+        outbound_policy.host_loopback_target = config.host_loopback_target;
         let limits = ProxyLimits::from_config(&config.proxy);
         let dlp = DlpCtx::from_config(&config)?;
 

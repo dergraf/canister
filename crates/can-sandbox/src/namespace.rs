@@ -352,6 +352,7 @@ fn setup_parent_network(
 
     let pasta_config = can_net::pasta::PastaConfig {
         ports: config.network.ports.clone(),
+        allow_host_loopback: config.network.allow_host_loopback,
         child_pid: Some(child_pid),
     };
 
@@ -409,13 +410,26 @@ fn setup_parent_network(
                     }
                 };
 
+                // Detect the in-netns default gateway *after* setns. When
+                // `allow_host_loopback` is on, this is the address pasta
+                // maps to the host's 127.0.0.1, so the proxy uses it as
+                // the dial target for the `host.canister.local` alias.
+                let host_loopback_target = if config.network.allow_host_loopback {
+                    can_net::pasta::detect_default_gateway().map(std::net::IpAddr::V4)
+                } else {
+                    None
+                };
+
                 rt.block_on(async {
-                    let proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
+                    let mut proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
                         .with_network(config.network.clone())
                         .with_proxy_config(config.proxy.clone())
                         .with_strict(config.strict)
                         .with_monitor(monitor)
                         .with_canaries(canary_values);
+                    if let Some(target) = host_loopback_target {
+                        proxy_server_config = proxy_server_config.with_host_loopback_target(target);
+                    }
                     let server = match can_proxy::server::ProxyServer::new(proxy_server_config) {
                         Ok(s) => s,
                         Err(e) => {

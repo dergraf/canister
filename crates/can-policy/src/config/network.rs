@@ -32,6 +32,19 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub ports: Vec<PortMapping>,
 
+    /// Allow the sandbox to reach host loopback services through the
+    /// egress proxy via the magic alias `host.canister.local`.
+    ///
+    /// When `true`, pasta keeps its default mapping of host loopback to
+    /// the namespace gateway, and the proxy rewrites the dial target of
+    /// requests whose `Host` header is `host.canister.local` to that
+    /// gateway IP. Only HTTP/HTTPS are supported (raw TCP still goes
+    /// through the proxy's network gate).
+    ///
+    /// Disabled by default — opt in per-recipe.
+    #[serde(default)]
+    pub allow_host_loopback: bool,
+
     /// Data Loss Prevention configuration for the egress proxy.
     #[serde(default)]
     pub dlp: Option<DlpConfig>,
@@ -49,6 +62,7 @@ impl NetworkConfig {
             allow_domains: union_vecs(self.allow_domains, overlay.allow_domains),
             allow_ips: union_vecs(self.allow_ips, overlay.allow_ips),
             ports: union_vecs(self.ports, overlay.ports),
+            allow_host_loopback: self.allow_host_loopback || overlay.allow_host_loopback,
             dlp: merge_dlp(self.dlp, overlay.dlp),
         }
     }

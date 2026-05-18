@@ -171,6 +171,17 @@ pub struct PastaConfig {
     /// Port forwarding rules (empty = no port forwarding).
     pub ports: Vec<PortMapping>,
 
+    /// Allow the sandbox to reach the host's loopback through the
+    /// namespace's default gateway.
+    ///
+    /// When `false` (default) pasta is invoked with `--no-map-gw` /
+    /// `--map-host-loopback none` so the sandbox cannot reach host
+    /// services via gateway → host:127.0.0.1 mapping. When `true`,
+    /// those flags are omitted and pasta defaults to mapping host
+    /// loopback to the gateway IP, which the proxy can use to forward
+    /// requests for `host.canister.local`.
+    pub allow_host_loopback: bool,
+
     /// PID of the child process whose network namespace to join.
     ///
     /// pasta is invoked with:
@@ -286,10 +297,17 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
     // across both old and transitional pastas. Fall back to
     // `--map-host-loopback none` only when `--no-map-gw` has actually been
     // removed.
-    if pasta_supports_option("--no-map-gw") {
-        cmd.arg("--no-map-gw");
-    } else if pasta_supports_option("--map-host-loopback") {
-        cmd.arg("--map-host-loopback").arg("none");
+    //
+    // When `allow_host_loopback` is true we skip these flags entirely so
+    // pasta's default mapping (host loopback ↔ gateway IP) stays in place;
+    // the proxy's `host.canister.local` alias uses that gateway to reach
+    // host services.
+    if !config.allow_host_loopback {
+        if pasta_supports_option("--no-map-gw") {
+            cmd.arg("--no-map-gw");
+        } else if pasta_supports_option("--map-host-loopback") {
+            cmd.arg("--map-host-loopback").arg("none");
+        }
     }
 
     // Port forwarding setup.

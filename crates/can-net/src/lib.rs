@@ -165,6 +165,7 @@ mod tests {
             allow_domains: vec!["example.com".to_string()],
             allow_ips: vec![],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
@@ -177,6 +178,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
@@ -189,6 +191,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec![],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Full);
@@ -216,6 +219,7 @@ mod tests {
                 container_port: 80,
                 protocol: PortProtocol::Tcp,
             }],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);

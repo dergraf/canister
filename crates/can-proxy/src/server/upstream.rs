@@ -11,7 +11,7 @@ use hyper_util::rt::TokioIo;
 use tracing::error;
 
 use crate::egress;
-use crate::policy::OutboundPolicy;
+use crate::policy::{HOST_LOOPBACK_ALIAS, OutboundPolicy};
 
 pub(super) async fn forward_upstream(
     dns_cache: &can_net::dns_cache::DnsCache,
@@ -36,6 +36,10 @@ pub(super) async fn forward_upstream(
         .port_u16()
         .unwrap_or(if original_scheme == "https" { 443 } else { 80 });
 
+    // `connect_via_cache` internally rewrites `host.canister.local`
+    // to the in-netns gateway IP that pasta maps to the host's
+    // 127.0.0.1. The TLS handshake below still uses the original host
+    // name so server-cert validation stays sane.
     let stream = connect_via_cache(dns_cache, &host, port, outbound_policy)
         .await
         .map_err(|e| format!("upstream connect to {host}:{port} failed: {e}"))?;
@@ -104,12 +108,24 @@ fn build_upstream_tls_connector() -> Result<tokio_rustls::TlsConnector, std::io:
 /// Connect to `host:port`, honouring the outbound policy at every gate
 /// (IP literals checked against `allow_ips`, DNS names checked against
 /// `allow_domains`, resolved IPs checked against `allow_ips` again).
+///
+/// `host.canister.local` is rewritten to `outbound_policy.host_loopback_target`
+/// when set — see [`HOST_LOOPBACK_ALIAS`] for the rationale.
 pub(super) async fn connect_via_cache(
     dns_cache: &can_net::dns_cache::DnsCache,
     host: &str,
     port: u16,
     outbound_policy: &OutboundPolicy,
 ) -> Result<tokio::net::TcpStream, std::io::Error> {
+    if host.eq_ignore_ascii_case(HOST_LOOPBACK_ALIAS) {
+        let Some(target) = outbound_policy.host_loopback_target else {
+            return Err(std::io::Error::other(
+                "host.canister.local used but [network] allow_host_loopback is false",
+            ));
+        };
+        return tokio::net::TcpStream::connect((target, port)).await;
+    }
+
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if !outbound_policy.allows_ip_literal(ip) {
             return Err(std::io::Error::other("ip not allowed by policy"));

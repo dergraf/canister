@@ -148,6 +148,7 @@ mod tests {
             allow_domains: vec!["pypi.org".to_string()],
             allow_ips: vec![],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_domain("pypi.org", &config), AccessDecision::Allow);
@@ -165,6 +166,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec![],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_domain("anything.com", &config), AccessDecision::Allow);
@@ -177,6 +179,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.1".to_string()],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
@@ -190,6 +193,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
@@ -206,6 +210,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_ip("not-an-ip", &config), AccessDecision::Deny);
@@ -218,6 +223,7 @@ mod tests {
             allow_domains: vec![],
             allow_ips: vec!["fd00::/8".to_string()],
             ports: vec![],
+            allow_host_loopback: false,
             dlp: None,
         };
         assert_eq!(check_ip("fd00::1", &config), AccessDecision::Allow);
