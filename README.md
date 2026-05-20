@@ -12,7 +12,9 @@
   <a href="#configuration">Configuration</a> &middot;
   <a href="docs/ARCHITECTURE.md">Architecture</a> &middot;
   <a href="docs/CONFIGURATION.md">Config Reference</a> &middot;
-  <a href="docs/SECCOMP.md">Seccomp Filtering</a>
+  <a href="docs/DLP.md">DLP</a> &middot;
+  <a href="docs/refusals.md">Refusals</a> &middot;
+  <a href="docs/SECCOMP.md">Seccomp</a>
 </p>
 
 ---
@@ -36,7 +38,9 @@ discarded.
 - **Filesystem isolation** -- ephemeral overlay with read-only bind mounts; writes discarded on exit
 - **Project manifests** -- define named sandboxes in `canister.toml` and run them with `can up`; recipes declared per-sandbox, overrides for filesystem/network/syscalls, dry-run preview
 - **Package manager support** -- auto-detects and mounts binaries from Nix, Homebrew, Guix, Snap, Cargo, and other non-standard install locations
-- **Network isolation** -- three modes: no network, filtered (domain/IP allow list via pasta), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
+- **Network isolation** -- three modes: no network, filtered (FQDN/IP allow list via pasta + a local L7 proxy), or full; port forwarding (`-p`); each sandbox gets its own isolated network namespace
+- **Per-destination egress contracts** -- one `[[host]]` block per upstream declares the allowed methods, content types, paths, body size, and DLP credential scope; refused requests get a `415` with a copy-pasteable patch in the response body. Closes the "POST `image/png` to a JSON-only API" class of exfil. See [docs/refusals.md](docs/refusals.md).
+- **DLP (Data Loss Prevention)** -- L7 proxy scans outbound HTTP for ~14 credential types (GitHub PAT, AWS access key, OpenAI / Anthropic keys, npm tokens, SSH private keys, session canaries, …) through every encoding chain (base64 / hex / percent / gzip / zlib / zstd / ascii85 / utf16-le) and structured payload format (JSON, multipart, form-urlencoded, XML, HTTP/1.1 trailers). See [docs/DLP.md](docs/DLP.md).
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~187 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
 - **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `sendmsg()` (blocks SCM_RIGHTS fd passing), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw sockets, restrict AF_NETLINK to NETLINK_ROUTE only), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve allow list with prefix rules (`/nix/store/*`)
@@ -44,7 +48,7 @@ discarded.
 - **Credential protection** -- recipes explicitly deny sensitive paths (`$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`, etc.); cargo credentials excluded from the cargo recipe via deny rules
 - **Recipe lifecycle** -- `can init` / `can update` download community recipes from GitHub via `git clone`
 - **Resource limits** -- cgroups v2 enforcement of memory and CPU limits
-- **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS instead of EPERM
+- **Strict mode** -- `--strict` flag for CI/production: seccomp uses KILL_PROCESS instead of EPERM, DLP scanning is implicitly enabled when `egress = "proxy-only"`, and generic high-entropy detections are promoted from Warn to Block
 - **Fail-by-default** -- sandbox aborts when isolation cannot be established; all setup failures are fatal
 - **Monitor mode** -- run with `--monitor` to observe what would be blocked without enforcing, then iterate on your policy
 - **Recipe inspection** -- `can recipe show` emits the fully resolved policy as valid TOML for auditing or creating standalone recipes
@@ -233,7 +237,7 @@ can run -r my-custom.toml -- mix test
 
 ## How It Works
 
-Canister combines ten Linux isolation mechanisms:
+Canister combines twelve isolation mechanisms:
 
 ```
                           can run -- python3 script.py
@@ -314,6 +318,22 @@ Canister combines ten Linux isolation mechanisms:
     RLIMIT_CORE=0. These provide defense against fork bombs, memory exhaustion,
     and core dump leakage even without explicit `[resources]` in the recipe.
 
+11. **L7 egress proxy + contract gate** -- in `proxy-only` mode, the sandbox's
+    only outbound route is a local HTTP/HTTPS proxy (the proxy port is the
+    only IP the supervisor allows `connect()` to). Every request is checked
+    against the matching `[[host]]` contract first — method, content-type,
+    path, body-size — and refused with `415` + an actionable patch in the
+    response body before any DLP scan runs.
+
+12. **DLP scanner** -- runs inside the proxy. ~14 credential detectors
+    (GitHub PAT, AWS key, OpenAI / Anthropic keys, npm token, SSH private
+    keys, session canaries, …) walk every header, URI segment, JSON path,
+    form value, multipart part, XML node, and HTTP/1.1 trailer through an
+    encoding-chain decoder (base64 / hex / percent / gzip / zlib / zstd /
+    ascii85 / utf16-le) and a normalize pass (strip separators, unicode
+    normalize, unescape). Per-host `allow_credentials` lists downgrade
+    legitimate flows from Block to Warn. See [docs/DLP.md](docs/DLP.md).
+
 For a detailed walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Recipe Composition
@@ -372,6 +392,17 @@ match_prefix = ["$HOME/.cargo"]
 These replace hardcoded prefix detection -- adding support for a new package
 manager is "write a .toml file" not "modify Rust code".
 
+### Tool & service contracts
+
+| Bundle              | What it ships                                  | Usage                |
+|---------------------|------------------------------------------------|----------------------|
+| `recipes/tools/`    | Per-tool filesystem + env passthrough (npm, gh, pip, cargo, kubectl, helm, …) | `tools = ["npm", "gh"]` in the manifest |
+| `recipes/services/` | Per-upstream `[[host]]` contracts: method, content-type, body-size, credential scope (github, openai, anthropic, npm, pypi, huggingface, docker, aws, stripe, slack) | `recipes = ["service:github", "service:openai"]` |
+
+A service contract refusing a request emits a 415 with a copy-pasteable
+`[[host]]` patch in the body — paste the three lines into your
+`canister.toml` to extend the contract for your project.
+
 ## Configuration
 
 Canister uses TOML recipe files. All fields have sensible defaults.
@@ -389,17 +420,22 @@ allow = ["/usr/lib", "/usr/bin", "/tmp/workspace", "$HOME/.config"]
 deny  = ["/etc/shadow"]
 
 [network]
+egress        = "proxy-only"        # default
+allow_ips     = ["10.0.0.0/8"]      # IP-literal egress
+contract_mode = "strict"            # default; refuse hosts with no [[host]] block
+
+# One [[host]] per upstream — see docs/refusals.md.
 [[host]]
-domain = "pypi.org"
+domain        = "pypi.org"
+methods       = ["GET", "HEAD"]
+content_types = ["application/json"]
 
 [[host]]
-domain = "files.pythonhosted.org"
-allow_ips     = ["10.0.0.0/8"]
-egress        = "proxy-only"   # default
+domain = "files.pythonhosted.org"   # CDN; minimal block = allow with no shape gate
 
 [process]
-max_pids       = 64
-allow_execve   = ["/usr/bin/python3", "/nix/store/*"]  # prefix rules with /*
+max_pids        = 64
+allow_execve    = ["/usr/bin/python3", "/nix/store/*"]  # prefix rules with /*
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [resources]
@@ -407,9 +443,9 @@ memory_mb   = 512
 cpu_percent = 50
 
 [syscalls]
-seccomp_mode = "allow-list"  # default; or "deny-list"
-allow_extra  = ["ptrace"]    # add to the default baseline
-deny_extra   = ["personality"] # remove from the baseline and explicitly deny
+seccomp_mode = "allow-list"     # default; or "deny-list"
+allow_extra  = ["ptrace"]       # add to the default baseline
+deny_extra   = ["personality"]  # remove from the baseline and explicitly deny
 ```
 
 For complete reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
@@ -421,11 +457,17 @@ The network mode is determined from `[network].egress` plus allowlists/ports:
 | Config | Mode | Behavior |
 |--------|------|----------|
 | `egress = "none"` | **None** | Empty network namespace, loopback only |
-| `egress = "proxy-only"` | **Filtered** | Outbound traffic must use local proxy; direct egress blocked |
+| `egress = "proxy-only"` | **Filtered** | Outbound HTTP/HTTPS must use the local L7 proxy; direct egress blocked; the contract gate refuses any request that doesn't match a `[[host]]` block (default `contract_mode = "strict"`) |
 | `egress = "direct"` (no allowlists/ports) | **Full** | No network isolation (trust mode) |
-| `egress = "direct"` (with allowlists/ports) | **Filtered** | Direct egress with policy checks and filtered namespace |
+| `egress = "direct"` (with allowlists/ports) | **Filtered** | Direct egress with seccomp policy checks against pre-resolved `[[host]]` IPs and `allow_ips` |
 
 Filtered mode requires `pasta` installed (`sudo apt install passt` on Debian/Ubuntu, `sudo dnf install passt` on Fedora).
+
+In `proxy-only` mode (the default), the contract gate runs **before**
+the DLP scanner: a `POST image/png` to a JSON-only API is refused
+with a `415` + a copy-pasteable patch in the response body, without
+ever decoding the request body. See [docs/refusals.md](docs/refusals.md)
+for the operator walkthrough.
 
 ### Port Forwarding
 
@@ -468,6 +510,8 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 | Environment filtering | Host env leakage | N/A (applied at exec) |
 | RLIMIT_NPROC | Fork bombs | Kernel exploit |
 | Read-only bind mounts | Write access | Remount (blocked by seccomp) |
+| Contract gate (`[[host]]`) | Wrong request shape (method / CT / path / size) to a known upstream | A `[[host]]` block that explicitly permits the shape |
+| DLP scanner | Outbound credential bytes (post decode chain + normalize) | A novel credential pattern, an unknown encoding, or a host with explicit `allow_credentials` |
 
 **What Canister does NOT protect against:**
 
@@ -491,6 +535,8 @@ not expected to carry kernel exploits.
 - Untrusted code consuming unbounded memory or CPU
 - Untrusted code leaking host environment variables (API keys, tokens)
 - Untrusted code executing unauthorized binaries (USER_NOTIF intercepts `execve()`/`execveat()`)
+- Untrusted code sending the wrong shape of request to a known upstream — `POST image/png` to a JSON-only API, `DELETE` to a read-only API, oversize uploads (contract gate)
+- Untrusted code exfiltrating credentials over HTTP — even when wrapped in `base64(gzip(strip_separators(token)))` or hidden in HTTP/1.1 trailers, multipart parts, XML attributes, or form values (DLP scanner)
 - Fork bombs and resource exhaustion within the sandbox
 - x32 ABI syscall bypass attempts
 - Namespace escape via clone/clone3 flags (USER_NOTIF blocks namespace creation)
@@ -553,35 +599,42 @@ transitions and permission grants.
 canister/
 ├── crates/
 │   ├── can-cli/        # CLI binary (clap): commands, can up, recipe resolution, can init/update
-│   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp, process control
+│   ├── can-sandbox/    # Core runtime: namespaces, overlay, seccomp, USER_NOTIF supervisor, process control
 │   ├── can-policy/     # Config parsing, recipe merge, manifest (canister.toml), env var expansion
 │   ├── can-net/        # Network isolation: netns, pasta, DNS proxy
+│   ├── can-proxy/      # L7 egress proxy: outbound policy, contract gate, MITM TLS, DLP enforcement
+│   ├── can-dlp/        # DLP detection engine: detector registry, encoding-chain decoder, structured walkers, proptest harness
+│   ├── can-docgen/     # mdBook reference generator (config.md, manifest.md, merge.md, recipes.md, cli.md)
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
-│   ├── default.toml    # Default seccomp baseline (embedded + overridable)
-│   ├── base.toml       # Essential OS bind mounts (embedded + overridable)
-│   ├── nix.toml        # Nix package manager (auto-detected)
-│   ├── homebrew.toml   # Homebrew/Linuxbrew (auto-detected)
-│   ├── cargo.toml      # Rust/Cargo toolchain (auto-detected)
-│   ├── snap.toml       # Snap packages (auto-detected)
-│   ├── flatpak.toml    # Flatpak applications (auto-detected)
-│   ├── gnu-store.toml  # GNU Guix (auto-detected)
-│   ├── elixir.toml     # Elixir/Erlang development recipe
-│   ├── opencode.toml   # OpenCode AI coding agent recipe
-│   ├── example.toml    # Example recipe (all options documented)
-│   ├── python-pip.toml # Python pip install recipe
-│   ├── node-build.toml # Node.js build recipe
-│   └── generic-strict.toml # Strict no-network recipe for CI
+│   ├── default.toml         # Default seccomp baseline (embedded + overridable)
+│   ├── base.toml            # Essential OS bind mounts (embedded + overridable)
+│   ├── nix.toml             # Nix package manager (auto-detected)
+│   ├── homebrew.toml        # Homebrew/Linuxbrew (auto-detected)
+│   ├── cargo.toml           # Rust/Cargo toolchain (auto-detected)
+│   ├── snap.toml            # Snap packages (auto-detected)
+│   ├── flatpak.toml         # Flatpak applications (auto-detected)
+│   ├── gnu-store.toml       # GNU Guix (auto-detected)
+│   ├── elixir.toml          # Elixir/Erlang development recipe
+│   ├── neovim.toml          # Neovim editor recipe
+│   ├── opencode.toml        # OpenCode AI coding agent recipe
+│   ├── python-pip.toml      # Python pip install recipe
+│   ├── node-build.toml      # Node.js build recipe
+│   ├── generic-strict.toml  # Strict no-network recipe for CI
+│   ├── example.toml         # Example recipe (all options documented)
+│   ├── checksums.toml       # SHA-256 pinning for shipped recipes (R16 trust)
+│   ├── tools/               # Per-tool bundles (gh, git, npm, pnpm, yarn, pip, poetry, uv, cargo, rustup, go, helm, kubectl, gpg-public, ssh-agent, docker-config, podman-config)
+│   └── services/            # Per-upstream [[host]] contracts (github, openai, anthropic, npm, pypi, huggingface, docker, aws, stripe, slack)
 ├── docs/
-│   ├── ARCHITECTURE.md # Design and execution flow
-│   ├── CONFIGURATION.md# Complete config reference (incl. canister.toml)
-│   ├── SECCOMP.md      # Seccomp baseline and filtering docs
-│   └── adr/            # Architecture Decision Records
-│       ├── 0001-recipes-over-profiles.md
-│       ├── 0002-recipe-composition-and-lifecycle.md
-│       └── 0005-project-manifest-and-recipe-sources.md
+│   ├── ARCHITECTURE.md    # Design and execution flow
+│   ├── CONFIGURATION.md   # Complete config reference (incl. canister.toml + [[host]])
+│   ├── SECCOMP.md         # Seccomp baseline and filtering docs
+│   ├── DLP.md             # DLP threat model + detector list
+│   ├── DLP-PROPTEST.md    # How the DLP proptest harness works
+│   ├── refusals.md        # Operator-facing 415-vs-451 guide
+│   └── adr/               # Architecture Decision Records (0001–0007)
 ├── tests/
-│   └── integration/    # Bash integration tests (15 test files)
+│   └── integration/    # Bash integration tests (32 test files)
 └── .github/
     └── workflows/      # CI configuration
 ```
