@@ -15,10 +15,8 @@ allow_write = [
 ]
 
 [network]
-allow_domains = [
-    "static.rust-lang.org",
-]
-
+[[host]]
+domain = "static.rust-lang.org"
 [process]
 env_passthrough = [
     "RUSTUP_HOME",

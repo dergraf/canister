@@ -792,7 +792,7 @@ fn socket_unknown_domain_denied() {
 ///
 /// This is the core "domain → dynamic IP → connect allowed" path
 /// — broken in this flow, the supervisor never honours a recipe's
-/// allow_domains for direct connects.
+/// `[[host]]` allow-set for direct connects.
 #[test]
 fn dynamic_allowlist_refresh_closes_the_loop() {
     use can_net::dns_cache::DnsCache;

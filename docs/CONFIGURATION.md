@@ -21,6 +21,7 @@ When no config file is provided (`can run -- command`), default policy uses
 - [recipe (metadata)](#recipe-metadata)
 - [filesystem](#filesystem)
 - [network](#network)
+- [[host]](#host)
 - [network.dlp](#networkdlp)
 - [process](#process)
 - [resources](#resources)
@@ -53,8 +54,8 @@ command = "nvim"
 [sandbox.dev.filesystem]
 allow_write = ["$HOME/.local/share/nvim"]
 
-[sandbox.dev.network]
-allow_domains = ["api.myproject.dev"]
+[[sandbox.dev.host]]
+domain = "api.myproject.dev"
 
 [sandbox.test]
 description = "Mix test runner"
@@ -87,7 +88,8 @@ Each sandbox can include optional override sections that merge on top of the
 composed recipes. These use the same schema as recipe files:
 
 - `[sandbox.<name>.filesystem]` — `allow`, `allow_write`, `deny`
-- `[sandbox.<name>.network]` — `egress`, `allow_domains`, `allow_ips`, `ports`
+- `[sandbox.<name>.network]` — `egress`, `allow_ips`, `ports`, `contract_mode`
+- `[[sandbox.<name>.host]]` — one or more per-destination contracts (see [`[[host]]`](#host) below)
 - `[sandbox.<name>.process]` — `max_pids`, `allow_execve`, `env_passthrough`
 - `[sandbox.<name>.resources]` — `memory_mb`, `cpu_percent`
 - `[sandbox.<name>.syscalls]` — `allow_extra`, `deny_extra`, `seccomp_mode`, `notifier`
@@ -360,9 +362,13 @@ explicitly allowed.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `egress` | `"proxy-only" \| "none" \| "direct"` | `"proxy-only"` | Outbound networking mode |
-| `allow_domains` | `string[]` | `[]` | Allowed domain names |
 | `allow_ips` | `string[]` | `[]` | Allowed IPs or CIDR ranges (IPv4 and IPv6) |
 | `ports` | `string[]` | `[]` | Port forwarding specs (`[ip:]hostPort:containerPort[/protocol]`) |
+| `contract_mode` | `"strict" \| "relaxed"` | `"strict"` | Default for hosts without a `[[host]]` block. `strict` refuses; `relaxed` allows + logs. |
+
+FQDN egress goes through the top-level [`[[host]]`](#host) table, not
+this section. Each `[[host]]` block names a domain and the request
+shapes accepted on it; see that section for the full schema.
 
 **Network mode determination:**
 
@@ -418,7 +424,14 @@ the namespace. DNS is handled via a link-local address:
 ```toml
 [network]
 egress = "proxy-only"
-allow_domains = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
+
+[[host]]
+domain = "registry.npmjs.org"
 ```
 
 **Port forwarding (`ports`):**
@@ -450,16 +463,93 @@ Syntax: `[ip:]hostPort:containerPort[/protocol]`
 
 ---
 
+## `[[host]]`
+
+Per-destination egress contract. **One `[[host]]` block per FQDN you
+allow the sandbox to reach.** The block answers every question about
+that upstream in one place: connect permission, the request shapes
+that are legitimate, and which DLP detectors may carry verdicts on
+this host as `Warn` instead of `Block`.
+
+There is no separate connect-permission list. Having a `[[host]]`
+block at all is the permission to dial; the block's other fields
+tighten what's allowed from there. The minimum block is one line
+(`domain = "x"`) — equivalent to "allow this host, any shape."
+
+```toml
+# Minimum-viable allow.
+[[host]]
+domain = "static.example.com"
+
+# Full picture for a service we care about.
+[[host]]
+domain             = "api.github.com"
+methods            = ["GET", "POST", "PATCH", "PUT", "DELETE"]
+content_types      = ["application/json", "application/vnd.github+json"]
+paths              = ["/repos/", "/user/", "/orgs/"]
+max_request_bytes  = 1_048_576                       # 1 MiB
+allow_credentials  = ["github_pat"]                  # downgrade github_pat hits to Warn here
+
+# Per-host escape hatch.
+[[host]]
+domain        = "weird-tool.corp.internal"
+contract_mode = "relaxed"
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `domain` | `string` | **required** | FQDN this block applies to. Wildcards (`*.github.com`) match one or more subdomain levels; bare domains match exact + any subdomain. Most-specific match wins. |
+| `methods` | `string[]` | `[]` | Allowed HTTP methods (case-insensitive). Empty = any. |
+| `content_types` | `string[]` | `[]` | Allowed request `Content-Type` values (matched on `mime/subtype` portion; `; charset=...` parameters are ignored). Empty = any. |
+| `paths` | `string[]` | `[]` | Path prefixes the request URI must start with. Empty = any. |
+| `max_request_bytes` | `u64` | unset | Per-host request body cap. Applies after the global `max_streamed_body_bytes`. |
+| `allow_credentials` | `string[]` | `[]` | DLP detector ids whose verdicts on this host downgrade from `Block` to `Warn` (e.g. `["github_pat"]` means the worker may legitimately carry a github PAT in `Authorization` to this host). |
+| `contract_mode` | `"strict" \| "relaxed"` | inherit `[network] contract_mode` | Per-host override of the global default. Only affects the unknown-host decision once you're inside this block; field-level checks still run. |
+
+Multiple `[[host]]` entries with the same `domain` merge by:
+**union** on vec fields, **max** for `max_request_bytes`, **last-Some-wins**
+for `contract_mode`. A project recipe can extend (never silently
+restrict) a canister-shipped contract by writing another `[[host]]`
+with the same domain.
+
+### Refusal behaviour
+
+If a request reaches the proxy with a destination that has no matching
+`[[host]]` block, the gate decides based on `[network] contract_mode`:
+
+- **`strict`** (default) — refuse with **415** (or **413** for body-size),
+  `x-canister-error: contract-refused`, and a response body that
+  carries the **exact `[[host]]` patch** to paste into `canister.toml`
+  to allow this exact shape.
+- **`relaxed`** — allow the request but emit an `unknown_host_contract`
+  tracing event. Intended for prototyping where the upstream set
+  isn't known up front.
+
+See [`docs/refusals.md`](refusals.md) for the operator-facing
+walkthrough (415 vs 451, how to read the patch, escape hatches).
+
+### Shipped service contracts
+
+Canister ships contracts for the upstreams workers most commonly hit
+under `recipes/services/`: `github.toml`, `openai.toml`,
+`anthropic.toml`, `npm.toml`, `pypi.toml`, `huggingface.toml`,
+`docker.toml`, `aws.toml`, `stripe.toml`, `slack.toml`. Compose
+them with `-r service:github` (etc.) or via a project manifest.
+
+---
+
 ## `[network.dlp]`
 
 Data Loss Prevention layer running inside the L7 egress proxy. Scans
 outbound HTTP traffic for credential patterns (GitHub PATs, npm tokens,
 AWS keys, Slack tokens, SSH private keys, generic bearer tokens) and
-enforces per-detector domain scoping — each token type may only flow to
-its built-in *home domains* for that service. Even when
-`allow_domains` permits a destination, a GitHub PAT bound for
-`registry.npmjs.org` will be blocked. See [DLP](DLP.md) for the full
-threat model and detector list.
+enforces per-host credential scoping via the `allow_credentials` field
+on each [`[[host]]`](#host) block — a GitHub PAT bound for
+`registry.npmjs.org` will be blocked even though both hosts are
+reachable. See [DLP](DLP.md) for the full threat model and detector
+list.
 
 DLP only runs when traffic is inspectable, i.e. when
 `network.egress = "proxy-only"`.
@@ -473,9 +563,12 @@ decompress = true                 # gzip/deflate/brotli before scan
 dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
 session_entropy_budget = 8192     # cumulative high-entropy bytes/session
 
-[network.dlp.extra_scopes]
-github_pat = ["github.corp.example.com"]
-npm_token  = ["npm.internal.example.com"]
+# Extend credential scope by adding allow_credentials on the host:
+[[host]]
+domain            = "github.corp.example.com"
+methods           = ["GET", "POST", "PATCH", "PUT", "DELETE"]
+content_types     = ["application/json"]
+allow_credentials = ["github_pat"]
 ```
 
 ### Fields
@@ -488,19 +581,28 @@ npm_token  = ["npm.internal.example.com"]
 | `decompress` | `bool` | `true` | Inflate gzip / deflate / brotli bodies before scanning. |
 | `dns_entropy_threshold` | `f64` | `4.5` | Shannon entropy per DNS label above which the hostname is blocked. |
 | `session_entropy_budget` | `u64` | `8192` | Cumulative high-entropy bytes allowed across one sandbox session before further requests are blocked. |
-| `extra_scopes` | `map<string, string[]>` | `{}` | Extend built-in home domains per detector for self-hosted services. Unioned with built-ins, never replaces them. |
+
+Credential-flow scope is configured per host via the
+`allow_credentials` field on [`[[host]]`](#host).
 
 ### Built-in scopes
 
-| Detector | Home domains |
+Each detector has a baseline list of *home domains* hardcoded in the
+detector registry — destinations where it's universally legitimate
+for that credential type to flow:
+
+| Detector | Built-in home domains |
 |---|---|
 | `github_pat` | `github.com`, `*.github.com` |
 | `npm_token` | `registry.npmjs.org` |
 | `aws_access_key` | `*.amazonaws.com` |
 | `slack_token` | `*.slack.com` |
-| `bearer_token` | *(any destination already in `allow_domains`)* |
+| `bearer_token` | *(none — requires explicit `allow_credentials = ["bearer_token"]` on the host)* |
 | `ssh_private_key`, `canary_token` | *(none — always block)* |
 | `generic_high_entropy` | *(warn only, block in `--strict`)* |
+
+Add to this set per-host via `allow_credentials` on the relevant
+`[[host]]` block. Built-in lists are never narrowed.
 
 ### Merge semantics
 
@@ -508,11 +610,10 @@ npm_token  = ["npm.internal.example.com"]
 |---|---|
 | `enabled` | OR — any `Some(true)` wins (security escalation, never reversed) |
 | `canary_tokens` | OR |
-| `extra_scopes` | per-detector domain union (never narrows) |
 | `max_decode_depth`, `decompress`, `dns_entropy_threshold`, `session_entropy_budget` | last-Some-wins |
 
 A downstream recipe can never disable DLP that an upstream recipe
-enabled, nor shrink the scope set.
+enabled.
 
 ### Interaction with `--strict` / `--monitor`
 
@@ -703,7 +804,7 @@ provides argument-level filtering for `connect()`, `clone()`/`clone3()`,
 | omitted | Auto-detect: enabled if kernel >= 5.9 and not in monitor mode |
 
 When the notifier is active, `connect()` calls are filtered against the
-resolved IPs from `allow_domains` and `allow_ips`, `clone()`/`clone3()` are
+resolved IPs from each `[[host]].domain` and `allow_ips`, `clone()`/`clone3()` are
 blocked from creating new namespaces, `socket()` is blocked from creating
 `AF_NETLINK` or `SOCK_RAW` sockets, and `execve()`/`execveat()` are validated
 against `allow_execve` paths for every execution (not just the initial command).
@@ -863,7 +964,14 @@ allow = ["/bin", "/sbin", "/usr/bin", ...]
 deny = ["/etc/shadow", "/etc/gshadow"]
 
 [network]
-allow_domains = ["hex.pm", "repo.hex.pm", "builds.hex.pm"]
+[[host]]
+domain = "hex.pm"
+
+[[host]]
+domain = "repo.hex.pm"
+
+[[host]]
+domain = "builds.hex.pm"
 egress = "proxy-only"
 
 [process]
@@ -920,11 +1028,11 @@ deny = ["/etc/shadow", "/root"]
 
 [network]
 egress = "proxy-only"
-allow_domains = [
-    "pypi.org",
-    "files.pythonhosted.org",
-]
+[[host]]
+domain = "pypi.org"
 
+[[host]]
+domain = "files.pythonhosted.org"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "VIRTUAL_ENV"]
 ```
@@ -944,11 +1052,11 @@ allow = [
 
 [network]
 egress = "proxy-only"
-allow_domains = [
-    "registry.npmjs.org",
-    "nodejs.org",
-]
+[[host]]
+domain = "registry.npmjs.org"
 
+[[host]]
+domain = "nodejs.org"
 [process]
 env_passthrough = ["PATH", "HOME", "NODE_ENV"]
 ```
@@ -1027,7 +1135,14 @@ allow = [
 deny = ["/etc/shadow", "/root"]
 
 [network]
-allow_domains = ["hex.pm", "repo.hex.pm", "builds.hex.pm"]
+[[host]]
+domain = "hex.pm"
+
+[[host]]
+domain = "repo.hex.pm"
+
+[[host]]
+domain = "builds.hex.pm"
 egress = "proxy-only"
 
 [process]

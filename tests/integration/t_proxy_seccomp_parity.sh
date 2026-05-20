@@ -30,8 +30,8 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
@@ -271,19 +271,22 @@ case "$RUN_STDOUT" in
     *) fail "expected DENIED under egress=none; got: $RUN_STDOUT" ;;
 esac
 
-# ---- Test 6: allow_domains + allow_ips combo ----
-# When both are set, the proxy must allow EITHER an allowed domain OR an
-# allowed IP literal. allow_domains by itself blocks IP literals (per the
-# `enforce_ip_policy` gate in policy.rs); adding allow_ips should
-# re-enable just the listed IPs without re-enabling arbitrary literals.
+# ---- Test 6: [[host]] + allow_ips combo ----
+# When both are set, the proxy must allow EITHER a host with a
+# `[[host]]` block OR an allowed IP literal. A `[[host]]` block by
+# itself blocks IP literals (per the `enforce_ip_policy` gate in
+# policy.rs); adding allow_ips should re-enable just the listed IPs
+# without re-enabling arbitrary literals.
 COMBO_CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
 allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
 allow_ips = ["192.0.2.1"]
+
+[[host]]
+domain = "example.com"
 
 [process]
 env_passthrough = ["PATH", "HOME"]

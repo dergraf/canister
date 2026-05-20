@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::filesystem::FilesystemConfig;
+use super::host::HostBlock;
 use super::network::NetworkConfig;
 use super::process::ProcessConfig;
 use super::proxy::ProxyConfig;
@@ -47,6 +48,10 @@ pub struct SandboxConfig {
     /// L7 Proxy and interception configuration.
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    /// Per-destination egress contracts (see `HostBlock`).
+    #[serde(default, rename = "host")]
+    pub hosts: Vec<HostBlock>,
 }
 
 impl SandboxConfig {
@@ -60,6 +65,7 @@ impl SandboxConfig {
             resources: ResourceConfig::default(),
             syscalls: SyscallConfig::default(),
             proxy: ProxyConfig::default(),
+            hosts: Vec::new(),
         }
     }
 }

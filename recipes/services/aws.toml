@@ -1,0 +1,27 @@
+# AWS service endpoints.
+#
+# AWS uses regional FQDNs (`s3.us-east-1.amazonaws.com`,
+# `sts.us-west-2.amazonaws.com`, etc.) so wildcarding under
+# `*.amazonaws.com` is the only practical contract — enumerating
+# every service × every region isn't tractable.
+#
+# Content types include the AWS-proprietary `application/x-amz-json-1.1`
+# (used by most services) and `application/xml` (S3 / SQS legacy).
+
+[recipe]
+name        = "service:aws"
+description = "AWS regional endpoint contracts"
+
+[[host]]
+domain        = "*.amazonaws.com"
+methods       = ["GET", "POST", "PUT", "DELETE", "HEAD"]
+content_types = [
+    "application/x-amz-json-1.0",
+    "application/x-amz-json-1.1",
+    "application/xml",
+    "application/json",
+    "application/octet-stream",
+    "text/xml",
+]
+max_request_bytes = 5368709120   # 5 GiB — S3 single-PUT cap
+allow_credentials = ["aws_access_key"]

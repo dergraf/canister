@@ -20,7 +20,8 @@ pub fn domain_matches(host: &str, pattern: &str) -> bool {
 }
 
 /// Per-detector scope table, derived from the registry at construction
-/// time and merged with any `[dlp.scopes]` entries from the recipe.
+/// time and merged with the per-host `allow_credentials` lists the
+/// caller provides as an inverted `detector_id → [domain]` map.
 ///
 /// The construction logic is uniform — no per-detector special cases.
 /// Every per-detector knob lives in [`crate::registry::REGISTRY`].
@@ -37,7 +38,8 @@ pub struct DlpScopes {
 impl DlpScopes {
     /// Build the scope table by walking the registry. `user_scopes`
     /// keys are detector ids (`github_pat`, `bearer_token`, …); values
-    /// are FQDN patterns from the recipe's `[dlp.scopes]` table.
+    /// are FQDN patterns. The proxy builds this map by inverting the
+    /// `[[host]] allow_credentials` lists from the recipe.
     pub fn new(user_scopes: &HashMap<String, Vec<String>>) -> Self {
         let mut domains: HashMap<&'static str, Vec<String>> = HashMap::new();
 
@@ -68,8 +70,8 @@ impl DlpScopes {
         // domain list that the user can never extend." We enforce that
         // by checking the policy directly from the registry before
         // consulting the merged list, so a user who adds
-        // `[dlp.scopes].ssh_private_key = ["..."]` cannot whitelist
-        // SSH key egress.
+        // `allow_credentials = ["ssh_private_key"]` to a `[[host]]`
+        // block cannot whitelist SSH key egress.
         let policy = crate::registry::lookup(detector.as_str())
             .map(|d| d.scope_policy)
             .unwrap_or(ScopePolicy::AlwaysBlock);
@@ -174,7 +176,7 @@ mod tests {
             let id = DetectorId::new(def.id);
             assert!(
                 !s.is_allowed(id, "api.example.com"),
-                "[{}] should require explicit [dlp.scopes] entry, but was allowed",
+                "[{}] should require an explicit allow_credentials entry, but was allowed",
                 def.id,
             );
         }

@@ -13,12 +13,14 @@ allow_write = [
 ]
 
 [network]
-allow_domains = [
-    "proxy.golang.org",
-    "sum.golang.org",
-    "storage.googleapis.com",
-]
+[[host]]
+domain = "proxy.golang.org"
 
+[[host]]
+domain = "sum.golang.org"
+
+[[host]]
+domain = "storage.googleapis.com"
 [process]
 env_passthrough = [
     "GOPATH",

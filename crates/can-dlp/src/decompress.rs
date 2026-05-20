@@ -13,7 +13,12 @@ pub fn decompress(data: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
     // the contained token.
     if let Some(actual) = sniffed {
         match claimed.as_deref() {
-            Some(claim) if !encoding_matches_sniff(claim, actual) => {
+            // Skip the lie-detection warning when the claim is a comma-
+            // separated stack — sniff only inspects the outermost
+            // layer, and a stack like `gzip, deflate` is gzip-on-the-
+            // wire, so the sniff and one of the claim tokens always
+            // match.
+            Some(claim) if !claim.contains(',') && !encoding_matches_sniff(claim, actual) => {
                 warn!(
                     "dlp-evasion: Content-Encoding mismatch — header={} actual={}",
                     claim,
@@ -36,12 +41,57 @@ pub fn decompress(data: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
         }
     }
 
-    match claimed.as_deref() {
-        Some("gzip") | Some("x-gzip") => try_gzip(data).unwrap_or_else(|| data.to_vec()),
-        Some("deflate") => try_deflate(data).unwrap_or_else(|| data.to_vec()),
-        Some("br") => try_brotli(data).unwrap_or_else(|| data.to_vec()),
-        Some("zstd") => try_zstd(data).unwrap_or_else(|| data.to_vec()),
-        _ => data.to_vec(),
+    // Per RFC 7231 §3.1.2.2 a Content-Encoding header lists the
+    // encodings "in the order in which they were applied" by the
+    // sender, so the receiver decodes in REVERSE order to recover the
+    // original bytes. A claim of `gzip, deflate` means
+    // `deflate(gzip(payload))` went on the wire — peel deflate, then
+    // peel gzip. Bounded at MAX_LAYERS so a hostile
+    // `gzip,gzip,gzip,…` header can't drive us into a CPU/RAM hole.
+    const MAX_LAYERS: usize = 4;
+    let Some(claim) = claimed else {
+        return data.to_vec();
+    };
+    let layers: Vec<&str> = claim
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if layers.is_empty() {
+        return data.to_vec();
+    }
+    let mut current = data.to_vec();
+    for (i, layer) in layers.iter().rev().enumerate() {
+        if i >= MAX_LAYERS {
+            warn!(
+                "dlp: Content-Encoding stack exceeded {MAX_LAYERS} layers — stopping decompression"
+            );
+            break;
+        }
+        let Some(decoded) = decompress_layer(layer, &current) else {
+            // A claimed layer that doesn't actually decode (e.g. claim
+            // says `gzip` but the bytes aren't gzip) leaves the
+            // partial result in place — the scanner still gets to see
+            // whatever bytes we have, which is no worse than the
+            // single-layer fallback.
+            return current;
+        };
+        current = decoded;
+    }
+    current
+}
+
+fn decompress_layer(layer: &str, data: &[u8]) -> Option<Vec<u8>> {
+    match layer {
+        "gzip" | "x-gzip" => try_gzip(data),
+        "deflate" => try_deflate(data),
+        "br" => try_brotli(data),
+        "zstd" => try_zstd(data),
+        // `identity` is a no-op encoding per RFC 7231 — just pass
+        // through. Any other value is unknown to us; return None so
+        // the caller stops layer-peeling.
+        "identity" => Some(data.to_vec()),
+        _ => None,
     }
 }
 
@@ -96,6 +146,17 @@ fn try_gzip(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn try_deflate(data: &[u8]) -> Option<Vec<u8>> {
+    // HTTP `Content-Encoding: deflate` is historically ambiguous: most
+    // clients (Python's `zlib.compress`, browsers, requests, libcurl)
+    // ship zlib-wrapped DEFLATE (RFC 1950 — 2-byte header + DEFLATE +
+    // adler32), but the literal RFC reading is raw DEFLATE (RFC 1951).
+    // Try zlib first; on failure fall back to raw so we don't regress
+    // the few clients that send the raw stream.
+    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    if decoder.read_to_end(&mut out).is_ok() {
+        return Some(out);
+    }
     let mut decoder = flate2::read::DeflateDecoder::new(data);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok()?;
@@ -133,12 +194,35 @@ mod tests {
     }
 
     #[test]
-    fn deflate_round_trip() {
+    fn deflate_raw_round_trip() {
+        // Raw DEFLATE (RFC 1951) — the strict reading of HTTP `deflate`.
         let original = b"npm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let mut encoder =
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
+
+        let decompressed = decompress(&compressed, Some("deflate"));
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn deflate_zlib_round_trip() {
+        // Zlib-wrapped DEFLATE (RFC 1950) — what Python's `zlib.compress`
+        // and most real HTTP clients send under `Content-Encoding: deflate`.
+        // Regression: the previous decoder only handled raw DEFLATE, so
+        // bodies from Python clients (e.g. the dlp-test.py fuzzer) were
+        // opaque to the scanner and every json_body+deflate case leaked.
+        let original = b"AKIA0123456789ABCDEF";
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(
+            &compressed[..2],
+            &[0x78, 0x9c],
+            "sanity: zlib header expected"
+        );
 
         let decompressed = decompress(&compressed, Some("deflate"));
         assert_eq!(decompressed, original);
@@ -209,6 +293,48 @@ mod tests {
         let zstd_data = zstd::stream::encode_all(&original[..], 3).unwrap();
         let result = decompress(&zstd_data, Some("gzip"));
         assert_eq!(result, zstd_data);
+    }
+
+    #[test]
+    fn multi_layer_content_encoding_is_unwrapped_in_reverse() {
+        // RFC 7231 §3.1.2.2: encodings are listed in the order they
+        // were applied. `gzip, deflate` therefore means
+        // `deflate(gzip(payload))` on the wire — peel deflate first,
+        // then gzip. Before this fix the decoder treated the
+        // whole comma-separated string as one unknown encoding and
+        // dropped to opaque-bytes, letting a stacked-encoding exfil
+        // bypass the scanner.
+        let original = b"ghp_LAYEREDsomething1234567890ABCD";
+        let gzipped = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(original).unwrap();
+            e.finish().unwrap()
+        };
+        let stacked = {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&gzipped).unwrap();
+            e.finish().unwrap()
+        };
+        let out = decompress(&stacked, Some("gzip, deflate"));
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn multi_layer_with_identity_is_a_noop() {
+        let original = b"plaintext payload";
+        let out = decompress(original, Some("identity"));
+        assert_eq!(out, original);
+        let out2 = decompress(original, Some("identity, identity"));
+        assert_eq!(out2, original);
+    }
+
+    #[test]
+    fn multi_layer_unknown_encoding_stops_peel_safely() {
+        // `weird-encoding` is unknown; the decoder leaves the bytes
+        // as-is rather than panicking or dropping the buffer.
+        let bytes = b"some bytes";
+        let out = decompress(bytes, Some("weird-encoding, gzip"));
+        assert_eq!(out, bytes);
     }
 
     #[test]

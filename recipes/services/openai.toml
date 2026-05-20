@@ -1,0 +1,15 @@
+# OpenAI API.
+#
+# Chat completions, embeddings, files, fine-tuning. `multipart/form-data`
+# permitted for the audio + files endpoints; everything else is JSON.
+
+[recipe]
+name        = "service:openai"
+description = "OpenAI API contracts"
+
+[[host]]
+domain            = "api.openai.com"
+methods           = ["GET", "POST", "DELETE"]
+content_types     = ["application/json", "multipart/form-data"]
+max_request_bytes = 26214400   # 25 MiB — OpenAI's file-upload cap
+allow_credentials = ["openai_key"]

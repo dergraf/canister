@@ -26,8 +26,8 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
@@ -61,7 +61,7 @@ case "$RUN_STDOUT" in
 esac
 
 # ---- Test 2: a worker that exfiltrates the GitHub PAT canary is blocked ----
-# The token is in the env, the host is in `allow_domains`, but the canary
+# The token is in the env, the host has a `[[host]]` block, but the canary
 # byte sequence in the URL trips DLP and returns 451. detector=canary_token
 # distinguishes this from a regex match on `ghp_…` (the canary happens to
 # share the prefix; the scanner records it as `canary_token` because the

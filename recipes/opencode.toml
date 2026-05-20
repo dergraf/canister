@@ -77,16 +77,26 @@ egress = "proxy-only"
 #
 # WebFetch tool — OpenCode fetches arbitrary URLs for research.
 # If you need unrestricted web access, set egress = "direct".
-allow_domains = [
-    "github.com",
-    "api.github.com",
-    "api.githubcopilot.com",
-    "copilot-proxy.githubusercontent.com",
-    "api.anthropic.com",
-    "api.openai.com",
-    "opencode.ai",
-]
+[[host]]
+domain = "github.com"
 
+[[host]]
+domain = "api.github.com"
+
+[[host]]
+domain = "api.githubcopilot.com"
+
+[[host]]
+domain = "copilot-proxy.githubusercontent.com"
+
+[[host]]
+domain = "api.anthropic.com"
+
+[[host]]
+domain = "api.openai.com"
+
+[[host]]
+domain = "opencode.ai"
 [process]
 # OpenCode spawns subprocesses for tools (git, cargo, rg, etc.)
 max_pids = 256

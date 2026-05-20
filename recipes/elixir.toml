@@ -28,13 +28,17 @@ deny = ["/etc/shadow", "/root"]
 [network]
 egress = "proxy-only"
 # Allow hex.pm for dependency fetching and common Elixir registries.
-allow_domains = [
-    "hex.pm",
-    "repo.hex.pm",
-    "builds.hex.pm",
-    "github.com",
-]
+[[host]]
+domain = "hex.pm"
 
+[[host]]
+domain = "repo.hex.pm"
+
+[[host]]
+domain = "builds.hex.pm"
+
+[[host]]
+domain = "github.com"
 [process]
 # BEAM spawns many lightweight processes via OS threads; the default
 # scheduler count equals the CPU core count. 256 is generous for most

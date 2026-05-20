@@ -107,7 +107,8 @@ fn build_upstream_tls_connector() -> Result<tokio_rustls::TlsConnector, std::io:
 
 /// Connect to `host:port`, honouring the outbound policy at every gate
 /// (IP literals checked against `allow_ips`, DNS names checked against
-/// `allow_domains`, resolved IPs checked against `allow_ips` again).
+/// the `[[host]]` allow-set, resolved IPs checked against `allow_ips`
+/// again).
 ///
 /// `host.canister.local` is rewritten to `outbound_policy.host_loopback_target`
 /// when set — see [`HOST_LOOPBACK_ALIAS`] for the rationale.

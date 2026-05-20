@@ -18,6 +18,10 @@ use super::responses::{ProxyBody, ProxyError};
 pub(super) enum FindingSource {
     /// Whole-buffer regex pass (request headers / URI / body).
     Request,
+    /// Whole-buffer regex pass over the upstream's response shape
+    /// (response headers + body). Distinct from `Request` so logs and
+    /// the `dlp_block` event stream make the direction visible.
+    Response,
     /// Chunked regex pass over a body larger than the buffered cap.
     Streaming,
 }
@@ -26,6 +30,7 @@ impl FindingSource {
     fn label(self) -> &'static str {
         match self {
             Self::Request => "request",
+            Self::Response => "response",
             Self::Streaming => "streaming",
         }
     }
@@ -99,15 +104,30 @@ pub(super) fn enforce_request_verdicts(
     host: &str,
     monitor: bool,
 ) -> Option<hyper::Response<ProxyBody>> {
+    enforce_verdicts(verdicts, host, monitor, FindingSource::Request)
+}
+
+/// Response-direction analogue of [`enforce_request_verdicts`]. Same
+/// shape; logs use the `response` label so dashboards can split
+/// inbound exfil attempts from upstream leaks.
+pub(super) fn enforce_response_verdicts(
+    verdicts: &[ScanVerdict],
+    host: &str,
+    monitor: bool,
+) -> Option<hyper::Response<ProxyBody>> {
+    enforce_verdicts(verdicts, host, monitor, FindingSource::Response)
+}
+
+fn enforce_verdicts(
+    verdicts: &[ScanVerdict],
+    host: &str,
+    monitor: bool,
+    source: FindingSource,
+) -> Option<hyper::Response<ProxyBody>> {
     for v in verdicts {
-        if let Some(resp) = enforce_one(
-            v.detector,
-            &v.matched_text,
-            host,
-            v.action,
-            monitor,
-            FindingSource::Request,
-        ) {
+        if let Some(resp) =
+            enforce_one(v.detector, &v.matched_text, host, v.action, monitor, source)
+        {
             return Some(resp);
         }
     }

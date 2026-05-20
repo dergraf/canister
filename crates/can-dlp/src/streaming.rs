@@ -11,24 +11,26 @@
 //! Body-frame-driven forward path; the `StreamingScanner` API is the
 //! contract that path will use.
 //!
-//! Limitations of chunked scanning (vs. the whole-buffer
-//! [`DlpScanner::scan_body`] path):
+//! Per-chunk coverage:
+//!
+//! - **Regex set** runs against the chunk + overlap.
+//! - **Canary substring** check runs against the same buffer.
+//! - **Multi-layer decode** ([`crate::decode::decode_layers`]) runs
+//!   against the chunk + overlap, and the regex/canary checks repeat
+//!   for each decoded layer. Closes the gap that previously let
+//!   base64/hex-encoded secrets slip through bodies over
+//!   `max_buffered_body_bytes`.
+//!
+//! Limitation that remains:
 //!
 //! - **No decompression**. gzip / zstd / brotli need the full stream;
-//!   chunked scans see compressed bytes only, which generally won't match
-//!   text regexes. The whole-buffer path remains the right choice when
-//!   bodies are smaller than the decompression-eligible cap.
-//! - **No multi-layer decoding**. `decode_layers` operates on a whole
-//!   buffer (fragment-aware substring search), not a stream.
-//!
-//! These are acceptable for the streaming path because:
-//! - Most exfil attempts ship plaintext bytes through unencoded fields.
-//! - Compressed exfil over the limit is rare in practice, and when it
-//!   matters the operator can keep `max_buffered_body_bytes` high
-//!   enough to capture it.
+//!   the chunked path sees compressed bytes only. The whole-buffer
+//!   [`crate::scanner::DlpScanner::scan_body`] path is still the right
+//!   choice when bodies are smaller than `max_buffered_body_bytes`.
 
 use std::collections::HashSet;
 
+use crate::decode::decode_layers;
 use crate::detectors::{DetectorId, PatternSet};
 
 /// Maximum signature length we'll preserve across chunk boundaries.
@@ -48,6 +50,7 @@ pub struct StreamingScanner<'a> {
     overlap: Vec<u8>,
     seen_detectors: HashSet<DetectorId>,
     overlap_bytes: usize,
+    max_decode_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -60,14 +63,15 @@ impl<'a> StreamingScanner<'a> {
     /// Create a streaming scanner backed by the existing pattern set and
     /// canary list. The scanner borrows both — they're immutable for the
     /// lifetime of the stream.
-    pub fn new(patterns: &'a PatternSet, canaries: &'a [Vec<u8>]) -> Self {
-        Self::with_overlap(patterns, canaries, DEFAULT_OVERLAP_BYTES)
+    pub fn new(patterns: &'a PatternSet, canaries: &'a [Vec<u8>], max_decode_depth: usize) -> Self {
+        Self::with_overlap(patterns, canaries, DEFAULT_OVERLAP_BYTES, max_decode_depth)
     }
 
     pub fn with_overlap(
         patterns: &'a PatternSet,
         canaries: &'a [Vec<u8>],
         overlap_bytes: usize,
+        max_decode_depth: usize,
     ) -> Self {
         Self {
             patterns,
@@ -75,6 +79,7 @@ impl<'a> StreamingScanner<'a> {
             overlap: Vec::new(),
             seen_detectors: HashSet::new(),
             overlap_bytes,
+            max_decode_depth,
         }
     }
 
@@ -104,6 +109,23 @@ impl<'a> StreamingScanner<'a> {
     fn scan_buffer(&mut self, buf: &[u8]) -> Vec<StreamingFinding> {
         let mut out = Vec::new();
 
+        // Decode candidate layers (raw buffer is always layer 0). Each
+        // layer goes through both canary substring and regex scan, so a
+        // base64- or hex-encoded secret inside a >max_buffered body is
+        // caught instead of slipping past the regex set.
+        let layers = decode_layers(
+            buf,
+            self.max_decode_depth,
+            crate::transforms::DEFAULT_COST_BUDGET,
+        );
+        for layer in &layers {
+            self.scan_layer(layer, &mut out);
+        }
+
+        out
+    }
+
+    fn scan_layer(&mut self, buf: &[u8], out: &mut Vec<StreamingFinding>) {
         let canary_id = DetectorId::new(crate::ids::CANARY_TOKEN);
         for canary in self.canaries.iter() {
             if !canary.is_empty()
@@ -127,8 +149,6 @@ impl<'a> StreamingScanner<'a> {
                 }
             }
         }
-
-        out
     }
 }
 
@@ -140,7 +160,7 @@ mod tests {
     fn streaming_finds_token_in_single_chunk() {
         let ps = PatternSet::new().unwrap();
         let canaries: Vec<Vec<u8>> = Vec::new();
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let token = format!("prefix ghp_{} suffix", "A".repeat(36));
         let findings = s.feed(token.as_bytes());
         assert!(findings.iter().any(|f| f.detector.as_str() == "github_pat"));
@@ -151,7 +171,7 @@ mod tests {
         // The whole point of overlap. Token straddles chunk 1 / chunk 2.
         let ps = PatternSet::new().unwrap();
         let canaries: Vec<Vec<u8>> = Vec::new();
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let token = format!("ghp_{}", "A".repeat(36));
         // Split at byte 8 (mid-token).
         let (head, tail) = token.split_at(8);
@@ -168,7 +188,7 @@ mod tests {
     fn streaming_does_not_repeat_detector() {
         let ps = PatternSet::new().unwrap();
         let canaries: Vec<Vec<u8>> = Vec::new();
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let token = format!("ghp_{}", "A".repeat(36));
         let first = s.feed(token.as_bytes());
         assert_eq!(first.len(), 1);
@@ -181,7 +201,7 @@ mod tests {
         let ps = PatternSet::new().unwrap();
         let canary = b"ghp_CANARYVALUEHEREXXXXXXXXXXXXXXXXXXXX".to_vec();
         let canaries = vec![canary.clone()];
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let body = format!("payload: {}", std::str::from_utf8(&canary).unwrap());
         let findings = s.feed(body.as_bytes());
         assert!(
@@ -198,7 +218,7 @@ mod tests {
         // buffer must not have grown unbounded. Default overlap is 256.
         let ps = PatternSet::new().unwrap();
         let canaries: Vec<Vec<u8>> = Vec::new();
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let chunk = vec![b'.'; 1024];
         for _ in 0..100 {
             let _ = s.feed(&chunk);
@@ -211,13 +231,79 @@ mod tests {
     }
 
     #[test]
+    fn streaming_finds_base64_encoded_aws_key() {
+        // Mirrors the request-side header matrix: the chunked path also
+        // has to peel encoding layers before regex hits.
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let ps = PatternSet::new().unwrap();
+        let canaries: Vec<Vec<u8>> = Vec::new();
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
+        let raw_key = "AKIAIOSFODNN7EXAMPLE";
+        let body = format!(r#"{{"upload":"{}"}}"#, STANDARD.encode(raw_key));
+
+        let findings = s.feed(body.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detector.as_str() == "aws_access_key"),
+            "base64-encoded AKIA key in streaming body should fire aws_access_key, got: {:?}",
+            findings
+                .iter()
+                .map(|f| f.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn streaming_finds_hex_encoded_aws_key() {
+        let ps = PatternSet::new().unwrap();
+        let canaries: Vec<Vec<u8>> = Vec::new();
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
+        let raw_key = "AKIAIOSFODNN7EXAMPLE";
+        let hex: String = raw_key.bytes().map(|b| format!("{b:02x}")).collect();
+        let body = format!("<envelope>{hex}</envelope>");
+
+        let findings = s.feed(body.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detector.as_str() == "aws_access_key"),
+            "hex-encoded AKIA key in streaming body should fire aws_access_key"
+        );
+    }
+
+    #[test]
+    fn streaming_finds_base64_canary() {
+        // Reflected-canary equivalent of the response-side decode test.
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let ps = PatternSet::new().unwrap();
+        let canary = b"AKIACANARYVALUE12345".to_vec();
+        let canaries = vec![canary.clone()];
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
+
+        let encoded = STANDARD.encode(&canary);
+        let body = format!("trace={encoded}&other=ok");
+        let findings = s.feed(body.as_bytes());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detector.as_str() == "canary_token"),
+            "base64-encoded canary in streaming body should fire canary_token"
+        );
+    }
+
+    #[test]
     fn streaming_short_chunks_aggregate() {
         // Many tiny chunks (one byte at a time) must still find the
         // token. This is the worst case for an overlap-window scanner;
         // make sure no path drops the running buffer.
         let ps = PatternSet::new().unwrap();
         let canaries: Vec<Vec<u8>> = Vec::new();
-        let mut s = StreamingScanner::new(&ps, &canaries);
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
         let token = format!("npm_{}", "B".repeat(36));
         let mut found = false;
         for b in token.bytes() {

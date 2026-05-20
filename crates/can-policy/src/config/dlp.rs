@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -45,22 +43,6 @@ pub struct DlpConfig {
     /// requests are blocked. Default: 8192.
     #[serde(default)]
     pub session_entropy_budget: Option<u64>,
-
-    /// Credential-flow scope per detector. Keys are detector names
-    /// (`github_pat`, `bearer_token`, `generic_high_entropy`, etc.), values
-    /// are FQDN patterns (`api.example.com`, `*.corp.example.com`).
-    ///
-    /// - For detectors with built-in home domains (`github_pat`,
-    ///   `npm_token`, `aws_access_key`, etc.) these entries are *added* to
-    ///   the built-ins.
-    /// - For `bearer_token` and `generic_high_entropy` these entries are
-    ///   the *only* scope. Without an explicit entry, those detectors
-    ///   block on every destination. (Prior versions reused
-    ///   `network.allow_domains` as an implicit scope here; that was
-    ///   removed in R14 of the DLP plan — `allow_domains` is now purely a
-    ///   connection gate.)
-    #[serde(default)]
-    pub scopes: HashMap<String, Vec<String>>,
 }
 
 impl DlpConfig {
@@ -99,19 +81,8 @@ impl DlpConfig {
     ///
     /// - `enabled`, `canary_tokens`: OR semantics (a security escalation
     ///   in either layer wins).
-    /// - `scopes`: per-detector domain lists are unioned (first occurrence
-    ///   preserved).
     /// - Numeric / `Option<T>` fields: last-Some-wins.
     fn merge_inner(self, overlay: Self) -> Self {
-        let mut scopes = self.scopes;
-        for (key, values) in overlay.scopes {
-            let entry = scopes.entry(key).or_default();
-            for v in values {
-                if !entry.contains(&v) {
-                    entry.push(v);
-                }
-            }
-        }
         Self {
             enabled: merge_or_bool(self.enabled, overlay.enabled),
             canary_tokens: merge_or_bool(self.canary_tokens, overlay.canary_tokens),
@@ -121,7 +92,6 @@ impl DlpConfig {
             session_entropy_budget: overlay
                 .session_entropy_budget
                 .or(self.session_entropy_budget),
-            scopes,
         }
     }
 }

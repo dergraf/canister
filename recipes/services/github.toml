@@ -1,0 +1,45 @@
+# GitHub REST + GraphQL APIs.
+#
+# Both `api.github.com` and `*.github.com` are scoped to JSON. Asset
+# uploads use the distinct `uploads.github.com` host (it accepts
+# octet-stream releases and packages — see github-uploads.toml).
+#
+# `allow_credentials = ["github_pat"]` downgrades a github_pat
+# detector hit on this host from Block to Warn — legitimate API
+# clients carry a PAT in `Authorization: Bearer …`.
+
+[recipe]
+name        = "service:github"
+description = "GitHub REST + GraphQL API contracts"
+
+[[host]]
+domain            = "api.github.com"
+methods           = ["GET", "POST", "PATCH", "PUT", "DELETE", "HEAD"]
+content_types     = ["application/json", "application/vnd.github+json", "application/vnd.github.v3+json"]
+max_request_bytes = 1048576
+allow_credentials = ["github_pat"]
+
+[[host]]
+domain            = "github.com"
+methods           = ["GET", "HEAD"]
+allow_credentials = ["github_pat"]
+
+[[host]]
+domain            = "*.github.com"
+methods           = ["GET", "HEAD"]
+allow_credentials = ["github_pat"]
+
+[[host]]
+domain            = "uploads.github.com"
+methods           = ["POST"]
+content_types     = ["application/octet-stream"]
+max_request_bytes = 1073741824   # 1 GiB for release-asset uploads
+allow_credentials = ["github_pat"]
+
+[[host]]
+domain            = "objects.githubusercontent.com"
+methods           = ["GET", "HEAD"]
+# Content-served-from-storage: blob download endpoint. No credentials
+# expected; downgrade to Relaxed because the path/content-type set is
+# huge and not worth enumerating.
+contract_mode     = "relaxed"

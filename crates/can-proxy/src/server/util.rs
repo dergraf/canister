@@ -140,15 +140,18 @@ mod tests {
     }
 
     fn policy_with_domain(domain: &str) -> OutboundPolicy {
-        let mut net = can_policy::config::NetworkConfig::default();
-        net.allow_domains.push(domain.to_string());
-        OutboundPolicy::from_config(&net)
+        let net = can_policy::config::NetworkConfig::default();
+        let hosts = vec![can_policy::config::HostBlock {
+            domain: domain.to_string(),
+            ..Default::default()
+        }];
+        OutboundPolicy::from_config(&net, &hosts)
     }
 
     fn policy_with_ip(ip: &str) -> OutboundPolicy {
         let mut net = can_policy::config::NetworkConfig::default();
         net.allow_ips.push(ip.to_string());
-        OutboundPolicy::from_config(&net)
+        OutboundPolicy::from_config(&net, &[])
     }
 
     #[test]

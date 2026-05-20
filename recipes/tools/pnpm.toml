@@ -14,10 +14,8 @@ deny = [
 ]
 
 [network]
-allow_domains = [
-    "registry.npmjs.org",
-]
-
+[[host]]
+domain = "registry.npmjs.org"
 [process]
 env_passthrough = [
     "NPM_TOKEN",

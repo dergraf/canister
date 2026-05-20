@@ -19,12 +19,16 @@ use super::util::parse_host_from_authority;
 use crate::ca::DynamicCa;
 use crate::policy::OutboundPolicy;
 
+// 8 distinct args, all genuinely required: TLS materials, dial state,
+// gates, dlp ctx. Bundling into one struct just shifts the noise.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_tunnel(
     upgraded: Upgraded,
     host_with_port: String,
     ca: Arc<DynamicCa>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: DlpCtx,
 ) -> Result<(), std::io::Error> {
@@ -54,6 +58,7 @@ pub(super) async fn handle_tunnel(
                     req,
                     dns_cache.clone(),
                     outbound_policy.clone(),
+                    contracts.clone(),
                     "https",
                     limits.clone(),
                     Some(dlp.clone()),

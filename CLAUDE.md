@@ -36,10 +36,12 @@ canonical source of truth for the baseline.
 | "Why is this syscall blocked / which baseline allows it?" | `recipes/default.toml`, then `crates/can-sandbox/src/seccomp.rs` |
 | "How does USER_NOTIF arg-level filtering decide?" | `crates/can-sandbox/src/notifier.rs` (one of ~13 `evaluate_*` fns) |
 | "How does the fork/ns/pivot dance work?" | `crates/can-sandbox/src/namespace.rs` (`spawn_sandboxed`) — **do not reorder steps**, the parent↔child pipe protocol is order-sensitive |
-| "Why is this recipe field merged that way?" | `crates/can-policy/src/config.rs` (`RecipeFile::merge`) |
-| "What does `can up <name>` do?" | `crates/can-cli/src/commands.rs` (`up` command) → `can-policy/src/manifest.rs::discover_manifest` |
-| "Proxy / DLP behavior?" | `crates/can-proxy/src/server.rs` (`handle_inner_request`), `crates/can-dlp/src/scanner.rs` |
-| "How is the egress mode decided?" | `crates/can-policy/src/config.rs` `NetworkConfig::egress` (`none`/`proxy-only`/`direct`), unified in commit 6f81746 |
+| "Why is this recipe field merged that way?" | `crates/can-policy/src/config/recipe_merge.rs` (`RecipeFile::merge`) — per-section merge lives next to each `FooConfig` |
+| "What does `can up <name>` do?" | `crates/can-cli/src/commands.rs` (`up` command) → `can-policy/src/manifest/mod.rs::discover_manifest` |
+| "Proxy / DLP behavior?" | `crates/can-proxy/src/server/request.rs` (`handle_inner_request`), `crates/can-dlp/src/scanner.rs` |
+| "How is the egress mode decided?" | `crates/can-policy/src/config/network.rs` `NetworkConfig::egress` (`none`/`proxy-only`/`direct`), unified in commit 6f81746 |
+| "Where does the FQDN allow-list live?" | `[[host]]` blocks (top-level recipe table) — see `crates/can-policy/src/config/host.rs` |
+| "How does the contract gate work? Why was my request refused with 415?" | `docs/refusals.md`; gate is in `crates/can-proxy/src/contracts.rs` + `gate_by_contract` in `crates/can-proxy/src/server/request.rs` |
 
 ## Build / test / lint
 

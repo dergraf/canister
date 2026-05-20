@@ -11,7 +11,7 @@
 # agent protocol), they must add an explicit `[filesystem] allow` entry
 # in their canister.toml and accept the exposure.
 #
-# No `allow_domains`: SSH is not HTTP and does not flow through the
+# No `[[host]]` blocks: SSH is not HTTP and does not flow through the
 # canister proxy. SSH egress is controlled by `[network] allow_ips`
 # (or `egress = "direct"`) on the containing sandbox.
 #

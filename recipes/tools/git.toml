@@ -7,10 +7,10 @@
 # (compose with `tool:ssh-agent` and rely on SSH_AUTH_SOCK rather than
 # on-disk keys).
 #
-# No `allow_domains` here: git remotes are user-defined (github.com,
-# gitlab.com, an internal forge, …). Pair this recipe with a
-# forge-specific one (e.g., `tool:gh` for github.com) or set
-# `[network] allow_domains = [...]` in your canister.toml.
+# No `[[host]]` blocks here: git remotes are user-defined
+# (github.com, gitlab.com, an internal forge, …). Pair this recipe
+# with a forge-specific one (e.g., `tool:gh` for github.com) or add
+# `[[host]] domain = "..."` entries to your canister.toml.
 #
 # Composes with: any recipe; meant to be one component of a larger sandbox
 # (e.g., `tools = ["git", "gh"]` in canister.toml).

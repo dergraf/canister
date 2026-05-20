@@ -1,0 +1,28 @@
+# Slack API.
+#
+# Two content types: JSON for the modern API, multipart for legacy
+# `files.upload`. `application/x-www-form-urlencoded` permitted for
+# the older endpoints that still accept it (the Slack docs are
+# explicit that JSON is preferred for new code).
+
+[recipe]
+name        = "service:slack"
+description = "Slack API contracts"
+
+[[host]]
+domain            = "slack.com"
+methods           = ["GET", "POST"]
+content_types     = [
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+]
+max_request_bytes = 1073741824   # 1 GiB for files.upload
+paths             = ["/api/", "/oauth/"]
+allow_credentials = ["slack_token"]
+
+[[host]]
+domain        = "hooks.slack.com"
+methods       = ["POST"]
+content_types = ["application/json"]
+paths         = ["/services/"]

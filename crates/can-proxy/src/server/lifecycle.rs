@@ -12,6 +12,7 @@ use super::dlp_ctx::DlpCtx;
 use super::limits::ProxyLimits;
 use super::request::handle_proxy_request;
 use crate::ca::DynamicCa;
+use crate::contracts::ContractTable;
 use crate::policy::OutboundPolicy;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,9 @@ pub struct ProxyServerConfig {
     pub strict: bool,
     pub monitor: bool,
     pub canaries: Vec<String>,
+    /// Per-destination egress contracts. Empty means "no FQDN egress
+    /// permitted" — the contract gate refuses any host.
+    pub hosts: Vec<can_policy::config::HostBlock>,
     /// In-netns address that pasta maps to host:127.0.0.1. Set by
     /// the sandbox after `setns()` when `network.allow_host_loopback`
     /// is `true`; used to resolve the `host.canister.local` alias.
@@ -46,12 +50,18 @@ impl ProxyServerConfig {
             strict: false,
             monitor: false,
             canaries: Vec::new(),
+            hosts: Vec::new(),
             host_loopback_target: None,
         }
     }
 
     pub fn with_network(mut self, network: can_policy::config::NetworkConfig) -> Self {
         self.network = Some(network);
+        self
+    }
+
+    pub fn with_hosts(mut self, hosts: Vec<can_policy::config::HostBlock>) -> Self {
+        self.hosts = hosts;
         self
     }
 
@@ -85,6 +95,7 @@ pub struct ProxyServer {
     ca: Arc<DynamicCa>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    contracts: Arc<ContractTable>,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
 }
@@ -94,17 +105,24 @@ impl ProxyServer {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let mut outbound_policy = match &config.network {
-            Some(network) => OutboundPolicy::from_config(network),
+            Some(network) => OutboundPolicy::from_config(network, &config.hosts),
             None => OutboundPolicy::default(),
         };
         outbound_policy.host_loopback_target = config.host_loopback_target;
         let limits = ProxyLimits::from_config(&config.proxy);
         let dlp = DlpCtx::from_config(&config)?;
+        let contract_mode = config
+            .network
+            .as_ref()
+            .map(|n| n.contract_mode())
+            .unwrap_or_default();
+        let contracts = Arc::new(ContractTable::new(config.hosts.clone(), contract_mode));
 
         Ok(Self {
             ca: config.ca,
             dns_cache: can_net::dns_cache::DnsCache::new(Duration::from_secs(15)),
             outbound_policy,
+            contracts,
             limits,
             dlp,
         })
@@ -120,6 +138,7 @@ impl ProxyServer {
             let ca = self.ca.clone();
             let dns_cache = self.dns_cache.clone();
             let outbound_policy = self.outbound_policy.clone();
+            let contracts = self.contracts.clone();
             let limits = self.limits.clone();
             let dlp = self.dlp.clone();
             tokio::task::spawn(async move {
@@ -134,6 +153,7 @@ impl ProxyServer {
                                 ca.clone(),
                                 dns_cache.clone(),
                                 outbound_policy.clone(),
+                                contracts.clone(),
                                 limits.clone(),
                                 dlp.clone(),
                             )

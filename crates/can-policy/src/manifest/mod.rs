@@ -105,6 +105,12 @@ pub struct SandboxDef {
     /// L7 Proxy configuration overrides.
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    /// Per-destination egress contracts ([[host]]). Merged additively
+    /// with whatever the composed recipes declare — extending a
+    /// shipped contract is the same shape as adding a new one.
+    #[serde(default, rename = "host")]
+    pub hosts: Vec<super::config::HostBlock>,
 }
 
 /// The manifest filename searched for by `can up`.
@@ -203,6 +209,7 @@ impl From<&SandboxDef> for RecipeFile {
             resources: def.resources.clone(),
             syscalls: def.syscalls.clone(),
             proxy: def.proxy.clone(),
+            hosts: def.hosts.clone(),
         }
     }
 }

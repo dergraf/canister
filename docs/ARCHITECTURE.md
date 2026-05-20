@@ -99,7 +99,7 @@ When proxy is enabled with enforcement, outbound networking follows a three-laye
    under `--strict` + `proxy-only`), the L7 path scans request headers, URI, and body
    for credential patterns (GitHub PATs, npm tokens, AWS keys, SSH keys, etc.) and
    enforces per-detector domain scoping. A GitHub PAT bound for `registry.npmjs.org`
-   is blocked even though npm is in `allow_domains`. Bodies are decompressed
+   is blocked even though `registry.npmjs.org` has a `[[host]]` block. Bodies are decompressed
    (gzip/deflate/brotli) and decoded (base64/hex/percent, up to 32 layers) before
    pattern matching. See [DLP.md](DLP.md) for the threat model, detector list, and
    canary-token / session-entropy-budget mechanisms.
@@ -672,7 +672,7 @@ terminates.
 
 | Syscall | What is inspected | Policy enforcement |
 |---------|------------------|--------------------|
-| `connect()` | `sockaddr` struct (IP + port) | Must match resolved `allow_domains` IPs, `allow_ips` CIDRs, or loopback |
+| `connect()` | `sockaddr` struct (IP + port) | Must match IPs resolved from each `[[host]]`'s `domain`, `allow_ips` CIDRs, or loopback |
 | `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution; connected sockets (NULL addr) allowed |
 | `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing |
 | `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`) denied |

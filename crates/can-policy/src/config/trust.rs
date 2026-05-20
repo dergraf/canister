@@ -1,7 +1,8 @@
-//! R16: trust signal for `[dlp.scopes]`. A recipe whose SHA-256 doesn't
-//! match the embedded canonical-recipes snapshot is "untrusted"; its
-//! `[dlp.scopes]` entries are dropped at load time so a malicious or
-//! stale third-party recipe can't silently widen credential trust.
+//! Trust signal for credential-scope entries. A recipe whose SHA-256
+//! doesn't match the embedded canonical-recipes snapshot is "untrusted";
+//! every `[[host]] allow_credentials` list it declares is dropped at
+//! load time so a malicious or stale third-party recipe can't silently
+//! widen credential trust.
 
 use std::collections::HashMap;
 

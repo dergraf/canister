@@ -27,8 +27,8 @@ command = "nvim"
 [sandbox.dev.filesystem]
 allow_write = ["$HOME/.local/share/nvim"]
 
-[sandbox.dev.network]
-allow_domains = ["api.myproject.dev"]
+[[sandbox.dev.host]]
+domain = "api.myproject.dev"
 
 [sandbox.test]
 description = "Mix test runner"
@@ -59,7 +59,8 @@ cpu_percent = 100
     assert_eq!(dev.recipes, vec!["neovim", "elixir", "nix"]);
     assert_eq!(dev.command, "nvim");
     assert_eq!(dev.filesystem.allow_write.len(), 1);
-    assert_eq!(dev.network.allow_domains, vec!["api.myproject.dev"]);
+    assert_eq!(dev.hosts.len(), 1);
+    assert_eq!(dev.hosts[0].domain, "api.myproject.dev");
 
     let test = manifest.get("test").unwrap();
     assert_eq!(test.recipes, vec!["elixir", "nix"]);
@@ -277,8 +278,8 @@ strict = true
 [sandbox.dev.filesystem]
 allow_write = ["/tmp/state"]
 
-[sandbox.dev.network]
-allow_domains = ["hex.pm"]
+[[sandbox.dev.host]]
+domain = "hex.pm"
 
 [sandbox.dev.syscalls]
 allow_extra = ["ptrace"]
@@ -289,7 +290,8 @@ allow_extra = ["ptrace"]
 
     assert_eq!(recipe.strict, Some(true));
     assert_eq!(recipe.filesystem.allow_write.len(), 1);
-    assert_eq!(recipe.network.allow_domains, vec!["hex.pm"]);
+    assert_eq!(recipe.hosts.len(), 1);
+    assert_eq!(recipe.hosts[0].domain, "hex.pm");
     assert_eq!(recipe.syscalls.allow_extra, vec!["ptrace"]);
 }
 

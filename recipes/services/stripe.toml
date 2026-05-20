@@ -1,0 +1,23 @@
+# Stripe API.
+#
+# Stripe is one of the rare REST APIs that still uses
+# `application/x-www-form-urlencoded` instead of JSON for request
+# bodies. Allow both — newer endpoints accept JSON too.
+
+[recipe]
+name        = "service:stripe"
+description = "Stripe API contracts"
+
+[[host]]
+domain            = "api.stripe.com"
+methods           = ["GET", "POST", "DELETE"]
+content_types     = ["application/x-www-form-urlencoded", "application/json", "multipart/form-data"]
+max_request_bytes = 1048576   # 1 MiB
+allow_credentials = ["stripe_key"]
+
+[[host]]
+domain        = "files.stripe.com"
+methods       = ["POST"]
+content_types = ["multipart/form-data"]
+max_request_bytes = 10485760   # 10 MiB receipts / IDs
+allow_credentials = ["stripe_key"]

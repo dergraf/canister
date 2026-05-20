@@ -1,4 +1,5 @@
 pub mod ca;
+pub mod contracts;
 pub mod egress;
 pub mod events;
 pub mod policy;

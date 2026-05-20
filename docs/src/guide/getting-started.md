@@ -66,7 +66,11 @@ For projects that need reproducible sandbox configurations, create a `canister.t
 recipes = ["python", "network-curl"]
 
 [sandbox.dev.config.network]
-allow_domains = ["pypi.org", "files.pythonhosted.org"]
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
 ```
 
 Then use `can up` to launch the sandbox:

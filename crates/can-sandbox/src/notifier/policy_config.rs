@@ -98,7 +98,7 @@ pub fn policy_from_config(
     // allows raw outbound.
     let egress_mode = config.network.egress();
     let restrict_outbound = !config.network.allow_ips.is_empty()
-        || !config.network.allow_domains.is_empty()
+        || !config.hosts.is_empty()
         || matches!(egress_mode, EgressMode::ProxyOnly | EgressMode::None);
 
     NotifierPolicy {
@@ -110,7 +110,7 @@ pub fn policy_from_config(
         allow_af_inet: true,
         restrict_outbound,
         dns_server_addr: dns_addr.to_string(),
-        allowed_domains: config.network.allow_domains.clone(),
+        allowed_domains: config.hosts.iter().map(|h| h.domain.clone()).collect(),
         dns_cache,
         dynamic_ips: Arc::new(RwLock::new(HashSet::new())),
         // `egress = "none"` and `egress = "proxy-only"` both restrict

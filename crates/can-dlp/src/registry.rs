@@ -17,9 +17,9 @@ use crate::detectors::DetectorAction;
 
 /// One detector's full definition.
 pub struct DetectorDef {
-    /// Snake-case identifier used in logs, events, recipe scope keys.
-    /// Stable contract — changing this is a breaking change visible in
-    /// recipes (`[dlp.scopes]` keys) and SIEM dashboards.
+    /// Snake-case identifier used in logs, events, and per-host
+    /// `allow_credentials` entries. Stable contract — changing this is
+    /// a breaking change visible in recipes and SIEM dashboards.
     pub id: &'static str,
     /// Regex source. `None` for detectors whose match is computed
     /// elsewhere (entropy-based, canary substring, …).
@@ -33,8 +33,8 @@ pub struct DetectorDef {
     /// a warning rather than a block. Wildcard patterns (`*.github.com`)
     /// are supported.
     pub home_domains: &'static [&'static str],
-    /// How this detector interacts with the user-supplied
-    /// `[dlp.scopes]` table.
+    /// How this detector interacts with per-host `allow_credentials`
+    /// entries supplied by the recipe.
     pub scope_policy: ScopePolicy,
     /// If `Some`, this detector has a corresponding canary that the
     /// sandbox injects as an environment variable. Used by both the
@@ -54,13 +54,14 @@ pub enum ScopePolicy {
     /// SSH/PKCS8 private keys, canary tokens, and Postgres URIs whose
     /// embedded credentials never have a legitimate egress path.
     AlwaysBlock,
-    /// Allowed at `home_domains` plus any `[dlp.scopes].<id>` entries
-    /// in the recipe. The default for "this token belongs at this
-    /// service" detectors (GithubPat, NpmToken, AwsAccessKey, …).
+    /// Allowed at `home_domains` plus any host whose `[[host]]` block
+    /// lists this detector id in `allow_credentials`. The default for
+    /// "this token belongs at this service" detectors (GithubPat,
+    /// NpmToken, AwsAccessKey, …).
     HomeAndScopes,
-    /// Only allowed at explicit `[dlp.scopes].<id>` entries. No
-    /// built-in home is meaningful — used for Bearer (any JWT) and
-    /// GenericHighEntropy.
+    /// Only allowed at hosts whose `[[host]]` block explicitly lists
+    /// this detector id in `allow_credentials`. No built-in home is
+    /// meaningful — used for Bearer (any JWT) and GenericHighEntropy.
     ScopesOnly,
 }
 

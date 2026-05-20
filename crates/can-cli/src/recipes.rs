@@ -172,11 +172,11 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
             println!();
         }
 
-        // Network
-        if !recipe.network.allow_domains.is_empty() {
-            println!("  Allowed domains:");
-            for domain in &recipe.network.allow_domains {
-                println!("    {domain}");
+        // Per-destination contracts.
+        if !recipe.hosts.is_empty() {
+            println!("  Hosts:");
+            for h in &recipe.hosts {
+                println!("    {}", h.domain);
             }
             println!();
         }

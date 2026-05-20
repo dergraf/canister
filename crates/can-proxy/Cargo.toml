@@ -36,3 +36,4 @@ ipnet.workspace = true
 base64 = "0.22"
 reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
 flate2 = "1"
+proptest = "1"

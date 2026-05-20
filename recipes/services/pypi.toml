@@ -1,0 +1,29 @@
+# PyPI + the index hosts behind it.
+#
+# `pypi.org` serves the JSON simple index (and the human site). The
+# actual wheels/sdists are on `*.pythonhosted.org` (CDN backend), so
+# pip and uv talk to both. `twine upload` POSTs multipart/form-data
+# to `upload.pypi.org`.
+
+[recipe]
+name        = "service:pypi"
+description = "PyPI + pythonhosted contracts"
+
+[[host]]
+domain            = "pypi.org"
+methods           = ["GET", "HEAD"]
+content_types     = ["application/json", "application/vnd.pypi.simple.v1+json"]
+
+[[host]]
+domain            = "upload.pypi.org"
+methods           = ["POST"]
+content_types     = ["multipart/form-data"]
+max_request_bytes = 1073741824   # 1 GiB — large wheels exist
+
+[[host]]
+domain        = "*.pythonhosted.org"
+methods       = ["GET", "HEAD"]
+# CDN endpoints don't carry credentials and the content types are
+# heterogeneous (whl, tar.gz, sigs); relaxed mode keeps detection
+# (BodyRaw) without enumerating every mime type.
+contract_mode = "relaxed"

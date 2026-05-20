@@ -27,8 +27,8 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [proxy]
 max_buffered_body_bytes = 1024
 max_streamed_body_bytes = 16384

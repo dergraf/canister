@@ -15,6 +15,7 @@ use serde::Deserialize;
 use super::env::expand_env_vars;
 use super::error::ConfigError;
 use super::filesystem::FilesystemConfig;
+use super::host::HostBlock;
 use super::network::NetworkConfig;
 use super::process::ProcessConfig;
 use super::proxy::ProxyConfig;
@@ -95,19 +96,28 @@ pub struct RecipeFile {
     /// L7 Proxy configuration.
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    /// Per-destination egress contracts. See `host::HostBlock` and
+    /// `docs/adr/0007-per-destination-egress-contracts.md`. Multiple
+    /// blocks targeting the same domain are merged in `RecipeFile::merge`
+    /// (vec union, max for `max_request_bytes`, last-Some-wins for
+    /// `contract_mode`).
+    #[serde(default, rename = "host")]
+    pub hosts: Vec<HostBlock>,
 }
 
 impl RecipeFile {
     /// Load a recipe from a TOML file.
     ///
-    /// R16: a recipe whose contents don't match a known-good SHA-256
-    /// checksum is considered "untrusted." We still load and apply the
-    /// recipe, but we **drop** its `[dlp.scopes]` entries so a malicious
-    /// or stale third-party recipe can't silently widen credential trust.
-    /// User-authored recipes are inherently untrusted under this scheme
-    /// (their hashes are not in the embedded list); the workaround is to
-    /// configure scopes in the project's own `canister.toml` manifest
-    /// rather than in a downloaded recipe, or to pin the recipe via
+    /// A recipe whose contents don't match a known-good SHA-256
+    /// checksum is considered "untrusted." We still load and apply
+    /// the recipe, but we **drop** every `[[host]] allow_credentials`
+    /// list so a malicious or stale third-party recipe can't
+    /// silently widen credential trust. User-authored recipes are
+    /// inherently untrusted under this scheme (their hashes aren't in
+    /// the embedded list); the workaround is to configure credential
+    /// scope in the project's own `canister.toml` manifest rather
+    /// than in a downloaded recipe, or to pin the recipe via
     /// `can pull` against the canonical repo.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(ConfigError::ReadFile)?;
@@ -120,31 +130,36 @@ impl RecipeFile {
         Ok(recipe)
     }
 
-    /// Drop `[dlp.scopes]` entries from this recipe unless the recipe's
-    /// SHA-256 matches the embedded `recipes/checksums.toml` snapshot.
-    /// Logs a warning per dropped detector at `warn` so the operator sees
-    /// what was filtered.
+    /// Drop `[[host]] allow_credentials` entries from this recipe
+    /// unless the recipe's SHA-256 matches the embedded
+    /// `recipes/checksums.toml` snapshot. Logs a warning so the
+    /// operator sees what was filtered.
     fn drop_untrusted_scopes(&mut self, filename: &str, content: &str) {
         if filename.is_empty() {
             return;
         }
-        let Some(dlp) = self.network.dlp.as_mut() else {
-            return;
-        };
-        if dlp.scopes.is_empty() {
+        let any_credentials = self.hosts.iter().any(|h| !h.allow_credentials.is_empty());
+        if !any_credentials {
             return;
         }
         if recipe_checksum_matches(filename, content) {
             return;
         }
-        let detectors: Vec<String> = dlp.scopes.keys().cloned().collect();
+        let dropped: Vec<(String, Vec<String>)> = self
+            .hosts
+            .iter()
+            .filter(|h| !h.allow_credentials.is_empty())
+            .map(|h| (h.domain.clone(), h.allow_credentials.clone()))
+            .collect();
         tracing::warn!(
             recipe = filename,
-            detectors = ?detectors,
-            "untrusted recipe: dropping [dlp.scopes] entries (recipe not pinned by checksum). \
-             Move scope entries into your project's canister.toml or pin the recipe via `can pull`."
+            dropped = ?dropped,
+            "untrusted recipe: dropping [[host]].allow_credentials entries (recipe not pinned by checksum). \
+             Move credential-scope entries into your project's canister.toml or pin the recipe via `can pull`."
         );
-        dlp.scopes.clear();
+        for h in &mut self.hosts {
+            h.allow_credentials.clear();
+        }
     }
 
     /// Parse a recipe from a TOML string.
@@ -183,6 +198,7 @@ impl RecipeFile {
             resources: self.resources,
             syscalls: self.syscalls,
             proxy: self.proxy,
+            hosts: self.hosts,
         })
     }
 

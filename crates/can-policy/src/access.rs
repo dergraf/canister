@@ -45,16 +45,22 @@ pub fn check_path(path: &Path, config: &FilesystemConfig) -> AccessDecision {
     AccessDecision::Deny
 }
 
-/// Check whether a domain is allowed by the network config.
-pub fn check_domain(domain: &str, config: &NetworkConfig) -> AccessDecision {
-    if matches!(config.egress(), EgressMode::Direct) {
+/// Check whether a domain is allowed under the active egress mode
+/// and the supplied allow-list. The allow-list comes from the
+/// `[[host]]` table (via `SandboxConfig::hosts`).
+pub fn check_domain(
+    domain: &str,
+    egress: EgressMode,
+    allowed_domains: impl IntoIterator<Item = impl AsRef<str>>,
+) -> AccessDecision {
+    if matches!(egress, EgressMode::Direct) {
         return AccessDecision::Allow;
     }
 
     let normalized = domain.trim_end_matches('.');
 
-    for allowed in &config.allow_domains {
-        let allowed_normalized = allowed.trim_end_matches('.');
+    for allowed in allowed_domains {
+        let allowed_normalized = allowed.as_ref().trim_end_matches('.');
         if normalized == allowed_normalized
             || normalized.ends_with(&format!(".{allowed_normalized}"))
         {
@@ -143,59 +149,48 @@ mod tests {
 
     #[test]
     fn domain_allowed() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec!["pypi.org".to_string()],
-            allow_ips: vec![],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
-        assert_eq!(check_domain("pypi.org", &config), AccessDecision::Allow);
+        let allowed = ["pypi.org".to_string()];
         assert_eq!(
-            check_domain("files.pypi.org", &config),
+            check_domain("pypi.org", EgressMode::ProxyOnly, &allowed),
             AccessDecision::Allow
         );
-        assert_eq!(check_domain("evil.com", &config), AccessDecision::Deny);
+        assert_eq!(
+            check_domain("files.pypi.org", EgressMode::ProxyOnly, &allowed),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            check_domain("evil.com", EgressMode::ProxyOnly, &allowed),
+            AccessDecision::Deny
+        );
     }
 
     #[test]
     fn domain_allow_all_when_egress_direct() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::Direct),
-            allow_domains: vec![],
-            allow_ips: vec![],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
-        assert_eq!(check_domain("anything.com", &config), AccessDecision::Allow);
+        let allowed: [String; 0] = [];
+        assert_eq!(
+            check_domain("anything.com", EgressMode::Direct, &allowed),
+            AccessDecision::Allow
+        );
+    }
+
+    fn net(ips: Vec<&str>) -> NetworkConfig {
+        NetworkConfig {
+            egress: Some(EgressMode::ProxyOnly),
+            allow_ips: ips.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn ip_allowed() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
-            allow_ips: vec!["10.0.0.1".to_string()],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
+        let config = net(vec!["10.0.0.1"]);
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("192.168.1.1", &config), AccessDecision::Deny);
     }
 
     #[test]
     fn ip_cidr_match() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
-            allow_ips: vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
+        let config = net(vec!["10.0.0.0/8", "192.168.1.0/24"]);
         assert_eq!(check_ip("10.0.0.1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("10.255.255.255", &config), AccessDecision::Allow);
         assert_eq!(check_ip("192.168.1.42", &config), AccessDecision::Allow);
@@ -205,27 +200,13 @@ mod tests {
 
     #[test]
     fn ip_invalid_input_denied() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
-            allow_ips: vec!["10.0.0.0/8".to_string()],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
+        let config = net(vec!["10.0.0.0/8"]);
         assert_eq!(check_ip("not-an-ip", &config), AccessDecision::Deny);
     }
 
     #[test]
     fn ip_ipv6_cidr() {
-        let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
-            allow_ips: vec!["fd00::/8".to_string()],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
-        };
+        let config = net(vec!["fd00::/8"]);
         assert_eq!(check_ip("fd00::1", &config), AccessDecision::Allow);
         assert_eq!(check_ip("2001:db8::1", &config), AccessDecision::Deny);
     }

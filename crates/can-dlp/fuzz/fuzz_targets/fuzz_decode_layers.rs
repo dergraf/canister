@@ -10,7 +10,8 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let layers = can_dlp::decode::decode_layers(data, 32);
+    let layers =
+        can_dlp::decode::decode_layers(data, 32, can_dlp::transforms::DEFAULT_COST_BUDGET);
     // The decode module hard-caps total layers at MAX_TOTAL_LAYERS (256).
     // If a fuzzer-found input ever exceeds that, the cap is broken.
     assert!(layers.len() <= 256, "layer count exceeded cap: {}", layers.len());

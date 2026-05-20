@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7e069efdc908c20fabe0fa14d2a6eb8aa0dc9445a4ee959054227f805ddaf537 # shrinks to (det, raw) = ("github_pat", [103, 104, 112, 95, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65]), chain = Chain { inner: Some(InterleaveSep('-')), comp: [] }, chan = HeaderValue { name: "X-Custom" }
+cc 0224d833f4baa2a9c2dc64b9f8738e399470e87161bbe115c8a1f790d1b28911 # shrinks to (det, raw) = ("github_pat", [103, 104, 112, 95, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65]), chain = Chain { inner: None, comp: [Gzip] }, chan = HeaderValue { name: "X-Custom" }
+cc 1ccba44f738da427b035d999948a6582ae0725b15ee19d5f10932753acf25824 # shrinks to (det, raw) = ("stripe_key", [115, 107, 95, 108, 105, 118, 101, 95, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65]), chain = Chain { inner: Some(InterleaveSep('_')), comp: [] }, chan = HeaderValue { name: "X-Custom" }

@@ -33,16 +33,22 @@ deny = [
 
 [network]
 # Destinations the GitHub CLI needs to function. Unioned with any
-# `allow_domains` from other recipes; ignored entirely unless the
+# other recipe's `[[host]]` blocks; ignored entirely unless the
 # containing sandbox enables `egress = "proxy-only"`.
-allow_domains = [
-    "github.com",
-    "api.github.com",
-    "uploads.github.com",
-    "objects.githubusercontent.com",
-    "codeload.github.com",
-]
+[[host]]
+domain = "github.com"
 
+[[host]]
+domain = "api.github.com"
+
+[[host]]
+domain = "uploads.github.com"
+
+[[host]]
+domain = "objects.githubusercontent.com"
+
+[[host]]
+domain = "codeload.github.com"
 [process]
 env_passthrough = [
     "GH_TOKEN",

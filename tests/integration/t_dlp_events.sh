@@ -26,8 +26,8 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 

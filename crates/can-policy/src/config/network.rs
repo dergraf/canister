@@ -16,11 +16,17 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub egress: Option<EgressMode>,
 
-    /// Allowed domain names (resolved via internal DNS proxy).
+    /// Global default for per-host contract enforcement when no
+    /// matching `[[host]]` entry exists. `Strict` refuses unknown
+    /// hosts; `Relaxed` allows them with a tracing event.
+    /// Default: `Strict`.
     #[serde(default)]
-    pub allow_domains: Vec<String>,
+    pub contract_mode: Option<super::host::ContractMode>,
 
-    /// Allowed IP addresses or CIDR ranges.
+    /// Allowed IP addresses or CIDR ranges. IP-literal egress is a
+    /// separate concept from FQDN egress (no service identity, no
+    /// per-route shape gates apply), so it stays here rather than
+    /// folding into the `[[host]]` table.
     #[serde(default)]
     pub allow_ips: Vec<String>,
 
@@ -59,12 +65,17 @@ impl NetworkConfig {
     pub fn merge(self, overlay: Self) -> Self {
         Self {
             egress: overlay.egress.or(self.egress),
-            allow_domains: union_vecs(self.allow_domains, overlay.allow_domains),
+            contract_mode: overlay.contract_mode.or(self.contract_mode),
             allow_ips: union_vecs(self.allow_ips, overlay.allow_ips),
             ports: union_vecs(self.ports, overlay.ports),
             allow_host_loopback: self.allow_host_loopback || overlay.allow_host_loopback,
             dlp: merge_dlp(self.dlp, overlay.dlp),
         }
+    }
+
+    /// Resolved global default contract mode (strict if unset).
+    pub fn contract_mode(&self) -> super::host::ContractMode {
+        self.contract_mode.unwrap_or_default()
     }
 }
 

@@ -111,7 +111,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     }
 
     // Determine network isolation mode from policy.
-    let net_mode = NetworkMode::from_config(&opts.config.network);
+    let net_mode = NetworkMode::from_config(&opts.config.network, opts.config.hosts.len());
     tracing::debug!(?net_mode, "network isolation mode");
 
     // Initialize CA for the proxy when egress mode requires proxy path.
@@ -135,35 +135,34 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     // Both parent and child need the resolved IPs: the parent for reference,
     // the child to build the NotifierPolicy for the supervisor.
     // Done here (before fork) so the child inherits the results.
-    let resolved_ips =
-        if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
-            let resolved = can_net::resolve_allowed_domains(&opts.config.network);
-            if resolved.is_empty() {
-                tracing::warn!("could not resolve any allowed domains to IPs");
-            } else {
-                tracing::info!(
-                    count = resolved.len(),
-                    "pre-resolved allowed domains to IPs"
-                );
-                for (domain, ips) in &resolved {
-                    tracing::debug!(domain, ips = ?ips, "resolved");
-                }
-            }
-            resolved
+    let host_domains: Vec<String> = opts.config.hosts.iter().map(|h| h.domain.clone()).collect();
+    let resolved_ips = if net_mode == NetworkMode::Filtered && !host_domains.is_empty() {
+        let resolved = can_net::resolve_allowed_domains(&host_domains);
+        if resolved.is_empty() {
+            tracing::warn!("could not resolve any allowed domains to IPs");
         } else {
-            Vec::new()
-        };
+            tracing::info!(
+                count = resolved.len(),
+                "pre-resolved allowed domains to IPs"
+            );
+            for (domain, ips) in &resolved {
+                tracing::debug!(domain, ips = ?ips, "resolved");
+            }
+        }
+        resolved
+    } else {
+        Vec::new()
+    };
 
-    let dns_cache =
-        if net_mode == NetworkMode::Filtered && !opts.config.network.allow_domains.is_empty() {
-            let cache = DnsCache::new(std::time::Duration::from_secs(15));
-            for domain in &opts.config.network.allow_domains {
-                let _ = cache.resolve_cached_or_lookup(domain);
-            }
-            Some(cache)
-        } else {
-            None
-        };
+    let dns_cache = if net_mode == NetworkMode::Filtered && !host_domains.is_empty() {
+        let cache = DnsCache::new(std::time::Duration::from_secs(15));
+        for domain in &host_domains {
+            let _ = cache.resolve_cached_or_lookup(domain);
+        }
+        Some(cache)
+    } else {
+        None
+    };
 
     let dlp_config = opts.config.network.dlp.as_ref();
     let dlp_enabled = dlp_config.map(|d| d.is_enabled()).unwrap_or(false)
@@ -423,6 +422,7 @@ fn setup_parent_network(
                 rt.block_on(async {
                     let mut proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
                         .with_network(config.network.clone())
+                        .with_hosts(config.hosts.clone())
                         .with_proxy_config(config.proxy.clone())
                         .with_strict(config.strict)
                         .with_monitor(monitor)

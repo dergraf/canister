@@ -389,7 +389,11 @@ allow = ["/usr/lib", "/usr/bin", "/tmp/workspace", "$HOME/.config"]
 deny  = ["/etc/shadow"]
 
 [network]
-allow_domains = ["pypi.org", "files.pythonhosted.org"]
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
 allow_ips     = ["10.0.0.0/8"]
 egress        = "proxy-only"   # default
 

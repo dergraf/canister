@@ -308,7 +308,7 @@ delivers the notification to the supervisor, regardless of what other filters re
 
 | Syscall | Argument inspected | Policy |
 |---------|-------------------|--------|
-| `connect()` | `sockaddr` (destination address) | Allow only IPs from pre-resolved `allow_domains` and explicit `allow_ips`. Loopback and Unix domain sockets always allowed. |
+| `connect()` | `sockaddr` (destination address) | Allow only IPs pre-resolved from each `[[host]]` block's `domain` and explicit `allow_ips`. Loopback and Unix domain sockets always allowed. |
 | `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution and dynamic allowlist population. Connected sockets (NULL dest_addr) allowed. |
 | `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing regardless of outbound restriction settings. |
 | `clone()` | `flags` (register value) | Deny namespace-creating flags: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` |
@@ -340,9 +340,9 @@ eliminates the most common race windows.
 
 For `connect()` filtering, the supervisor supports both exact IP matches and CIDR
 range matches (e.g., `10.0.0.0/8`, `2606:2800:220:1::/64`). The resolved IPs from
-`allow_domains` are combined with any `allow_ips` CIDR ranges from the config to
-build the allowlist. Loopback addresses (`127.0.0.0/8`, `::1`) and `AF_UNIX`
-sockets are always permitted.
+each `[[host]]` block's `domain` are combined with any `allow_ips` CIDR ranges
+from the config to build the allowlist. Loopback addresses (`127.0.0.0/8`,
+`::1`) and `AF_UNIX` sockets are always permitted.
 
 ### DNS proxy integration
 
@@ -350,9 +350,9 @@ When the notifier is active, a DNS proxy runs in the **parent process** on
 an ephemeral port. The sandbox's `/etc/resolv.conf` points to pasta's
 DNS address (`169.254.0.1:53`), which is configured via `--dns-forward`
 to forward queries to the parent's DNS proxy. The proxy
-only resolves domains in the `allow_domains` list — all other queries receive
-an NXDOMAIN response. This prevents DNS-based information exfiltration and
-ensures the sandbox can only resolve allowed domains.
+only resolves domains that have a matching `[[host]]` block — all other
+queries receive an NXDOMAIN response. This prevents DNS-based information
+exfiltration and ensures the sandbox can only resolve allowed domains.
 
 ### Configuration
 

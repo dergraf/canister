@@ -426,10 +426,10 @@ fn generate_merge_semantics(out_dir: &Path) -> Result<()> {
             "Deduplicated, preserving first-occurrence order",
         ),
         (
-            "network.allow_domains",
-            "Vec<String>",
-            "Union",
-            "Deduplicated, preserving first-occurrence order",
+            "host (top-level [[host]] blocks)",
+            "Vec<HostBlock>",
+            "Union by domain",
+            "Same domain → field-merged via HostBlock::merge; distinct domains preserved",
         ),
         (
             "network.allow_ips",

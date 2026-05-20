@@ -19,12 +19,14 @@ deny = [
 ]
 
 [network]
-allow_domains = [
-    "crates.io",
-    "index.crates.io",
-    "static.crates.io",
-]
+[[host]]
+domain = "crates.io"
 
+[[host]]
+domain = "index.crates.io"
+
+[[host]]
+domain = "static.crates.io"
 [process]
 env_passthrough = [
     "CARGO_HOME",

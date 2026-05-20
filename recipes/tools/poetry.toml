@@ -17,11 +17,11 @@ deny = [
 ]
 
 [network]
-allow_domains = [
-    "pypi.org",
-    "files.pythonhosted.org",
-]
+[[host]]
+domain = "pypi.org"
 
+[[host]]
+domain = "files.pythonhosted.org"
 [process]
 env_passthrough = [
     "POETRY_HOME",

@@ -8,13 +8,14 @@ fn parse_minimal_config() {
 [filesystem]
 allow = ["/usr/lib", "/tmp/workspace"]
 
-[network]
-allow_domains = ["pypi.org"]
+[[host]]
+domain = "pypi.org"
 "#;
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
     let config = recipe.into_sandbox_config().unwrap();
     assert_eq!(config.filesystem.allow.len(), 2);
-    assert_eq!(config.network.allow_domains, vec!["pypi.org"]);
+    assert_eq!(config.hosts.len(), 1);
+    assert_eq!(config.hosts[0].domain, "pypi.org");
     assert_eq!(config.network.egress(), EgressMode::ProxyOnly); // default
     assert!(config.syscalls.allow_extra.is_empty());
 }
@@ -28,9 +29,14 @@ allow_write = ["/var/data"]
 deny = ["/etc/shadow"]
 
 [network]
-allow_domains = ["pypi.org", "registry.npmjs.org"]
 allow_ips = ["10.0.0.0/8"]
 egress = "proxy-only"
+
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "registry.npmjs.org"
 
 [process]
 max_pids = 64
@@ -62,7 +68,7 @@ fn default_deny_config() {
     let config = SandboxConfig::default_deny();
     assert_eq!(config.network.egress(), EgressMode::ProxyOnly);
     assert!(config.filesystem.allow.is_empty());
-    assert!(config.network.allow_domains.is_empty());
+    assert!(config.hosts.is_empty());
     assert!(config.syscalls.allow_extra.is_empty());
     assert!(config.syscalls.deny_extra.is_empty());
 }
@@ -98,8 +104,13 @@ version = "1"
 allow = ["/usr/lib", "/tmp"]
 
 [network]
-allow_domains = ["pypi.org", "files.pythonhosted.org"]
 egress = "proxy-only"
+
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
@@ -350,24 +361,30 @@ fn merge_egress_last_wins() {
 }
 
 #[test]
-fn merge_network_domains_union() {
+fn merge_hosts_dedup_across_recipes() {
+    // Same-domain `[[host]]` blocks across recipes collapse to one
+    // entry; distinct domains stay separate.
     let a = parse_recipe(
         r#"
-[network]
-allow_domains = ["pypi.org", "github.com"]
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "github.com"
 "#,
     );
     let b = parse_recipe(
         r#"
-[network]
-allow_domains = ["github.com", "hex.pm"]
+[[host]]
+domain = "github.com"
+
+[[host]]
+domain = "hex.pm"
 "#,
     );
     let merged = a.merge(b);
-    assert_eq!(
-        merged.network.allow_domains,
-        vec!["pypi.org", "github.com", "hex.pm"]
-    );
+    let domains: Vec<&str> = merged.hosts.iter().map(|h| h.domain.as_str()).collect();
+    assert_eq!(domains, vec!["pypi.org", "github.com", "hex.pm"]);
 }
 
 #[test]
@@ -638,32 +655,25 @@ egress = "proxy-only"
     );
     let auto_detected = parse_recipe(
         r#"
-[network]
-allow_domains = ["github.com"]
+[[host]]
+domain = "github.com"
 "#,
     );
     let cli_override = parse_recipe(
         r#"
-[network]
-allow_domains = ["registry.npmjs.org"]
+[[host]]
+domain = "registry.npmjs.org"
 "#,
     );
     let merged = strict_base.merge(auto_detected).merge(cli_override);
     assert_eq!(merged.strict, Some(true));
     assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
+    assert!(merged.hosts.iter().any(|h| h.domain == "github.com"));
     assert!(
         merged
-            .network
-            .allow_domains
+            .hosts
             .iter()
-            .any(|d| d == "github.com")
-    );
-    assert!(
-        merged
-            .network
-            .allow_domains
-            .iter()
-            .any(|d| d == "registry.npmjs.org")
+            .any(|h| h.domain == "registry.npmjs.org")
     );
 }
 
@@ -697,33 +707,28 @@ upstream_request_timeout_ms = 5000
 
 #[test]
 fn merge_case_different_domains_preserved_then_normalized_at_policy() {
+    // Equivalent for the [[host]] schema: case-different domains are
+    // distinct keys at the merge layer (the proxy normalises at
+    // policy-build time via `OutboundPolicy::from_config`).
     let a = parse_recipe(
         r#"
-[network]
-allow_domains = ["Example.com"]
+[[host]]
+domain = "Example.com"
 "#,
     );
     let b = parse_recipe(
         r#"
-[network]
-allow_domains = ["example.com"]
+[[host]]
+domain = "example.com"
 "#,
     );
     let merged = a.merge(b);
     assert!(
-        merged
-            .network
-            .allow_domains
-            .iter()
-            .any(|d| d == "Example.com"),
+        merged.hosts.iter().any(|h| h.domain == "Example.com"),
         "merged should still contain Example.com",
     );
     assert!(
-        merged
-            .network
-            .allow_domains
-            .iter()
-            .any(|d| d == "example.com"),
+        merged.hosts.iter().any(|h| h.domain == "example.com"),
         "merged should still contain example.com",
     );
 }
@@ -862,21 +867,26 @@ match_prefix = ["$_CANISTER_TEST_HOME3/.cargo"]
 }
 
 #[test]
-fn r16_untrusted_recipe_scopes_dropped() {
+fn r16_untrusted_recipe_credentials_dropped() {
+    // R16 trust mechanism now operates on per-[[host]]
+    // `allow_credentials`. An unpinned recipe must not silently
+    // widen credential trust.
     let content = r#"
 [recipe]
 name = "evil"
 
 [network]
 egress = "proxy-only"
-allow_domains = ["api.example.com"]
 
 [network.dlp]
 enabled = true
 
-[network.dlp.scopes]
-github_pat = ["attacker.example.com"]
-bearer_token = ["attacker.example.com"]
+[[host]]
+domain = "attacker.example.com"
+allow_credentials = ["github_pat", "bearer_token"]
+
+[[host]]
+domain = "api.example.com"
 "#;
     let dir = std::env::temp_dir().join("can-r16-test");
     std::fs::create_dir_all(&dir).unwrap();
@@ -889,33 +899,249 @@ bearer_token = ["attacker.example.com"]
         .dlp
         .as_ref()
         .expect("dlp section should still be present");
-    assert!(
-        dlp.scopes.is_empty(),
-        "untrusted recipe's scopes should be cleared, got: {:?}",
-        dlp.scopes
-    );
     assert_eq!(dlp.enabled, Some(true));
-    assert_eq!(recipe.network.allow_domains, vec!["api.example.com"]);
+    assert_eq!(recipe.hosts.len(), 2);
+    let attacker = recipe
+        .hosts
+        .iter()
+        .find(|h| h.domain == "attacker.example.com")
+        .unwrap();
+    assert!(
+        attacker.allow_credentials.is_empty(),
+        "untrusted recipe's allow_credentials should be cleared, got: {:?}",
+        attacker.allow_credentials
+    );
 
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn r16_parse_path_skipped_for_string_parse() {
+    // `RecipeFile::parse` (no path) bypasses the R16 trust filter —
+    // the filter only triggers for `from_file`, which can know the
+    // filename to look up in the embedded checksums table.
     let content = r#"
 [network]
 egress = "proxy-only"
 
-[network.dlp]
-enabled = true
-
-[network.dlp.scopes]
-github_pat = ["github.corp.example.com"]
+[[host]]
+domain = "github.corp.example.com"
+allow_credentials = ["github_pat"]
 "#;
     let recipe = RecipeFile::parse(content).unwrap();
-    let dlp = recipe.network.dlp.as_ref().unwrap();
     assert!(
-        !dlp.scopes.is_empty(),
+        !recipe.hosts[0].allow_credentials.is_empty(),
         "RecipeFile::parse should not trigger trust filtering"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// [[host]] block parsing + merge.
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn host_block_parses_in_recipe_file() {
+    let recipe = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+methods = ["GET", "POST"]
+content_types = ["application/json"]
+allow_credentials = ["github_pat"]
+contract_mode = "strict"
+"#,
+    );
+    assert_eq!(recipe.hosts.len(), 1);
+    let h = &recipe.hosts[0];
+    assert_eq!(h.domain, "api.github.com");
+    assert_eq!(h.methods, vec!["GET", "POST"]);
+    assert_eq!(h.allow_credentials, vec!["github_pat"]);
+    assert_eq!(h.contract_mode, Some(crate::config::ContractMode::Strict));
+}
+
+#[test]
+fn merge_host_blocks_unions_same_domain() {
+    let a = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+methods = ["GET"]
+allow_credentials = ["github_pat"]
+"#,
+    );
+    let b = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+methods = ["POST"]
+content_types = ["application/json"]
+"#,
+    );
+    let merged = a.merge(b);
+    assert_eq!(merged.hosts.len(), 1);
+    let h = &merged.hosts[0];
+    assert_eq!(h.methods, vec!["GET", "POST"]);
+    assert_eq!(h.content_types, vec!["application/json"]);
+    assert_eq!(h.allow_credentials, vec!["github_pat"]);
+}
+
+#[test]
+fn merge_host_blocks_keeps_distinct_domains_separate() {
+    let a = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+methods = ["GET"]
+"#,
+    );
+    let b = parse_recipe(
+        r#"
+[[host]]
+domain = "registry.npmjs.org"
+methods = ["GET"]
+"#,
+    );
+    let merged = a.merge(b);
+    assert_eq!(merged.hosts.len(), 2);
+    assert!(merged.hosts.iter().any(|h| h.domain == "api.github.com"));
+    assert!(
+        merged
+            .hosts
+            .iter()
+            .any(|h| h.domain == "registry.npmjs.org")
+    );
+}
+
+#[test]
+fn merge_host_blocks_max_request_bytes_takes_max() {
+    let a = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+max_request_bytes = 1024
+"#,
+    );
+    let b = parse_recipe(
+        r#"
+[[host]]
+domain = "api.github.com"
+max_request_bytes = 1048576
+"#,
+    );
+    let merged = a.merge(b);
+    assert_eq!(merged.hosts[0].max_request_bytes, Some(1_048_576));
+}
+
+#[test]
+fn merge_host_blocks_contract_mode_last_some_wins() {
+    let a = parse_recipe(
+        r#"
+[[host]]
+domain = "weird.internal"
+contract_mode = "strict"
+"#,
+    );
+    let b = parse_recipe(
+        r#"
+[[host]]
+domain = "weird.internal"
+contract_mode = "relaxed"
+"#,
+    );
+    assert_eq!(
+        a.merge(b).hosts[0].contract_mode,
+        Some(crate::config::ContractMode::Relaxed)
+    );
+}
+
+#[test]
+fn minimum_viable_host_block_parses() {
+    // Just permit the host — no shape gates, no credential whitelist.
+    let recipe = parse_recipe(
+        r#"
+[[host]]
+domain = "static.example.com"
+"#,
+    );
+    let h = &recipe.hosts[0];
+    assert_eq!(h.domain, "static.example.com");
+    assert!(h.methods.is_empty());
+    assert!(h.allow_credentials.is_empty());
+    assert!(h.max_request_bytes.is_none());
+    assert!(h.contract_mode.is_none());
+}
+
+#[test]
+fn host_block_round_trips_into_sandbox_config() {
+    let recipe = parse_recipe(
+        r#"
+[[host]]
+domain = "api.example.com"
+methods = ["GET"]
+allow_credentials = ["aws_access_key"]
+"#,
+    );
+    let sandbox = recipe.into_sandbox_config().expect("resolve");
+    assert_eq!(sandbox.hosts.len(), 1);
+    assert_eq!(sandbox.hosts[0].domain, "api.example.com");
+    assert_eq!(sandbox.hosts[0].allow_credentials, vec!["aws_access_key"]);
+}
+
+#[test]
+fn shipped_service_recipes_all_parse() {
+    // Every recipe under `recipes/services/` must parse cleanly with
+    // `deny_unknown_fields`. Typos and stale field names in a shipped
+    // contract are silent wins for an attacker (no contract = no
+    // gate); this test guards against that.
+    let services_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes/services");
+    let mut parsed = 0;
+    for entry in std::fs::read_dir(&services_dir).expect("services dir") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let recipe =
+            RecipeFile::parse(&content).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        assert!(
+            !recipe.hosts.is_empty(),
+            "{} must declare at least one [[host]] block",
+            path.display(),
+        );
+        // Every block in a service recipe should have a non-empty
+        // domain (else parsing would silently produce a wildcard for
+        // empty string).
+        for h in &recipe.hosts {
+            assert!(
+                !h.domain.is_empty(),
+                "{} has a [[host]] with empty domain",
+                path.display()
+            );
+        }
+        parsed += 1;
+    }
+    assert!(
+        parsed >= 10,
+        "expected at least 10 shipped service recipes, found {parsed}"
+    );
+}
+
+#[test]
+fn host_block_unknown_field_rejected() {
+    // deny_unknown_fields is the canister-wide standard: a typo'd
+    // field name shouldn't silently noop.
+    let err = RecipeFile::parse(
+        r#"
+[[host]]
+domain = "x"
+mehtods = ["GET"]
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown field"),
+        "expected unknown-field error, got: {err}"
     );
 }

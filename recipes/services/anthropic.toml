@@ -1,0 +1,12 @@
+# Anthropic API.
+
+[recipe]
+name        = "service:anthropic"
+description = "Anthropic API contracts"
+
+[[host]]
+domain            = "api.anthropic.com"
+methods           = ["GET", "POST"]
+content_types     = ["application/json"]
+max_request_bytes = 4194304   # 4 MiB
+allow_credentials = ["anthropic_key"]

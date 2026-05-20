@@ -20,11 +20,11 @@ deny = [
 ]
 
 [network]
-allow_domains = [
-    "keys.openpgp.org",
-    "keyserver.ubuntu.com",
-]
+[[host]]
+domain = "keys.openpgp.org"
 
+[[host]]
+domain = "keyserver.ubuntu.com"
 [process]
 env_passthrough = [
     "GNUPGHOME",

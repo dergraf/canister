@@ -17,11 +17,11 @@ deny = [
 ]
 
 [network]
-allow_domains = [
-    "registry.yarnpkg.com",
-    "registry.npmjs.org",
-]
+[[host]]
+domain = "registry.yarnpkg.com"
 
+[[host]]
+domain = "registry.npmjs.org"
 [process]
 env_passthrough = [
     "YARN_NPM_AUTH_TOKEN",

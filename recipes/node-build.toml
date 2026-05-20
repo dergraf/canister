@@ -18,12 +18,14 @@ deny = ["/etc/shadow", "/root"]
 
 [network]
 egress = "proxy-only"
-allow_domains = [
-    "registry.npmjs.org",
-    "registry.yarnpkg.com",
-    "registry.npmmirror.com",
-]
+[[host]]
+domain = "registry.npmjs.org"
 
+[[host]]
+domain = "registry.yarnpkg.com"
+
+[[host]]
+domain = "registry.npmmirror.com"
 [process]
 max_pids = 128
 env_passthrough = [

@@ -22,6 +22,19 @@ pub fn unescape(input: &str) -> String {
                         out.push('u');
                     }
                 }
+                Some('x') => {
+                    // Python / C / JSON-extension `\xNN` byte escape.
+                    // Without this an attacker can write
+                    // `"\x41\x4B\x49\x41..."` in a Python repr or a
+                    // JSON-with-extensions body and the literal AKIA
+                    // never appears in the bytes the regex sees.
+                    if let Some(decoded) = take_hex_escape(&mut chars) {
+                        out.push(decoded);
+                    } else {
+                        out.push('\\');
+                        out.push('x');
+                    }
+                }
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
@@ -54,6 +67,16 @@ fn needs_unescape(s: &str) -> bool {
     let bytes = s.as_bytes();
     // Quick reject: only scan strings that contain at least one trigger byte.
     bytes.iter().any(|&b| b == b'\\' || b == b'&')
+}
+
+fn take_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<char> {
+    let h1 = chars.next()?;
+    let h2 = chars.next()?;
+    if !h1.is_ascii_hexdigit() || !h2.is_ascii_hexdigit() {
+        return None;
+    }
+    let code = u32::from_str_radix(&format!("{h1}{h2}"), 16).ok()?;
+    char::from_u32(code)
 }
 
 fn take_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<char> {

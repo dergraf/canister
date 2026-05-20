@@ -27,7 +27,11 @@ deny = ["/etc/shadow", "/root"]
 [network]
 egress = "proxy-only"
 # Allowed domains (resolved via internal DNS proxy).
-allow_domains = ["pypi.org", "files.pythonhosted.org"]
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
 # Allowed IPs or CIDRs.
 allow_ips = []
 

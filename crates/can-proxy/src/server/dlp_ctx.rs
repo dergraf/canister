@@ -20,8 +20,12 @@ pub(super) struct DlpCtx {
     pub(super) monitor: bool,
     pub(super) dns_entropy_threshold: f64,
     /// Raw canary byte sequences. The response-direction scanner uses
-    /// these for a cheap substring check without re-running the regex.
+    /// these for a cheap substring check (against each `decode_layers`
+    /// layer) without re-running the regex.
     pub(super) canaries: Arc<Vec<Vec<u8>>>,
+    /// Layer cap for `decode_layers` calls outside `DlpScanner` —
+    /// specifically the response-side canary scan.
+    pub(super) max_decode_depth: usize,
 }
 
 impl DlpCtx {
@@ -40,7 +44,20 @@ impl DlpCtx {
             return Ok(None);
         }
 
-        let user_scopes = dlp_cfg.map(|d| d.scopes.clone()).unwrap_or_default();
+        // Invert the per-host `[[host]].allow_credentials` list into
+        // the per-detector mapping `DlpScanner` consumes — credential
+        // scope is authored co-located with the host's other
+        // attributes but the scanner wants a detector-keyed view.
+        let mut user_scopes: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for h in &config.hosts {
+            for det in &h.allow_credentials {
+                user_scopes
+                    .entry(det.clone())
+                    .or_default()
+                    .push(h.domain.clone());
+            }
+        }
         let max_depth = dlp_cfg
             .map(|d| d.max_decode_depth())
             .unwrap_or(can_policy::config::DlpConfig::DEFAULT_MAX_DECODE_DEPTH);
@@ -78,6 +95,7 @@ impl DlpCtx {
             monitor: config.monitor,
             dns_entropy_threshold: dns_threshold,
             canaries: Arc::new(canary_bytes),
+            max_decode_depth: max_depth,
         }))
     }
 }

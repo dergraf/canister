@@ -9,8 +9,8 @@
 # `Api-Key:` to an unauthorized host slipped past every detector.
 #
 # This file pins each common offender by:
-#   1. Putting a recipe in `proxy-only` mode with `allow_domains` covering
-#      a benign upstream we never actually expect to reach.
+#   1. Putting a recipe in `proxy-only` mode with `[[host]]` blocks
+#      for a benign upstream we never actually expect to reach.
 #   2. Issuing requests through the proxy that carry a GitHub PAT in
 #      various non-standard header names.
 #   3. Asserting each request comes back as HTTP 451 with
@@ -33,8 +33,8 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 

@@ -33,8 +33,8 @@ egress = "proxy-only"
 # Wildcard via subdomain match: `example.com` accepts any *.example.com,
 # letting us send the chunked subdomain through the policy gate so DLP
 # gets a chance to see the host.
-allow_domains = ["example.com"]
-
+[[host]]
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 

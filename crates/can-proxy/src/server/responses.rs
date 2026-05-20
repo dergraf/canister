@@ -49,6 +49,15 @@ pub(super) enum ErrorKind {
     BadGateway { message: String },
     /// Generic 400 for malformed inbound requests we can't even parse.
     BadRequest,
+    /// Per-destination contract refusal. Body carries the `[[host]]`
+    /// patch the user can paste into `canister.toml` to allow this
+    /// exact shape. `reason` populates `x-canister-error`; `detail`
+    /// lines populate the body.
+    ContractRefused {
+        reason: &'static str,
+        detail: String,
+        patch: String,
+    },
 }
 
 impl<'a> ProxyError<'a> {
@@ -87,6 +96,79 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn bad_request(host: &'a str) -> Self {
         Self::new(ErrorKind::BadRequest, host)
+    }
+
+    /// Build a contract refusal from a [`crate::contracts::ContractViolation`].
+    /// Generates the actionable `[[host]]` patch from the violation's
+    /// detail so the user can paste 3 lines into `canister.toml` to
+    /// unblock themselves.
+    pub(super) fn contract_refused(
+        host: &'a str,
+        violation: crate::contracts::ContractViolation,
+    ) -> Self {
+        use crate::contracts::ContractViolation as V;
+        let reason: &'static str = match &violation {
+            V::UnknownHost => "unknown-host",
+            V::DisallowedMethod { .. } => "method-not-allowed",
+            V::DisallowedContentType { .. } => "content-type-not-allowed",
+            V::DisallowedPath { .. } => "path-not-allowed",
+            V::OversizeBody { .. } => "body-too-large",
+        };
+        let (detail, patch) = match &violation {
+            V::UnknownHost => (
+                format!(
+                    "No [[host]] block matches {host} and the global contract mode is `strict`."
+                ),
+                format!(
+                    "[[host]]\ndomain = \"{host}\"\n# Add methods / content_types / paths / allow_credentials to tighten."
+                ),
+            ),
+            V::DisallowedMethod { method, allowed } => (
+                format!(
+                    "{host} does not accept method `{method}`. Allowed: {}.",
+                    allowed.join(", ")
+                ),
+                format!(
+                    "[[host]]\ndomain = \"{host}\"\nmethods = [\"{method}\"]   # extends the shipped contract"
+                ),
+            ),
+            V::DisallowedContentType {
+                content_type,
+                allowed,
+            } => (
+                format!(
+                    "{host} does not accept Content-Type `{content_type}`. Allowed: {}.",
+                    allowed.join(", ")
+                ),
+                format!(
+                    "[[host]]\ndomain = \"{host}\"\ncontent_types = [\"{ct}\"]   # extends the shipped contract",
+                    ct = content_type.split(';').next().unwrap_or("").trim()
+                ),
+            ),
+            V::DisallowedPath { path, allowed } => (
+                format!(
+                    "Path `{path}` is not under any allowed prefix for {host}. Allowed prefixes: {}.",
+                    allowed.join(", ")
+                ),
+                format!(
+                    "[[host]]\ndomain = \"{host}\"\npaths = [\"{path}\"]   # extends the shipped contract"
+                ),
+            ),
+            V::OversizeBody { size, limit } => (
+                format!("Request body is {size} bytes; per-host limit is {limit} bytes."),
+                format!(
+                    "[[host]]\ndomain = \"{host}\"\nmax_request_bytes = {size}   # raises the cap to fit"
+                ),
+            ),
+        };
+        Self::new(
+            ErrorKind::ContractRefused {
+                reason,
+                detail,
+                patch,
+            },
+            host,
+        )
     }
 
     /// Set the DLP detector header. Implies the variant should carry
@@ -151,6 +233,33 @@ impl<'a> ProxyError<'a> {
                 "Bad Request".to_string(),
                 "bad-request",
             ),
+            ErrorKind::ContractRefused {
+                reason,
+                detail,
+                patch,
+            } => {
+                warn!(
+                    "contract refusal for {}: {} — {}",
+                    self.host, reason, detail
+                );
+                crate::events::dlp_block(self.host, "contract", reason);
+                let body = format!(
+                    "Refused by canister: {detail}\n\
+                     \n\
+                     To allow this for the current project, append to ./canister.toml:\n\
+                     \n    {indented_patch}\n",
+                    indented_patch = patch.replace('\n', "\n    "),
+                );
+                // 415 covers method, content-type, path, and unknown-host;
+                // 413 covers oversize body. Both are conventional and
+                // map to "the request shape isn't acceptable here."
+                let status = if *reason == "body-too-large" {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE
+                };
+                (status, body, "contract-refused")
+            }
         };
 
         let mut resp = Response::new(body_from(body));
@@ -179,6 +288,7 @@ fn static_str(kind: &str) -> &'static str {
         "dlp-blocked" => "dlp-blocked",
         "upstream-error" => "upstream-error",
         "bad-request" => "bad-request",
+        "contract-refused" => "contract-refused",
         _ => "proxy-error",
     }
 }

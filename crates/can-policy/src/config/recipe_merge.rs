@@ -3,6 +3,7 @@
 //! Per-section merge logic lives next to each `FooConfig`. This file is
 //! just the thin glue that calls them in order.
 
+use super::host::merge_host_blocks;
 use super::merge::merge_or_bool;
 use super::recipe::RecipeFile;
 
@@ -16,6 +17,8 @@ impl RecipeFile {
     /// - `Option<bool>` security escalations (`strict`, `dlp.enabled`,
     ///   `dlp.canary_tokens`): OR — any `Some(true)` wins
     /// - `RecipeMeta`: overlay wins if present
+    /// - `[[host]]` blocks: grouped by domain, then field-merged via
+    ///   `HostBlock::merge`
     pub fn merge(self, overlay: RecipeFile) -> RecipeFile {
         RecipeFile {
             recipe: overlay.recipe.or(self.recipe),
@@ -26,6 +29,7 @@ impl RecipeFile {
             resources: self.resources.merge(overlay.resources),
             syscalls: self.syscalls.merge(overlay.syscalls),
             proxy: self.proxy.merge(overlay.proxy),
+            hosts: merge_host_blocks(self.hosts, overlay.hosts),
         }
     }
 }

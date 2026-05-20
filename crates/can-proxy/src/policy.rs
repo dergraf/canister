@@ -45,12 +45,18 @@ impl Default for OutboundPolicy {
 }
 
 impl OutboundPolicy {
-    pub fn from_config(network: &can_policy::config::NetworkConfig) -> Self {
+    /// Build an outbound policy from network config + the resolved
+    /// `[[host]]` blocks. The host blocks carry the FQDN allow-list:
+    /// permission to dial an FQDN means "there's a `[[host]]` block
+    /// for it."
+    pub fn from_config(
+        network: &can_policy::config::NetworkConfig,
+        hosts: &[can_policy::config::HostBlock],
+    ) -> Self {
         let mut policy = Self {
-            allowed_domains: network
-                .allow_domains
+            allowed_domains: hosts
                 .iter()
-                .map(|d| d.to_ascii_lowercase())
+                .map(|h| h.domain.to_ascii_lowercase())
                 .collect(),
             enforce_ip_policy: !network.allow_ips.is_empty(),
             ..Self::default()
@@ -111,22 +117,27 @@ impl OutboundPolicy {
 #[cfg(test)]
 mod tests {
     use super::{HOST_LOOPBACK_ALIAS, OutboundPolicy};
+    use can_policy::config::HostBlock;
     use std::net::IpAddr;
+
+    fn host(domain: &str) -> HostBlock {
+        HostBlock {
+            domain: domain.to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn blocks_ip_literals_when_only_domains_are_configured() {
-        let mut net = can_policy::config::NetworkConfig::default();
-        net.allow_domains.push("hex.pm".to_string());
-        let policy = OutboundPolicy::from_config(&net);
-
+        let net = can_policy::config::NetworkConfig::default();
+        let policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
         assert!(!policy.allows_ip_literal("1.1.1.1".parse().unwrap()));
     }
 
     #[test]
     fn allows_subdomains_of_allowed_domain() {
-        let mut net = can_policy::config::NetworkConfig::default();
-        net.allow_domains.push("hex.pm".to_string());
-        let policy = OutboundPolicy::from_config(&net);
+        let net = can_policy::config::NetworkConfig::default();
+        let policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
 
         assert!(policy.allows_host("hex.pm"));
         assert!(policy.allows_host("repo.hex.pm"));
@@ -135,18 +146,16 @@ mod tests {
 
     #[test]
     fn host_loopback_alias_blocked_when_target_unset() {
-        let mut net = can_policy::config::NetworkConfig::default();
-        net.allow_domains.push("hex.pm".to_string());
-        let policy = OutboundPolicy::from_config(&net);
+        let net = can_policy::config::NetworkConfig::default();
+        let policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
 
         assert!(!policy.allows_host(HOST_LOOPBACK_ALIAS));
     }
 
     #[test]
     fn host_loopback_alias_allowed_when_target_set() {
-        let mut net = can_policy::config::NetworkConfig::default();
-        net.allow_domains.push("hex.pm".to_string());
-        let mut policy = OutboundPolicy::from_config(&net);
+        let net = can_policy::config::NetworkConfig::default();
+        let mut policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
         policy.host_loopback_target = Some("169.254.0.1".parse().unwrap());
 
         assert!(policy.allows_host(HOST_LOOPBACK_ALIAS));

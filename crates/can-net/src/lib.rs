@@ -48,17 +48,17 @@ pub enum NetworkMode {
 }
 
 impl NetworkMode {
-    /// Determine the appropriate network mode from policy config.
+    /// Determine the appropriate network mode from policy config and
+    /// the resolved `[[host]]` block count.
     ///
     /// Port forwarding requires Filtered mode, so its presence
     /// upgrades None → Filtered.
-    pub fn from_config(config: &NetworkConfig) -> Self {
+    pub fn from_config(config: &NetworkConfig, host_blocks: usize) -> Self {
         match config.egress() {
             EgressMode::None => NetworkMode::None,
             EgressMode::ProxyOnly => NetworkMode::Filtered,
             EgressMode::Direct => {
-                let has_allowlist =
-                    !config.allow_domains.is_empty() || !config.allow_ips.is_empty();
+                let has_allowlist = host_blocks > 0 || !config.allow_ips.is_empty();
                 let has_ports = !config.ports.is_empty();
                 if has_allowlist || has_ports {
                     NetworkMode::Filtered
@@ -118,15 +118,17 @@ impl Drop for NetworkState {
 /// Pre-resolve allowed domains to their IP addresses.
 ///
 /// This is done in the parent process before sandboxing, so the results
-/// can be used to build an IP allow-set for seccomp filtering.
+/// can be used to build an IP allow-set for seccomp filtering. Caller
+/// passes the FQDN list, typically derived from
+/// `config.hosts.iter().map(|h| h.domain.clone())`.
 ///
 /// Returns a map of domain -> resolved IPs.
-pub fn resolve_allowed_domains(config: &NetworkConfig) -> Vec<(String, Vec<IpAddr>)> {
+pub fn resolve_allowed_domains(domains: &[String]) -> Vec<(String, Vec<IpAddr>)> {
     use std::net::ToSocketAddrs;
 
     let mut results = Vec::new();
 
-    for domain in &config.allow_domains {
+    for domain in domains {
         // Use the system resolver by trying to resolve domain:0.
         match (domain.as_str(), 0u16).to_socket_addrs() {
             Ok(addrs) => {
@@ -155,46 +157,35 @@ mod tests {
     #[test]
     fn network_mode_proxy_only_default() {
         let config = NetworkConfig::default();
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
+        assert_eq!(NetworkMode::from_config(&config, 0), NetworkMode::Filtered);
     }
 
     #[test]
     fn network_mode_proxy_only_with_domains() {
         let config = NetworkConfig {
             egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec!["example.com".to_string()],
-            allow_ips: vec![],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
+            ..Default::default()
         };
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
+        assert_eq!(NetworkMode::from_config(&config, 1), NetworkMode::Filtered);
     }
 
     #[test]
     fn network_mode_proxy_only_with_ips() {
         let config = NetworkConfig {
             egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
             allow_ips: vec!["10.0.0.0/8".to_string()],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
+            ..Default::default()
         };
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
+        assert_eq!(NetworkMode::from_config(&config, 0), NetworkMode::Filtered);
     }
 
     #[test]
     fn network_mode_direct() {
         let config = NetworkConfig {
             egress: Some(EgressMode::Direct),
-            allow_domains: vec![],
-            allow_ips: vec![],
-            ports: vec![],
-            allow_host_loopback: false,
-            dlp: None,
+            ..Default::default()
         };
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Full);
+        assert_eq!(NetworkMode::from_config(&config, 0), NetworkMode::Full);
     }
 
     #[test]
@@ -203,25 +194,22 @@ mod tests {
             egress: Some(EgressMode::None),
             ..Default::default()
         };
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::None);
+        assert_eq!(NetworkMode::from_config(&config, 0), NetworkMode::None);
     }
 
     #[test]
     fn network_mode_ports_upgrade_to_filtered() {
         use can_policy::config::{PortMapping, PortProtocol};
         let config = NetworkConfig {
-            egress: Some(EgressMode::ProxyOnly),
-            allow_domains: vec![],
-            allow_ips: vec![],
+            egress: Some(EgressMode::Direct),
             ports: vec![PortMapping {
                 host_ip: None,
                 host_port: 8080,
                 container_port: 80,
                 protocol: PortProtocol::Tcp,
             }],
-            allow_host_loopback: false,
-            dlp: None,
+            ..Default::default()
         };
-        assert_eq!(NetworkMode::from_config(&config), NetworkMode::Filtered);
+        assert_eq!(NetworkMode::from_config(&config, 0), NetworkMode::Filtered);
     }
 }

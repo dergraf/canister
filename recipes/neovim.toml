@@ -30,27 +30,32 @@ deny = ["/etc/shadow", "/root"]
 egress = "proxy-only"
 # LSP servers, Mason, and plugin managers may need network access
 # for installation and updates. Lock down to known hosts.
-allow_domains = [
-    # Mason registry + installers
-    "github.com",
-    "objects.githubusercontent.com",
-    "raw.githubusercontent.com",
-    "api.github.com",
+[[host]]
+domain = "github.com"
 
-    # Mason packages (npm-based LSPs)
-    "registry.npmjs.org",
+[[host]]
+domain = "objects.githubusercontent.com"
 
-    # Mason packages (PyPI-based LSPs)
-    "pypi.org",
-    "files.pythonhosted.org",
+[[host]]
+domain = "raw.githubusercontent.com"
 
-    # Luarocks (some plugins)
-    "luarocks.org",
+[[host]]
+domain = "api.github.com"
 
-    # Lazy.nvim plugin manager
-    "github.com",
-]
+[[host]]
+domain = "registry.npmjs.org"
 
+[[host]]
+domain = "pypi.org"
+
+[[host]]
+domain = "files.pythonhosted.org"
+
+[[host]]
+domain = "luarocks.org"
+
+[[host]]
+domain = "github.com"
 [process]
 max_pids = 256
 allow_execve = []

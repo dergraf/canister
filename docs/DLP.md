@@ -112,9 +112,9 @@ it would bypass scanning.
 ## Detectors and Scope Model
 
 Each detector has hardcoded **home domains** baked into the binary.
-Tokens can only flow to their home service — even if `allow_domains`
-permits the destination, a GitHub PAT bound for `registry.npmjs.org` is
-blocked.
+Tokens can only flow to their home service — even if a `[[host]]`
+block permits the destination, a GitHub PAT bound for
+`registry.npmjs.org` is blocked.
 
 | Detector | Pattern | Built-in home domains | Default action |
 |---|---|---|---|
@@ -123,7 +123,7 @@ blocked.
 | `aws_access_key` | `AKIA[A-Z0-9]{16}` | `*.amazonaws.com` | block |
 | `slack_token` | `xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{24}` | `*.slack.com` | block |
 | `ssh_private_key` | `-----BEGIN (RSA\|EC\|OPENSSH\|DSA )?PRIVATE KEY-----` | *none — always block* | block |
-| `bearer_token` | `Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*` | *(any `allow_domains` destination)* | block |
+| `bearer_token` | `Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*` | *(requires explicit `allow_credentials = ["bearer_token"]` on a host)* | block |
 | `generic_high_entropy` | Sliding window, Shannon entropy > 4.5, 20+ chars | *(warn only)* | warn (promoted to block in `--strict`) |
 | `canary_token` | Exact match against injected fake credentials | *none — always block* | block (error log) |
 
@@ -131,23 +131,20 @@ blocked.
 
 1. **Known-service tokens** (`github_pat`, `npm_token`, `aws_access_key`,
    `slack_token`) — destination must be in the detector's home domains
-   (plus any `extra_scopes` for self-hosted instances). Mismatched
-   service → 451 block.
-2. **`bearer_token`** — generic; allowed to any destination that already
-   passes the `allow_domains` egress allow list. The proxy's domain
-   allow list IS the scope.
+   or in a `[[host]]` block whose `allow_credentials` includes the
+   detector id. Mismatched service → 451 block.
+2. **`bearer_token`** — generic; requires explicit per-host opt-in via
+   `allow_credentials = ["bearer_token"]`. No implicit scope.
 3. **`ssh_private_key` and `canary_token`** — no legitimate HTTP
    destination; always blocked.
 4. **`generic_high_entropy`** — too noisy to scope; always warn, blocks
    only in `--strict`.
 
-This means tool recipes don't need any DLP-specific configuration. The
-`allow_domains` in `tool:gh`, `tool:npm`, etc. already declares the
-right egress destinations, and DLP knows which tokens belong where.
-Composing `tools = ["npm", "gh"]` in a manifest produces the right
-behaviour: npm tokens can only reach npmjs.org, GitHub PATs can only
-reach GitHub — even though both domain sets are simultaneously in
-`allow_domains`.
+The shipped service contracts under `recipes/services/*.toml`
+(`github.toml`, `npm.toml`, …) already include the right
+`allow_credentials` for their detector — composing
+`tools = ["npm", "gh"]` produces the right behaviour: npm tokens
+can only reach npmjs.org, GitHub PATs can only reach GitHub.
 
 ### Extending scopes for self-hosted services
 
@@ -187,7 +184,7 @@ Per request, the proxy runs:
    - canary    → BLOCK + error! log (zero false positives)
    - ssh key   → BLOCK
    - scoped    → BLOCK if destination not in home/extras
-   - bearer    → BLOCK if destination not in allow_domains
+   - bearer    → BLOCK unless the destination's `[[host]]` block lists `"bearer_token"` in `allow_credentials`
    - generic   → WARN (BLOCK in --strict)
 5. Session entropy budget update; BLOCK if exceeded.
 6. Build response:
@@ -380,8 +377,8 @@ upstream recipe enabled, and can never *shrink* the scope set.
 - **Per-sandbox**: same key under `[sandbox.<name>.network.dlp]`.
 - **Recipe-level**: drop a `[network.dlp]` block into a custom recipe.
   Tool recipes (`tool:gh`, `tool:npm`, etc.) deliberately do **not**
-  ship DLP config — they only declare the right `allow_domains`, and
-  DLP scopes do the rest.
+  ship `[network.dlp]` — they declare the right `[[host]]` blocks
+  with `allow_credentials`, and the scope check does the rest.
 
 ---
 

@@ -492,8 +492,9 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
         EgressMode::Direct => "direct",
     };
     println!("  egress: {egress}");
-    if !config.network.allow_domains.is_empty() {
-        println!("  allow_domains: {:?}", config.network.allow_domains);
+    if !config.hosts.is_empty() {
+        let domains: Vec<&str> = config.hosts.iter().map(|h| h.domain.as_str()).collect();
+        println!("  hosts: {domains:?}");
     }
     if !config.network.allow_ips.is_empty() {
         println!("  allow_ips: {:?}", config.network.allow_ips);
@@ -1031,7 +1032,7 @@ fn print_monitor_policy_preview(config: &SandboxConfig) {
     }
 
     // Network.
-    let net_mode = can_net::NetworkMode::from_config(&config.network);
+    let net_mode = can_net::NetworkMode::from_config(&config.network, config.hosts.len());
     eprintln!("  network:         {net_mode:?}");
 
     // Writable paths.

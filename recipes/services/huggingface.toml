@@ -1,0 +1,31 @@
+# Hugging Face Hub.
+#
+# Heterogeneous: JSON for the API, multipart/form-data + LFS
+# uploads for model push, octet-stream for model downloads. Path
+# allow-list keeps scans focused on the API surface; downloads use
+# a relaxed sibling block to avoid enumerating every model.
+
+[recipe]
+name        = "service:huggingface"
+description = "Hugging Face Hub contracts"
+
+[[host]]
+domain            = "huggingface.co"
+methods           = ["GET", "POST", "PUT", "DELETE", "HEAD"]
+content_types     = [
+    "application/json",
+    "multipart/form-data",
+    "application/x-www-form-urlencoded",
+    "application/octet-stream",
+]
+max_request_bytes = 5368709120   # 5 GiB; big-model pushes
+
+[[host]]
+domain        = "*.huggingface.co"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"
+
+[[host]]
+domain        = "cdn-lfs.huggingface.co"
+methods       = ["GET", "PUT", "HEAD"]
+contract_mode = "relaxed"

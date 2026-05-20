@@ -21,7 +21,7 @@ use super::dlp_ctx::DlpCtx;
 use super::dlp_enforce::enforce_request_verdicts;
 use super::limits::ProxyLimits;
 use super::passthrough::{handle_http_passthrough, handle_passthrough};
-use super::response_scan::scan_response_for_canaries;
+use super::response_scan::scan_response;
 use super::responses::{ProxyBody, ProxyError, empty_body};
 use super::stream_scan::stream_scan_body;
 use super::tunnel::handle_tunnel;
@@ -41,18 +41,28 @@ pub(super) async fn handle_proxy_request(
     ca: Arc<DynamicCa>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     if req.method() == Method::CONNECT {
-        return handle_connect(req, ca, dns_cache, outbound_policy, limits, dlp).await;
+        return handle_connect(req, ca, dns_cache, outbound_policy, contracts, limits, dlp).await;
     }
     if crate::websocket::is_websocket_upgrade(&req) {
         return Ok(crate::websocket::not_implemented_ws_bridge().await);
     }
     match dlp {
         Some(ctx) => {
-            handle_inner_request(req, dns_cache, outbound_policy, "http", limits, Some(ctx)).await
+            handle_inner_request(
+                req,
+                dns_cache,
+                outbound_policy,
+                contracts,
+                "http",
+                limits,
+                Some(ctx),
+            )
+            .await
         }
         None => handle_http_passthrough(req, dns_cache, outbound_policy, limits).await,
     }
@@ -63,6 +73,7 @@ async fn handle_connect(
     ca: Arc<DynamicCa>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
@@ -87,6 +98,7 @@ async fn handle_connect(
     }
 
     let dlp_for_tunnel = dlp.clone();
+    let contracts_for_tunnel = contracts.clone();
     tokio::task::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
@@ -97,6 +109,7 @@ async fn handle_connect(
                         ca,
                         dns_cache.clone(),
                         outbound_policy.clone(),
+                        contracts_for_tunnel.clone(),
                         limits.clone(),
                         ctx,
                     )
@@ -130,6 +143,7 @@ pub(super) async fn handle_inner_request(
     req: Request<hyper::body::Incoming>,
     dns_cache: can_net::dns_cache::DnsCache,
     outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
     default_scheme: &'static str,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
@@ -138,12 +152,26 @@ pub(super) async fn handle_inner_request(
 
     let host = extract_host(&req);
 
-    // Stage 1: policy gate.
+    // Stage 1: policy gate (connect permission).
     if let Some(resp) = gate_by_policy(&host, &outbound_policy) {
         return Ok(resp);
     }
 
-    // Stage 2: DNS-entropy gate (DLP only).
+    // Stage 2: contract gate (request shape). Runs before DLP scan
+    // so a POST `image/png` to a JSON-only API is refused without
+    // burning the decoder chain. The `host.canister.local` alias is
+    // a canister-internal indirection (resolved to the pasta gateway
+    // IP), not a real upstream — short-circuit it so the user doesn't
+    // need to author a `[[host]]` block for our internal magic.
+    let is_loopback_alias = outbound_policy.host_loopback_target.is_some()
+        && host.eq_ignore_ascii_case(crate::policy::HOST_LOOPBACK_ALIAS);
+    if !is_loopback_alias {
+        if let Some(resp) = gate_by_contract(&host, &req, &contracts) {
+            return Ok(resp);
+        }
+    }
+
+    // Stage 3: DNS-entropy gate (DLP only).
     if let Some(ctx) = dlp.as_ref() {
         if let Some(resp) = gate_by_dns_entropy(&host, ctx) {
             return Ok(resp);
@@ -212,12 +240,56 @@ pub(super) async fn handle_inner_request(
     .await
 }
 
+/// Flatten an optional [`hyper::HeaderMap`] of trailers into the
+/// `Vec<(String, String)>` shape the scanner consumes. Skips trailer
+/// values that aren't valid UTF-8 — there's nothing the scanner can
+/// do with raw binary header values, and hyper has already rejected
+/// the wire-format-invalid ones upstream of us.
+pub(super) fn trailer_pairs(map: Option<&hyper::HeaderMap>) -> Vec<(String, String)> {
+    let Some(m) = map else {
+        return Vec::new();
+    };
+    m.iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 fn gate_by_policy(host: &str, outbound_policy: &OutboundPolicy) -> Option<Response<ProxyBody>> {
     if host_allowed_by_outbound_policy(host, outbound_policy) {
         None
     } else {
         Some(ProxyError::policy_blocked(host, host_is_ip(host)).into_response())
     }
+}
+
+/// Check the request against the per-destination contract.
+/// Refuses with a 415 / 413 carrying an actionable `[[host]]` patch
+/// when the request shape doesn't fit. Returns `None` to continue.
+/// Body-size enforcement happens after buffering, in
+/// `buffer_and_scan_body` — at this stage we only have headers.
+fn gate_by_contract(
+    host: &str,
+    req: &Request<hyper::body::Incoming>,
+    contracts: &crate::contracts::ContractTable,
+) -> Option<Response<ProxyBody>> {
+    let content_type = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let path = req.uri().path();
+    let shape = crate::contracts::RequestShape {
+        method: req.method().as_str(),
+        path,
+        content_type,
+        body_size: None,
+    };
+    let violation = contracts.check(host, &shape)?;
+    Some(ProxyError::contract_refused(host, violation).into_response())
 }
 
 fn gate_by_dns_entropy(host: &str, ctx: &DlpCtx) -> Option<Response<ProxyBody>> {
@@ -288,15 +360,35 @@ async fn buffer_and_scan_body(
             );
         }
     };
+    // Trailers ride after the body in chunked transfer-encoding.
+    // Capture them *before* consuming the buffer so a worker can't
+    // hide a credential in `X-Sig: AKIA…` and bypass DLP simply
+    // because we only looked at the chunks. Forwarding of trailers
+    // to the upstream is a separate concern — today the proxy
+    // re-emits the body as `Full<Bytes>`, which drops trailers in
+    // transit, so accidentally we still block any leak that would
+    // otherwise have arrived upstream via a trailer.
+    let trailer_pairs = trailer_pairs(collected.trailers());
     let bytes = collected.to_bytes();
     let content_encoding = headers
         .get("content-encoding")
         .and_then(|v| v.to_str().ok());
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
 
     if bytes.len() <= limits.max_buffered_body_bytes {
         // Full pipeline: decode chain + decompression + unescape + regex.
-        let body_verdicts = ctx.scanner.scan_body(&bytes, content_encoding, host);
+        // Pass content_type so the structured extractor can walk JSON
+        // and attribute hits to the exact field path.
+        let body_verdicts =
+            ctx.scanner
+                .scan_body_with_type(&bytes, content_encoding, content_type, host);
         if let Some(resp) = enforce_request_verdicts(&body_verdicts, host, ctx.monitor) {
+            return BodyOutcome::Refused(resp);
+        }
+        // Trailers ride after the body in chunked transfer-encoding
+        // and were a complete bypass before this scan was added.
+        let trailer_verdicts = ctx.scanner.scan_trailers(&trailer_pairs, host);
+        if let Some(resp) = enforce_request_verdicts(&trailer_verdicts, host, ctx.monitor) {
             return BodyOutcome::Refused(resp);
         }
         if ctx
@@ -309,9 +401,14 @@ async fn buffer_and_scan_body(
                 ProxyError::dlp_blocked(host, "entropy-budget").into_response(),
             );
         }
-    } else if let Some(resp) =
-        stream_scan_body(&ctx.scanner, &bytes, host, &ctx.canaries, ctx.monitor)
-    {
+    } else if let Some(resp) = stream_scan_body(
+        &ctx.scanner,
+        &bytes,
+        host,
+        &ctx.canaries,
+        ctx.monitor,
+        ctx.max_decode_depth,
+    ) {
         return BodyOutcome::Refused(resp);
     }
 
@@ -345,14 +442,16 @@ async fn forward_and_scan_response(
         }
     };
 
-    // R8: scan response body for canary tokens. Cheap end of response-
-    // direction DLP — fixed-set substring check, not the full regex
-    // chain. Catches reflection / second-stage exfil where a malicious
-    // upstream echoes the canary back.
+    // R8: scan the upstream's full response — headers + body — with
+    // the same extract + decode + normalize + regex pipeline as the
+    // request side. Catches canary reflections (Set-Cookie, Location,
+    // JSON `echo` field) **and** upstream credential leaks (a
+    // misbehaving API returning `ghp_…` in an error message). Gated
+    // on DLP being enabled at all; no separate canary-empty
+    // short-circuit, because the scanner now runs the full detector
+    // registry, not just the canary substring check.
     if let Some(ctx) = dlp {
-        if !ctx.canaries.is_empty() {
-            return Ok(scan_response_for_canaries(response, ctx, host, limits).await);
-        }
+        return Ok(scan_response(response, ctx, host, limits).await);
     }
     Ok(response.map(|body| body.boxed()))
 }
