@@ -170,6 +170,8 @@ impl PerHostEntropyBudget {
     /// crossed it. A first-time host gets a fresh budget initialised
     /// from `per_host_budget_bytes`.
     pub fn record(&self, host: &str, high_entropy_bytes: u64) -> bool {
+        // SAFETY-UNWRAP: the only code under this mutex is the HashMap
+        // entry update below — no panic path, so the mutex can't be poisoned.
         let mut tbl = self
             .table
             .lock()
@@ -181,6 +183,7 @@ impl PerHostEntropyBudget {
     }
 
     pub fn used(&self, host: &str) -> u64 {
+        // SAFETY-UNWRAP: same invariant as `record` — no panic path under the lock.
         self.table
             .lock()
             .expect("per-host entropy budget mutex poisoned")

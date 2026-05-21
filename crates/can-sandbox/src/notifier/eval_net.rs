@@ -442,8 +442,8 @@ pub(super) fn evaluate_sendmsg(
     // SAFETY-UNWRAP: hdr_bytes is exactly 48 bytes; the fixed slices
     // match u64/u32 exactly.
     let msg_name_ptr = u64::from_ne_bytes(hdr_bytes[0..8].try_into().unwrap());
-    let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize;
-    let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap());
+    let msg_namelen = u32::from_ne_bytes(hdr_bytes[8..12].try_into().unwrap()) as usize; // SAFETY-UNWRAP: see above
+    let msg_controllen = u64::from_ne_bytes(hdr_bytes[40..48].try_into().unwrap()); // SAFETY-UNWRAP: see above
 
     let msg_name_bytes = if msg_name_ptr != 0 && (2..=128).contains(&msg_namelen) {
         match read_proc_mem(pid, msg_name_ptr, msg_namelen) {

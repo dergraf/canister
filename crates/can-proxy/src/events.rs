@@ -27,12 +27,15 @@ static SINK: Mutex<Option<Box<dyn EventSink>>> = Mutex::new(None);
 
 /// Replace the default stderr sink. Used by tests to capture events.
 pub fn set_sink_for_test(sink: Box<dyn EventSink>) {
+    // SAFETY-UNWRAP: nothing under this lock panics — only a single
+    // `Option<Box<...>>` assignment — so the mutex can't be poisoned.
     let mut guard = SINK.lock().expect("event sink mutex poisoned");
     *guard = Some(sink);
 }
 
 fn emit(line: String) {
     let bytes = line.into_bytes();
+    // SAFETY-UNWRAP: same invariant as `set_sink_for_test`.
     let guard = SINK.lock().expect("event sink mutex poisoned");
     match guard.as_ref() {
         Some(sink) => sink.emit(&bytes),
@@ -91,11 +94,13 @@ pub fn canary_fire(host: &str, detector: &str, matched_redacted: &str) {
     let ts = unix_ms();
 
     let prev_hash = {
+        // SAFETY-UNWRAP: only a `[u8; 32]` copy happens under this lock, no panic path.
         let guard = CHAIN_HASH.lock().expect("chain hash mutex poisoned");
         *guard
     };
     let new_hash = compute_chain_hash(&prev_hash, host, detector, matched_redacted, ts);
     {
+        // SAFETY-UNWRAP: only a `[u8; 32]` assignment under this lock, no panic path.
         let mut guard = CHAIN_HASH.lock().expect("chain hash mutex poisoned");
         *guard = new_hash;
     }
@@ -156,6 +161,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// Reset the canary fire counter and chain hash. Tests only.
 #[cfg(test)]
 pub(crate) fn reset_canary_chain_for_test() {
+    // SAFETY-UNWRAP: cfg(test)-gated helper; failure is acceptable in tests.
     *CHAIN_HASH.lock().unwrap() = [0u8; 32];
     CANARY_FIRES.store(0, Ordering::Relaxed);
 }
