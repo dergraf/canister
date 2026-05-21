@@ -506,7 +506,9 @@ jobs:
           mkdir -p ~/.config/canister
           cp -r ~/canister/recipes ~/.config/canister/recipes
           echo "--- Artifact layout ---"
-          find ~/canister -type f | head -40
+          # `|| true` to swallow SIGPIPE (141) when `find` outruns `head`
+          # under `set -o pipefail`.
+          find ~/canister -type f | head -40 || true
           REMOTE
 
       - name: Install dependencies in VM
@@ -731,7 +733,9 @@ jobs:
           mkdir -p ~/.config/canister
           cp -r ~/canister/recipes ~/.config/canister/recipes
           echo "--- Artifact layout ---"
-          find ~/canister -type f | head -40
+          # `|| true` to swallow SIGPIPE (141) when `find` outruns `head`
+          # under `set -o pipefail`.
+          find ~/canister -type f | head -40 || true
           REMOTE
 
       - name: Install dependencies in VM

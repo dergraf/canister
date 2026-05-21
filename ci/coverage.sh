@@ -43,23 +43,31 @@ rustup component add llvm-tools-preview --quiet >/dev/null 2>&1 || true
 # Exclude crates that generate docs / are essentially scaffolding so the
 # coverage number reflects the runtime behaviour. `can-docgen` runs
 # `can --help` and stringly templates markdown — not useful to gate on.
-COVERAGE_ARGS=(
+#
+# `--workspace` and `--exclude` are only accepted by the test subcommand
+# (the one that *runs* tests). `cargo llvm-cov report` reads the already-
+# generated profile data and only takes filtering flags such as
+# `--ignore-filename-regex`, so the two arg sets diverge.
+TEST_ARGS=(
     --workspace
     --exclude can-docgen
+    --ignore-filename-regex 'tests/.*'
+)
+REPORT_ARGS=(
     --ignore-filename-regex 'tests/.*'
 )
 
 echo "==> Running tests with coverage instrumentation"
 cargo llvm-cov clean --workspace >/dev/null
-cargo llvm-cov "${COVERAGE_ARGS[@]}" --summary-only \
+cargo llvm-cov "${TEST_ARGS[@]}" --summary-only \
     --fail-under-lines "$THRESHOLD"
 
 if [[ -n "$LCOV_OUT" ]]; then
     echo "==> Writing lcov.info to $LCOV_OUT"
-    cargo llvm-cov report "${COVERAGE_ARGS[@]}" --lcov --output-path "$LCOV_OUT"
+    cargo llvm-cov report "${REPORT_ARGS[@]}" --lcov --output-path "$LCOV_OUT"
 fi
 
 if [[ "$HTML" == 1 ]]; then
     echo "==> Generating HTML report"
-    cargo llvm-cov report "${COVERAGE_ARGS[@]}" --html --open
+    cargo llvm-cov report "${REPORT_ARGS[@]}" --html --open
 fi
