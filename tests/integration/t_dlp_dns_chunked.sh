@@ -30,13 +30,12 @@ allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "proxy-only"
-# Wildcard via explicit `*.` prefix lets us send a chunked subdomain
-# through the policy gate so DLP gets a chance to see the host. A
-# bare `example.com` would only match the literal apex; without the
-# wildcard the contract gate refuses chunked subdomains with 415
-# `unknown_host` before the DNS-entropy detector runs.
+# `example.com` matches the apex AND any subdomain per the documented
+# bare-domain semantics (CONFIGURATION.md). That lets us send a chunked
+# subdomain through both policy gates so DLP gets a chance to see the
+# host.
 [[host]]
-domain = "*.example.com"
+domain = "example.com"
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 

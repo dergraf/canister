@@ -178,20 +178,30 @@ impl ContractTable {
 
 /// Score how well `pattern` matches `host`. `None` = no match.
 /// Higher score = more specific. Exact match > wildcard > none.
+///
+/// Per `docs/CONFIGURATION.md`: `*.github.com` matches any subdomain;
+/// a bare `github.com` matches the apex AND any subdomain. The
+/// outbound-policy gate (`policy.rs::allows_host`) implements the
+/// bare-domain form already; the contract gate must agree, otherwise
+/// the same `[[host]]` block can be accepted at one stage and refused
+/// at the next.
 fn match_score(host: &str, pattern: &str) -> Option<usize> {
     let pattern = pattern.to_ascii_lowercase();
     if pattern == host {
         // Exact equality outranks every wildcard.
         return Some(usize::MAX);
     }
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        if host.ends_with(suffix) && host.len() > suffix.len() {
-            // The boundary char must be `.` so `*.github.com`
-            // doesn't match `notgithub.com`.
-            let prefix_len = host.len() - suffix.len();
-            if host.as_bytes()[prefix_len - 1] == b'.' {
-                return Some(suffix.len());
-            }
+    // Either `*.X` (explicit) or bare `X` may stand for "any subdomain
+    // of X". Strip the wildcard prefix if present so both forms share
+    // one matching path.
+    let suffix = pattern.strip_prefix("*.").unwrap_or(&pattern);
+    if host.ends_with(suffix) && host.len() > suffix.len() {
+        // The boundary char must be `.` so `*.github.com` doesn't
+        // match `notgithub.com` and `github.com` doesn't match
+        // `notgithub.com` either.
+        let prefix_len = host.len() - suffix.len();
+        if host.as_bytes()[prefix_len - 1] == b'.' {
+            return Some(suffix.len());
         }
     }
     None
@@ -277,6 +287,29 @@ mod tests {
         // char isn't a dot — must not match.
         assert!(matches!(
             t.check("notgithub.com", &shape("GET", "/")),
+            Some(ContractViolation::UnknownHost)
+        ));
+    }
+
+    // Per docs/CONFIGURATION.md and policy.rs::allows_host, a bare
+    // domain in a `[[host]]` block matches the apex AND any subdomain.
+    // The contract gate must agree, otherwise the outbound policy gate
+    // accepts a request that this gate refuses.
+    #[test]
+    fn bare_domain_matches_apex_and_subdomain() {
+        let t = ContractTable::new(vec![block("example.com")], ContractMode::Strict);
+        assert!(t.check("example.com", &shape("GET", "/")).is_none());
+        assert!(t.check("api.example.com", &shape("GET", "/")).is_none());
+        assert!(t.check("a.b.c.example.com", &shape("GET", "/")).is_none());
+    }
+
+    #[test]
+    fn bare_domain_does_not_match_substring_suffix() {
+        let t = ContractTable::new(vec![block("example.com")], ContractMode::Strict);
+        // `notexample.com` shares the suffix but the boundary char
+        // isn't a dot — must not match.
+        assert!(matches!(
+            t.check("notexample.com", &shape("GET", "/")),
             Some(ContractViolation::UnknownHost)
         ));
     }
