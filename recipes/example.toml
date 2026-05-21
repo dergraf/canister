@@ -26,14 +26,17 @@ deny = ["/etc/shadow", "/root"]
 
 [network]
 egress = "proxy-only"
-# Allowed domains (resolved via internal DNS proxy).
+# Allowed IPs or CIDRs for direct connections. Empty = no IP-literal
+# egress; everything must go through the DNS-resolved `[[host]]` list
+# below.
+allow_ips = []
+
+# Allowed upstream destinations. The proxy refuses any other host.
 [[host]]
 domain = "pypi.org"
 
 [[host]]
 domain = "files.pythonhosted.org"
-# Allowed IPs or CIDRs.
-allow_ips = []
 
 [process]
 # Max child PIDs.
