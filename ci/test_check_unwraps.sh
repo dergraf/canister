@@ -208,6 +208,47 @@ mod tests {
 EOF
 )"
 
+# 13. A `tests.rs` file (test module loaded from parent via
+#     `#[cfg(test)] mod tests;`) is exempt even though its own contents
+#     contain no `#[cfg(test)]` marker.
+{
+    name="tests.rs file is exempt"
+    expected_exit=0
+    expected_pattern="no unannotated"
+    tmp=$(mktemp -d)
+    mkdir -p "${tmp}/crates/fixture/src" "${tmp}/ci"
+    cat > "${tmp}/crates/fixture/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests;
+EOF
+    cat > "${tmp}/crates/fixture/src/tests.rs" <<'EOF'
+#[test]
+fn it_works() {
+    let x: Result<i32, ()> = Ok(1);
+    let _ = x.unwrap();
+}
+EOF
+    cp "${GUARD}" "${tmp}/ci/check_unwraps.sh"
+
+    exit_code=0
+    out=$(cd "${tmp}" && bash ci/check_unwraps.sh 2>&1) || exit_code=$?
+    ok=1
+    if [[ "${exit_code}" != "${expected_exit}" ]]; then ok=0; fi
+    if [[ "${out}" != *"${expected_pattern}"* ]]; then ok=0; fi
+    if (( ok == 1 )); then
+        echo "  PASS ${name}"
+        PASSED=$(( PASSED + 1 ))
+    else
+        echo "  FAIL ${name}"
+        echo "       expected exit=${expected_exit} pattern='${expected_pattern}'"
+        echo "       got exit=${exit_code}, output:"
+        printf '       | %s\n' "$(echo "${out}" | sed 's/^/  /')"
+        FAILED=$(( FAILED + 1 ))
+        FAILURES+=("${name}")
+    fi
+    rm -rf "${tmp}"
+}
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

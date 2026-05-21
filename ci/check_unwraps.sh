@@ -19,7 +19,11 @@ cd "$ROOT_DIR"
 violations=0
 report=""
 
-for file in $(find crates -path '*/src/*.rs' -type f); do
+# Files named `tests.rs` under `src/` are test modules loaded from their
+# parent via `#[cfg(test)] mod tests;` — the awk pass below only sees
+# inline `#[cfg(test)] mod tests { ... }` blocks, so we exclude these
+# explicitly.
+for file in $(find crates -path '*/src/*.rs' -type f -not -name tests.rs); do
     # awk script:
     #   - Skip everything from `#[cfg(test)]` (followed by `mod ... {`) until
     #     the matching closing brace. We track brace depth from the line that
@@ -32,7 +36,10 @@ for file in $(find crates -path '*/src/*.rs' -type f); do
     done < <(awk '
         BEGIN { in_test = 0; depth = 0; safety_active = 0 }
         {
-            if (in_test == 0 && $0 ~ /#\[cfg\(test\)\]/) {
+            # Skip the `#[cfg(test)]` marker only when it appears as an
+            # attribute (not inside a comment — e.g. an explanatory
+            # SAFETY-UNWRAP line that mentions cfg(test) in prose).
+            if (in_test == 0 && $0 ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
                 expect_test_mod = 1
                 next
             }
