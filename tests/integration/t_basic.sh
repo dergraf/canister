@@ -60,7 +60,7 @@ assert_contains "$RUN_STDOUT" "User namespaces"
 begin_test "can recipe list shows default baseline"
 run_can recipe list
 assert_exit_code 0 "$RUN_EXIT"
-assert_contains "$RUN_STDOUT" "Discovered recipes"
+assert_contains "$RUN_STDOUT" "Recipes:"
 assert_contains "$RUN_STDOUT" "Default baseline"
 assert_contains "$RUN_STDOUT" "allowed"
 
