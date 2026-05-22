@@ -14,7 +14,7 @@
 <body>
   <div class="status-strip">
     <div class="container status-strip-inner">
-      <a class="strip-link" href="https://dergraf.org">dergraf.org ↗</a>
+      <a class="strip-link" href="https://www.dergraf.org">dergraf.org ↗</a>
       <a class="strip-link strip-link-right" href="https://github.com/dergraf/canister">github ↗</a>
     </div>
   </div>
@@ -34,8 +34,12 @@
             <span class="window-mark" aria-hidden="true"></span>
             <span class="terminal-title">~ — install canister</span>
           </div>
-<pre class="terminal-body"><code><span class="prompt">$</span> <span class="cmd">mkdir</span> -p ~/.local/bin
+<pre class="terminal-body install-full"><code><span class="prompt">$</span> <span class="cmd">mkdir</span> -p ~/.local/bin
 <span class="prompt">$</span> <span class="cmd">curl</span> -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz \
+    | <span class="cmd">tar</span> xz -C ~/.local/bin
+<span class="prompt">$</span> <span class="cmd">can</span> --version
+<span class="ok">canister 0.1.0  ✓</span></code></pre>
+<pre class="terminal-body install-compact"><code><span class="prompt">$</span> <span class="cmd">curl</span> -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz \
     | <span class="cmd">tar</span> xz -C ~/.local/bin
 <span class="prompt">$</span> <span class="cmd">can</span> --version
 <span class="ok">canister 0.1.0  ✓</span></code></pre>

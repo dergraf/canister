@@ -56,6 +56,8 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+html, body { overflow-x: hidden; }
+
 /* Subtle grid texture on the body — barely visible, gives the page weight */
 body {
   min-height: 100vh;
@@ -156,8 +158,7 @@ code { font-size: 0.92em; }
 }
 @media (max-width: 820px) {
   .hero-grid { grid-template-columns: 1fr; }
-  .hero-logo-wrap { order: -1; justify-self: start; }
-  .hero-logo { width: 180px; }
+  .hero-logo-wrap { display: none; }
 }
 
 .hero h1 {
@@ -212,6 +213,8 @@ code { font-size: 0.92em; }
   filter: drop-shadow(0 12px 32px rgba(95, 216, 122, 0.18))
           drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
 }
+
+.install-compact { display: none; }
 
 /* =========================================================================
    Terminal window framing (install snippet + output preview)
@@ -437,7 +440,7 @@ code { font-size: 0.92em; }
   background: transparent;
   border: 1px solid var(--border-strong);
   color: var(--fg-muted);
-  width: 28px; height: 28px;
+  width: 40px; height: 40px;
   border-radius: 4px;
   padding: 0;
   cursor: pointer;
@@ -475,6 +478,7 @@ code { font-size: 0.92em; }
   color: var(--fg);
   border: 1px solid var(--border-strong);
   padding: 0.55rem 0.75rem;
+  min-height: 42px;
   border-radius: 5px;
   font: inherit;
   font-family: var(--font-mono);
@@ -519,6 +523,7 @@ code { font-size: 0.92em; }
   color: var(--fg);
   border: 1px solid var(--border-strong);
   padding: 0.7rem 0.85rem 0.7rem 2.25rem;
+  min-height: 42px;
   border-radius: 5px;
   font-family: var(--font-mono);
   font-size: 1rem;
@@ -694,7 +699,7 @@ code { font-size: 0.92em; }
   background: transparent;
   border: 1px solid var(--border-strong);
   color: var(--fg-muted);
-  width: 32px; height: 32px;
+  width: 40px; height: 40px;
   padding: 0;
   border-radius: 4px;
   cursor: pointer;
@@ -894,6 +899,7 @@ code { font-size: 0.92em; }
   color: var(--accent);
   border: 1px dashed var(--accent-strong);
   padding: 0.65rem 1.15rem;
+  min-height: 42px;
   border-radius: var(--radius);
   cursor: pointer;
   transition: background 0.1s, border-color 0.1s;
@@ -941,6 +947,7 @@ code { font-size: 0.92em; }
   color: var(--fg);
   border: 1px solid var(--border-strong);
   padding: 0.32rem 0.85rem;
+  min-height: 38px;
   font-family: var(--font-mono);
   font-size: 0.85rem;
   border-radius: 4px;
@@ -1074,6 +1081,258 @@ code { font-size: 0.92em; }
   border: 2px solid var(--bg-deep);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent-strong); }
+
+/* =========================================================================
+   Mobile polish
+   ========================================================================= */
+
+@media (max-width: 640px) {
+  body {
+    background-attachment: scroll;
+    background-size: 48px 48px;
+  }
+
+  .status-strip-inner {
+    height: auto;
+    min-height: 38px;
+    padding: 0.35rem 0;
+    flex-wrap: wrap;
+    row-gap: 0.2rem;
+  }
+
+  .strip-link-right { margin-left: 0; }
+
+  .container { padding: 0 1rem; }
+
+  .hero {
+    padding: 2.2rem 0 2rem;
+  }
+
+  .hero-grid {
+    gap: 1.2rem;
+  }
+
+  .hero-logo-wrap { display: none; }
+
+  .hero h1 {
+    font-size: clamp(2rem, 11vw, 2.6rem);
+    margin-bottom: 0.2rem;
+  }
+
+  .brand-tag {
+    font-size: 0.92rem;
+    margin-bottom: 1rem;
+  }
+
+  .tagline {
+    font-size: 1rem;
+    margin-bottom: 1.25rem;
+    line-height: 1.55;
+  }
+
+  .terminal-window {
+    box-shadow: 0 14px 32px -20px rgba(0,0,0,0.78), 0 1px 0 rgba(255,255,255,0.02) inset;
+  }
+
+  .terminal-titlebar {
+    padding: 0.5rem 0.7rem;
+    font-size: 0.72rem;
+  }
+
+  .terminal-title {
+    margin-left: 0.35rem;
+    min-width: 0;
+  }
+
+  .terminal-body {
+    padding: 0.85rem 0.95rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+
+  .install-window {
+    margin-bottom: 1rem;
+  }
+
+  .install-window .terminal-title {
+    font-size: 0.7rem;
+    letter-spacing: 0.01em;
+  }
+
+  .install-window .terminal-titlebar {
+    padding-right: 0.55rem;
+  }
+
+  .install-full { display: none; }
+  .install-compact { display: block; }
+
+  .install-window .terminal-body {
+    padding: 0.75rem 0.8rem;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .install-window .cmd {
+    word-break: break-word;
+  }
+
+  .feature-strip {
+    gap: 0.35rem;
+    margin-bottom: 1rem;
+  }
+
+  .feature-strip li {
+    font-size: 0.76rem;
+    padding: 0.24rem 0.58rem;
+  }
+
+  .hero-notes {
+    font-size: 0.92rem;
+    margin-bottom: 1rem;
+    padding-left: 0.7rem;
+  }
+
+  .hero .links {
+    gap: 0.6rem;
+  }
+
+  .hero .links a {
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0.72rem 1rem;
+  }
+
+  .hero-text,
+  .brand-tag,
+  .tagline,
+  .hero-notes {
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+
+  .hero-notes code,
+  .brand-tag code,
+  .tagline code {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .builder {
+    padding: 2.25rem 0 2.75rem;
+  }
+
+  .builder-intro h2,
+  .output-header-row h2 {
+    font-size: 1.35rem;
+  }
+
+  .builder-intro p,
+  .output-header-row p {
+    font-size: 0.98rem;
+    line-height: 1.55;
+  }
+
+  .sandboxes {
+    margin: 1.25rem 0 0.85rem;
+    gap: 1rem;
+  }
+
+  .sandbox-card-header {
+    padding: 0.65rem 0.8rem 0.65rem 0.95rem;
+  }
+
+  .sandbox-fields {
+    gap: 0.75rem;
+    padding: 0.9rem 0.95rem;
+  }
+
+  .picker {
+    padding: 0.95rem;
+  }
+
+  .picker-controls {
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+
+  .picker-controls input[type="search"] {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .search-icon {
+    top: 1.06rem;
+    transform: none;
+  }
+
+  .picker-summary {
+    white-space: normal;
+    width: 100%;
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+
+  .output-grid {
+    gap: 0.9rem;
+  }
+
+  .output-window .terminal-titlebar {
+    flex-wrap: wrap;
+  }
+
+  .output-window #output,
+  .output-window #output-cli {
+    min-height: 9rem;
+  }
+
+  .output-help {
+    font-size: 0.88rem;
+    line-height: 1.5;
+  }
+
+  .site-footer {
+    padding: 1.4rem 0 2.2rem;
+  }
+
+  .footer-sub {
+    font-size: 0.9rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .container { padding: 0 0.85rem; }
+
+  .hero {
+    padding-top: 1.9rem;
+  }
+
+  .terminal-body {
+    font-size: 0.84rem;
+  }
+
+  .install-window .terminal-title {
+    font-size: 0.66rem;
+  }
+
+  .install-window .terminal-body {
+    font-size: 0.76rem;
+  }
+
+  .recipe-row-header {
+    gap: 0.55rem;
+    padding: 0.6rem 0.7rem;
+  }
+
+  .recipe-name-wrap {
+    font-size: 0.96rem;
+  }
+}
 
 /* =========================================================================
    Reduced motion
