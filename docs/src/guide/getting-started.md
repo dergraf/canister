@@ -5,8 +5,10 @@
 Download the latest binary from [GitHub Releases](https://github.com/dergraf/canister/releases):
 
 ```bash
-# Download and extract
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-linux.tar.gz \
+# Install to ~/.local/bin so no sudo is needed for the binary itself.
+# Make sure ~/.local/bin is on your PATH (most distros add it automatically).
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz \
   | tar xz -C ~/.local/bin
 
 # Verify
@@ -21,6 +23,11 @@ cd canister
 cargo build --release
 cp target/release/can ~/.local/bin/
 ```
+
+## Runtime requirements
+
+- **Filtered network mode** uses `pasta` from the `passt` package — install it on the host (`sudo apt install passt` on Debian/Ubuntu, `sudo dnf install passt` on Fedora). Canister itself ships no daemon; pasta runs only for the lifetime of a sandbox that opts into filtered networking.
+- **Hardened distros** (Ubuntu 24.04+, Fedora 41+, RHEL 10+) restrict unprivileged user-namespace creation. Run `sudo can setup` once to install the AppArmor or SELinux policy that grants the `can` binary that capability. After that, day-to-day `can run` / `can up` invocations stay unprivileged.
 
 ## First-time Setup
 

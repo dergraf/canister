@@ -1,57 +1,43 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use can_policy::config::expand_env_vars;
 use can_policy::profile::baseline_search_dirs;
-use can_policy::{RecipeFile, SeccompProfile};
+use can_policy::{RecipeFile, SeccompProfile, walk_recipes};
 
-/// Discover all `.toml` recipe files across search directories.
-///
-/// Returns `(path, RecipeFile)` pairs. `default.toml` and `base.toml` are
-/// excluded — they are infrastructure recipes (always loaded), not regular
-/// user-facing recipes. Files that fail to parse are skipped with a warning.
-fn discover() -> Vec<(PathBuf, RecipeFile)> {
-    let mut recipes = Vec::new();
-
-    for dir in baseline_search_dirs() {
-        scan_dir(&dir, &mut recipes);
-
-        let tools_dir = dir.join("tools");
-        scan_dir(&tools_dir, &mut recipes);
-    }
-
-    recipes
+/// Category derived from the recipe's parent directory relative to the
+/// recipe search dir. Top-level recipes get `"core"`.
+fn category_for(path: &Path, search_dir: &Path) -> String {
+    path.strip_prefix(search_dir)
+        .ok()
+        .and_then(|rel| rel.parent())
+        .and_then(|parent| parent.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "core".to_string())
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<(PathBuf, RecipeFile)>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|ext| ext == "toml")
-                && p.file_stem().is_some_and(|s| s != "default" && s != "base")
-        })
-        .collect();
-    paths.sort();
-
-    for path in paths {
-        match RecipeFile::from_file(&path) {
-            Ok(recipe) => out.push((path, recipe)),
-            Err(e) => {
-                tracing::warn!("skipping {}: {e}", path.display());
+/// Discover all recipe files across the search path.
+///
+/// Returns `(path, category, RecipeFile)` triples. Infrastructure recipes
+/// (`default.toml`, `base.toml`, `checksums.toml`) are filtered out by
+/// `walk_recipes`. Files that fail to parse are skipped with a warning.
+fn discover() -> Vec<(PathBuf, String, RecipeFile)> {
+    let mut out = Vec::new();
+    for dir in baseline_search_dirs() {
+        for path in walk_recipes(&dir) {
+            let category = category_for(&path, &dir);
+            match RecipeFile::from_file(&path) {
+                Ok(recipe) => out.push((path, category, recipe)),
+                Err(e) => {
+                    tracing::warn!("skipping {}: {e}", path.display());
+                }
             }
         }
     }
-}
-
-fn is_tool_recipe(recipe: &RecipeFile) -> bool {
-    recipe.display_name("").starts_with("tool:")
+    out
 }
 
 fn print_recipe_entry(path: &Path, recipe: &RecipeFile) {
@@ -81,42 +67,37 @@ fn print_recipe_entry(path: &Path, recipe: &RecipeFile) {
 
 /// Execute the `can recipe list` command.
 ///
-/// Lists discovered recipes from the search path, grouped into regular
-/// recipes and tool shortcuts, followed by information about the default
-/// seccomp baseline and its source.
+/// Lists discovered recipes from the search path, grouped by category
+/// (the parent directory under the search root), followed by information
+/// about the default seccomp baseline and its source.
 pub fn list() -> Result<i32> {
     let all = discover();
 
-    let (tools, regular): (Vec<_>, Vec<_>) = all.iter().partition(|(_, r)| is_tool_recipe(r));
+    let mut by_category: BTreeMap<String, Vec<&(PathBuf, String, RecipeFile)>> = BTreeMap::new();
+    for entry in &all {
+        by_category.entry(entry.1.clone()).or_default().push(entry);
+    }
 
-    // --- Regular recipes ---
     println!("Recipes:\n");
-    if regular.is_empty() {
+    if by_category.is_empty() {
         println!("  (none found)");
     } else {
-        for (path, recipe) in &regular {
-            print_recipe_entry(path, recipe);
+        for (category, entries) in &by_category {
+            println!("[{category}]");
+            for (path, _cat, recipe) in entries {
+                print_recipe_entry(path, recipe);
+            }
+            println!();
         }
     }
 
-    // --- Tool shortcuts ---
-    println!("\nTool shortcuts:\n");
-    if tools.is_empty() {
-        println!("  (none found — run `can init` to install curated tool recipes)");
-    } else {
-        for (path, recipe) in &tools {
-            print_recipe_entry(path, recipe);
-        }
-    }
-
-    println!("\nSearch path:");
+    println!("Search path:");
     for dir in baseline_search_dirs() {
         let exists = dir.is_dir();
         let marker = if exists { "+" } else { " " };
         println!("  {marker} {}", dir.display());
     }
 
-    // --- Default baseline ---
     match SeccompProfile::resolve_baseline() {
         Ok(resolved) => {
             println!(
@@ -217,9 +198,9 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
 
 /// Execute the `can recipe suggest` command.
 ///
-/// Takes a command line, resolves the binary, and recommends tool recipes
-/// based on binary basename matching known `tool:*` recipe names and
-/// `match_prefix` on the resolved binary path.
+/// Takes a command line, resolves the binary, and recommends recipes
+/// whose name matches the binary basename or whose `match_prefix`
+/// covers the resolved binary path.
 pub fn suggest(command: &[String]) -> Result<i32> {
     let cmd = command
         .first()
@@ -239,28 +220,21 @@ pub fn suggest(command: &[String]) -> Result<i32> {
     let all = discover();
     let mut suggestions: Vec<String> = Vec::new();
 
-    for (path, recipe) in &all {
+    for (path, _category, recipe) in &all {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let name = recipe.display_name(stem);
 
-        // Match by tool name → command basename (tool:npm matches `npm`)
-        if let Some(tool_name) = name.strip_prefix("tool:") {
-            if tool_name == basename {
-                suggestions.push(tool_name.to_string());
-                continue;
-            }
+        // Match by recipe stem → command basename (recipe "npm" matches `npm`).
+        if stem == basename {
+            suggestions.push(stem.to_string());
+            continue;
         }
 
-        // Match by match_prefix against the resolved binary path
+        // Match by match_prefix against the resolved binary path.
         if let Some(ref resolved_path) = resolved {
             let resolved_str = resolved_path.to_string_lossy();
             for prefix in recipe.match_prefixes_expanded() {
                 if resolved_str.starts_with(&prefix) {
-                    if let Some(tool_name) = name.strip_prefix("tool:") {
-                        suggestions.push(tool_name.to_string());
-                    } else {
-                        suggestions.push(name.clone());
-                    }
+                    suggestions.push(stem.to_string());
                     break;
                 }
             }
@@ -273,35 +247,8 @@ pub fn suggest(command: &[String]) -> Result<i32> {
         println!("No matching recipes found for `{cmd}`.");
         println!("\nRun `can recipe list` to see all available recipes.");
     } else {
-        let tool_suggestions: Vec<_> = suggestions
-            .iter()
-            .filter(|s| {
-                all.iter().any(|(_, r)| {
-                    r.display_name("")
-                        .strip_prefix("tool:")
-                        .is_some_and(|t| t == s.as_str())
-                })
-            })
-            .collect();
-        let other_suggestions: Vec<_> = suggestions
-            .iter()
-            .filter(|s| !tool_suggestions.contains(s))
-            .collect();
-
-        if !tool_suggestions.is_empty() {
-            let quoted: Vec<_> = tool_suggestions
-                .iter()
-                .map(|s| format!("\"{s}\""))
-                .collect();
-            println!("tools = [{}]", quoted.join(", "));
-        }
-        if !other_suggestions.is_empty() {
-            let quoted: Vec<_> = other_suggestions
-                .iter()
-                .map(|s| format!("\"{s}\""))
-                .collect();
-            println!("recipes = [{}]", quoted.join(", "));
-        }
+        let quoted: Vec<_> = suggestions.iter().map(|s| format!("\"{s}\"")).collect();
+        println!("recipes = [{}]", quoted.join(", "));
     }
 
     Ok(0)

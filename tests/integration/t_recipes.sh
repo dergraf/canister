@@ -9,15 +9,14 @@
 #   4. Recipe with [syscalls] allow_extra works
 #   5. Recipe with unknown fields is rejected (deny_unknown_fields)
 #   6. Plain policy (no [recipe] section) works via --recipe
-#   7. tool:NAME resolves to <search-path>/tools/NAME.toml
-#   8. tool:nonexistent fails with `can init` hint
-#   9. tool: (bare) fails with a clear error
-#  10. tool:foo/bar fails with "bare identifier" error (no slashes)
-#  11. recipe explain shows filesystem paths and env vars
-#  12. recipe explain with direct file path works
-#  13. recipe list groups tool shortcuts separately
-#  14. recipe suggest matches tool recipe by basename
-#  15. recipe suggest with unknown binary suggests nothing
+#   7. Name lookup recurses into category subdirs
+#   8. Missing name reports the search path
+#   9. Name collision within one search dir is reported
+#  10. recipe explain shows filesystem paths and env vars
+#  11. recipe explain with direct file path works
+#  12. recipe list groups output by category
+#  13. recipe suggest matches recipe by basename
+#  14. recipe suggest with unknown binary suggests nothing
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -28,7 +27,6 @@ header "Recipe system"
 begin_test "can recipe list lists discovered recipes"
 run_can recipe list
 assert_exit_code 0 "$RUN_EXIT"
-# Should find the example recipes in ./recipes/
 assert_contains "$RUN_STDOUT" "Recipes:"
 
 # ---- Test 2: can recipe list shows default baseline ----
@@ -101,21 +99,20 @@ assert_exit_code 0 "$RUN_EXIT"
 assert_eq "plain works" "$RUN_STDOUT"
 
 # ============================================================================
-# tool: namespace resolution
+# Recursive name lookup
 #
-# These tests pin the resolver behaviour for tool-prefixed recipes. They
-# use a temp `.canister/tools/<name>.toml` so the search-path lookup is
-# exercised end-to-end without depending on `can init` having populated
-# ~/.config/canister/recipes/.
+# Recipes live in category subdirectories under the recipe search path.
+# Name lookup walks the tree, so a project-local recipe under any depth
+# resolves the same way as one at the search-dir root.
 # ============================================================================
 
-TOOLDIR=$(mktemp -d)
-_TMPFILES+=("$TOOLDIR")
-mkdir -p "$TOOLDIR/.canister/tools"
-cat >"$TOOLDIR/.canister/tools/example.toml" <<'EOF'
+PROJDIR=$(mktemp -d)
+_TMPFILES+=("$PROJDIR")
+mkdir -p "$PROJDIR/.canister/extras"
+cat >"$PROJDIR/.canister/extras/example.toml" <<'EOF'
 [recipe]
-name = "tool:example"
-description = "Test fixture for tool: namespace resolution"
+name = "example"
+description = "Test fixture for recursive name resolution"
 version = "1"
 
 [filesystem]
@@ -125,10 +122,10 @@ allow = ["/tmp/example-marker-path"]
 env_passthrough = ["EXAMPLE_TEST_VAR"]
 EOF
 
-# ---- Test 7: tool:NAME resolves via tools/ subdirectory ----
-begin_test "tool:example resolves to .canister/tools/example.toml"
-pushd "$TOOLDIR" >/dev/null
-run_can recipe show -r tool:example
+# ---- Test 7: name lookup recurses into category subdirs ----
+begin_test "bare-name lookup resolves from .canister/extras/example.toml"
+pushd "$PROJDIR" >/dev/null
+run_can recipe show -r example
 popd >/dev/null
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     fail "exit ${RUN_EXIT}; stderr: ${RUN_STDERR}"
@@ -138,49 +135,52 @@ else
     pass
 fi
 
-# ---- Test 8: tool:<missing> fails with init hint ----
-begin_test "tool:does-not-exist fails with 'can init' hint"
-pushd "$TOOLDIR" >/dev/null
-run_can recipe show -r tool:does-not-exist
+# ---- Test 8: missing recipe reports searched path ----
+begin_test "missing recipe reports recursive search path"
+run_can recipe show -r definitely-no-such-recipe
+if [[ "$RUN_EXIT" -eq 0 ]]; then
+    fail "expected non-zero exit on missing recipe"
+elif [[ "$RUN_STDERR" != *"definitely-no-such-recipe.toml"* ]] && \
+     [[ "$RUN_STDOUT" != *"definitely-no-such-recipe.toml"* ]]; then
+    fail "expected filename in error; stderr: ${RUN_STDERR}"
+elif [[ "$RUN_STDERR" != *"recursively"* ]] && [[ "$RUN_STDOUT" != *"recursively"* ]]; then
+    fail "expected 'recursively' hint; stderr: ${RUN_STDERR}"
+else
+    pass
+fi
+
+# ---- Test 9: name collision within one search dir is reported ----
+DUPDIR=$(mktemp -d)
+_TMPFILES+=("$DUPDIR")
+mkdir -p "$DUPDIR/.canister/catA" "$DUPDIR/.canister/catB"
+cat >"$DUPDIR/.canister/catA/dup.toml" <<'EOF'
+[recipe]
+name = "dup"
+EOF
+cat >"$DUPDIR/.canister/catB/dup.toml" <<'EOF'
+[recipe]
+name = "dup"
+EOF
+begin_test "name collision across category dirs is reported"
+pushd "$DUPDIR" >/dev/null
+run_can recipe show -r dup
 popd >/dev/null
 if [[ "$RUN_EXIT" -eq 0 ]]; then
-    fail "expected non-zero exit on missing tool recipe"
-elif [[ "$RUN_STDERR" != *"can init"* ]] && [[ "$RUN_STDOUT" != *"can init"* ]]; then
-    fail "expected 'can init' hint in error output; stderr: ${RUN_STDERR}"
-else
-    pass
-fi
-
-# ---- Test 9: bare tool: rejected ----
-begin_test "bare 'tool:' rejected with clear error"
-run_can recipe show -r "tool:"
-if [[ "$RUN_EXIT" -eq 0 ]]; then
-    fail "expected non-zero exit on bare 'tool:'"
-elif [[ "$RUN_STDERR" != *"bare 'tool:'"* ]] && [[ "$RUN_STDOUT" != *"bare 'tool:'"* ]]; then
-    fail "expected 'bare tool:' error; stderr: ${RUN_STDERR}; stdout: ${RUN_STDOUT}"
-else
-    pass
-fi
-
-# ---- Test 10: tool name with slash rejected ----
-begin_test "tool:foo/bar rejected (no slashes in tool names)"
-run_can recipe show -r "tool:foo/bar"
-if [[ "$RUN_EXIT" -eq 0 ]]; then
-    fail "expected non-zero exit on tool:foo/bar"
-elif [[ "$RUN_STDERR" != *"bare identifier"* ]] && [[ "$RUN_STDOUT" != *"bare identifier"* ]]; then
-    fail "expected 'bare identifier' error; stderr: ${RUN_STDERR}"
+    fail "expected non-zero exit on ambiguous recipe"
+elif [[ "$RUN_STDERR" != *"ambiguous"* ]] && [[ "$RUN_STDOUT" != *"ambiguous"* ]]; then
+    fail "expected 'ambiguous' in error; stderr: ${RUN_STDERR}"
 else
     pass
 fi
 
 # ============================================================================
-# recipe explain / suggest subcommands
+# recipe explain / list / suggest subcommands
 # ============================================================================
 
-# ---- Test 11: recipe explain shows filesystem and env sections ----
+# ---- Test 10: recipe explain shows filesystem and env sections ----
 begin_test "recipe explain shows filesystem paths and env vars"
-pushd "$TOOLDIR" >/dev/null
-run_can recipe explain -r tool:example
+pushd "$PROJDIR" >/dev/null
+run_can recipe explain -r example
 popd >/dev/null
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     fail "exit ${RUN_EXIT}; stderr: ${RUN_STDERR}"
@@ -194,51 +194,50 @@ else
     pass
 fi
 
-# ---- Test 12: recipe explain with file path works ----
+# ---- Test 11: recipe explain with file path works ----
 begin_test "recipe explain with direct file path"
-run_can recipe explain -r "$TOOLDIR/.canister/tools/example.toml"
+run_can recipe explain -r "$PROJDIR/.canister/extras/example.toml"
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     fail "exit ${RUN_EXIT}; stderr: ${RUN_STDERR}"
-elif [[ "$RUN_STDOUT" != *"tool:example"* ]]; then
+elif [[ "$RUN_STDOUT" != *"example"* ]]; then
     fail "expected recipe name in output; got: ${RUN_STDOUT:0:200}"
 else
     pass
 fi
 
-# ---- Test 13: recipe list groups tool shortcuts separately ----
-begin_test "recipe list groups tool shortcuts"
-pushd "$TOOLDIR" >/dev/null
+# ---- Test 12: recipe list groups output by category ----
+begin_test "recipe list groups output by category"
+pushd "$PROJDIR" >/dev/null
 run_can recipe list
 popd >/dev/null
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     fail "exit ${RUN_EXIT}; stderr: ${RUN_STDERR}"
-elif [[ "$RUN_STDOUT" != *"Tool shortcuts:"* ]]; then
-    fail "expected 'Tool shortcuts:' heading; got: ${RUN_STDOUT:0:500}"
-elif [[ "$RUN_STDOUT" != *"tool:example"* ]]; then
-    fail "expected tool:example in tool shortcuts section; got: ${RUN_STDOUT:0:500}"
+elif [[ "$RUN_STDOUT" != *"[extras]"* ]]; then
+    fail "expected category header '[extras]'; got: ${RUN_STDOUT:0:500}"
+elif [[ "$RUN_STDOUT" != *"example"* ]]; then
+    fail "expected fixture recipe 'example' in listing; got: ${RUN_STDOUT:0:500}"
 else
     pass
 fi
 
-# ---- Test 14: recipe suggest with known binary matches tool recipe ----
-# Create a fake binary so `which`-style resolution finds it by basename.
+# ---- Test 13: recipe suggest with known binary matches recipe by basename ----
 FAKEBIN=$(mktemp -d)
 _TMPFILES+=("$FAKEBIN")
 touch "$FAKEBIN/example"
 chmod +x "$FAKEBIN/example"
-begin_test "recipe suggest matches tool recipe by basename"
-pushd "$TOOLDIR" >/dev/null
+begin_test "recipe suggest matches recipe by basename"
+pushd "$PROJDIR" >/dev/null
 PATH="$FAKEBIN:$PATH" run_can recipe suggest example
 popd >/dev/null
 if [[ "$RUN_EXIT" -ne 0 ]]; then
     fail "exit ${RUN_EXIT}; stderr: ${RUN_STDERR}"
-elif [[ "$RUN_STDOUT" != *'tools = ["example"]'* ]]; then
-    fail "expected tools = [\"example\"]; got: ${RUN_STDOUT}"
+elif [[ "$RUN_STDOUT" != *'recipes = ["example"]'* ]]; then
+    fail "expected recipes = [\"example\"]; got: ${RUN_STDOUT}"
 else
     pass
 fi
 
-# ---- Test 15: recipe suggest with unknown binary suggests nothing ----
+# ---- Test 14: recipe suggest with unknown binary suggests nothing ----
 begin_test "recipe suggest with unknown binary"
 run_can recipe suggest no-such-binary-ever
 if [[ "$RUN_EXIT" -ne 0 ]]; then

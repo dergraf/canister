@@ -90,15 +90,25 @@ Canister can run on this system.
 Download the latest release from [GitHub Releases](https://github.com/dergraf/canister/releases):
 
 ```bash
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv can /usr/local/bin/
+# Install to ~/.local/bin so no sudo is needed.
+# Make sure ~/.local/bin is on your PATH (most distros add it automatically).
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz \
+  | tar xz -C ~/.local/bin
 ```
 
 Verify the download:
 
 ```bash
-curl -fsSL https://github.com/dergraf/canister/releases/latest/download/canister-x86_64-unknown-linux-gnu.tar.gz.sha256 | sha256sum -c
+curl -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz.sha256 | sha256sum -c
 ```
+
+> **Note on privileges.** Day-to-day `can run` / `can up` invocations are
+> unprivileged. Two exceptions: `can setup` needs `sudo` once on hardened
+> distros (Ubuntu 24.04+, Fedora 41+) to install the AppArmor / SELinux
+> policy that grants the binary user-namespace creation; and filtered
+> network mode requires `pasta` (from the `passt` package) installed on
+> the host — `can` itself ships no daemon.
 
 ### Build from source
 
@@ -382,22 +392,63 @@ match_prefix = ["$HOME/.cargo"]
 
 | Recipe | Auto-detected when binary is under |
 |--------|-----------------------------------|
-| `nix.toml` | `/nix/store` |
-| `homebrew.toml` | `/opt/homebrew`, `/home/linuxbrew/.linuxbrew` |
-| `cargo.toml` | `$HOME/.cargo`, `$HOME/.rustup` |
-| `snap.toml` | `/snap` |
-| `flatpak.toml` | `/var/lib/flatpak`, `$HOME/.local/share/flatpak` |
-| `gnu-store.toml` | `/gnu/store` |
+| `package-managers/nix` | `/nix/store` |
+| `package-managers/homebrew` | `/opt/homebrew`, `/home/linuxbrew/.linuxbrew` |
+| `package-managers/cargo` | `$HOME/.cargo`, `$HOME/.rustup` |
+| `package-managers/snap` | `/snap` |
+| `package-managers/flatpak` | `/var/lib/flatpak`, `$HOME/.local/share/flatpak` |
+| `package-managers/gnu-store` | `/gnu/store` |
 
-These replace hardcoded prefix detection -- adding support for a new package
-manager is "write a .toml file" not "modify Rust code".
+These replace hardcoded prefix detection — adding support for a new
+package manager is "write a .toml file" not "modify Rust code".
 
-### Tool & service contracts
+### Recipe categories — strict, composable, least-privilege
 
-| Bundle              | What it ships                                  | Usage                |
-|---------------------|------------------------------------------------|----------------------|
-| `recipes/tools/`    | Per-tool filesystem + env passthrough (npm, gh, pip, cargo, kubectl, helm, …) | `tools = ["npm", "gh"]` in the manifest |
-| `recipes/services/` | Per-upstream `[[host]]` contracts: method, content-type, body-size, credential scope (github, openai, anthropic, npm, pypi, huggingface, docker, aws, stripe, slack) | `recipes = ["service:github", "service:openai"]` |
+Recipes live in category subdirectories under `recipes/`. The category
+is the directory name; there is no `kind` / `tool:` / `service:`
+distinction — every entry is just a recipe.
+
+The split is **strict** so every recipe stays single-purpose. A recipe
+in `languages/` covers only what the runtime needs to *execute*. A
+recipe in `package-managers/` covers cache dirs, config, and
+credential handling — never registry domains. The **only** recipes that
+open a network destination are under `recipes/services/`, one per
+upstream. To do anything useful you **compose** explicitly:
+
+```toml
+[sandbox.python]
+recipes = ["python", "pip", "pypi"]    # run python3 + install from PyPI
+command = "python3 -m pip install -r requirements.txt"
+
+[sandbox.python.network]
+egress = "proxy-only"
+```
+
+```toml
+[sandbox.rust]
+recipes = ["cargo", "crates-io", "rust-lang"]   # build + fetch + rustup
+command = "cargo build --release"
+```
+
+```toml
+[sandbox.elixir]
+recipes = ["elixir", "hex", "github"]   # mix + Hex deps + GitHub-hosted deps
+command = "mix deps.get"
+```
+
+This way a recipe can never *imply* a network destination you didn't
+ask for, and the audit story is straightforward: the manifest is the
+complete picture of what a sandbox can reach.
+
+| Directory               | What it ships                                                 | Example usage                                  |
+|-------------------------|---------------------------------------------------------------|------------------------------------------------|
+| `recipes/languages/`    | Programming-language runtimes — interpreter / compiler only (python, node, elixir, go) | `recipes = ["python", "pip", "pypi"]`          |
+| `recipes/package-managers/` | OS PMs + language-ecosystem PMs + toolchain managers (cargo, rustup, npm, pip, poetry, pnpm, yarn, uv, homebrew, nix, snap, flatpak, gnu-store) — filesystem/config only, no registry hosts | `recipes = ["nix", "pip", "pypi"]`             |
+| `recipes/vcs/`          | Version-control clients (git, gh)                              | `recipes = ["git", "gh", "github"]`            |
+| `recipes/container/`    | Container tooling configs that don't require a local runtime (podman-config, kubectl, helm) | `recipes = ["kubectl"]`                        |
+| `recipes/editors/`      | Editor bundles (neovim, opencode)                              | `recipes = ["neovim", "github", "luarocks"]`   |
+| `recipes/system/`       | System & auth helpers (ssh-agent, gpg-public, generic-strict)  | `recipes = ["gpg-public", "gpg-keyservers"]`   |
+| `recipes/services/`     | Per-upstream `[[host]]` contracts — the **only** recipes that open network destinations (github, openai, anthropic, npm-registry, pypi, hex, crates-io, rust-lang, go-proxy, yarn-registry, luarocks, opencode-ai, gpg-keyservers, huggingface, aws, stripe, slack) | `recipes = ["github", "openai"]`               |
 
 A service contract refusing a request emits a 415 with a copy-pasteable
 `[[host]]` patch in the body — paste the three lines into your
@@ -607,24 +658,17 @@ canister/
 │   ├── can-docgen/     # mdBook reference generator (config.md, manifest.md, merge.md, recipes.md, cli.md)
 │   └── can-log/        # TTY-aware structured logging
 ├── recipes/
-│   ├── default.toml         # Default seccomp baseline (embedded + overridable)
-│   ├── base.toml            # Essential OS bind mounts (embedded + overridable)
-│   ├── nix.toml             # Nix package manager (auto-detected)
-│   ├── homebrew.toml        # Homebrew/Linuxbrew (auto-detected)
-│   ├── cargo.toml           # Rust/Cargo toolchain (auto-detected)
-│   ├── snap.toml            # Snap packages (auto-detected)
-│   ├── flatpak.toml         # Flatpak applications (auto-detected)
-│   ├── gnu-store.toml       # GNU Guix (auto-detected)
-│   ├── elixir.toml          # Elixir/Erlang development recipe
-│   ├── neovim.toml          # Neovim editor recipe
-│   ├── opencode.toml        # OpenCode AI coding agent recipe
-│   ├── python-pip.toml      # Python pip install recipe
-│   ├── node-build.toml      # Node.js build recipe
-│   ├── generic-strict.toml  # Strict no-network recipe for CI
-│   ├── example.toml         # Example recipe (all options documented)
-│   ├── checksums.toml       # SHA-256 pinning for shipped recipes (R16 trust)
-│   ├── tools/               # Per-tool bundles (gh, git, npm, pnpm, yarn, pip, poetry, uv, cargo, rustup, go, helm, kubectl, gpg-public, ssh-agent, docker-config, podman-config)
-│   └── services/            # Per-upstream [[host]] contracts (github, openai, anthropic, npm, pypi, huggingface, docker, aws, stripe, slack)
+│   ├── default.toml          # Default seccomp baseline (embedded + overridable)
+│   ├── base.toml             # Essential OS bind mounts (embedded + overridable)
+│   ├── example.toml          # Example recipe (all options documented)
+│   ├── checksums.toml        # SHA-256 pinning for shipped recipes (R16 trust)
+│   ├── languages/            # Programming-language runtimes — interpreter/compiler only (python, node, elixir, go)
+│   ├── package-managers/     # OS PMs + language-ecosystem PMs + toolchain managers (cargo, rustup, npm, pip, poetry, pnpm, yarn, uv, homebrew, nix, snap, flatpak, gnu-store)
+│   ├── vcs/                  # Version-control clients (git, gh)
+│   ├── container/            # Container tooling configs that work without a local runtime (podman-config, kubectl, helm)
+│   ├── editors/              # Editor bundles (neovim, opencode)
+│   ├── system/               # System & auth helpers (ssh-agent, gpg-public, generic-strict)
+│   └── services/             # Per-upstream [[host]] contracts (github, openai, anthropic, npm-registry, pypi, huggingface, docker, aws, stripe, slack)
 ├── docs/
 │   ├── ARCHITECTURE.md    # Design and execution flow
 │   ├── CONFIGURATION.md   # Complete config reference (incl. canister.toml + [[host]])

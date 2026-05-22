@@ -1,7 +1,7 @@
 # Anthropic API.
 
 [recipe]
-name        = "service:anthropic"
+name = "anthropic"
 description = "Anthropic API contracts"
 
 [[host]]

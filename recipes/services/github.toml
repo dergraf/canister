@@ -9,7 +9,7 @@
 # clients carry a PAT in `Authorization: Bearer …`.
 
 [recipe]
-name        = "service:github"
+name = "github"
 description = "GitHub REST + GraphQL API contracts"
 
 [[host]]
@@ -42,4 +42,18 @@ methods           = ["GET", "HEAD"]
 # Content-served-from-storage: blob download endpoint. No credentials
 # expected; downgrade to Relaxed because the path/content-type set is
 # huge and not worth enumerating.
+contract_mode     = "relaxed"
+
+[[host]]
+domain            = "raw.githubusercontent.com"
+methods           = ["GET", "HEAD"]
+# Raw-content endpoint serving arbitrary file types from repositories.
+# Content set is too heterogeneous to enumerate.
+contract_mode     = "relaxed"
+
+[[host]]
+domain            = "codeload.github.com"
+methods           = ["GET", "HEAD"]
+# Tarball / zip download endpoint used by `git clone`, `gh repo clone`,
+# and codeload links. Returns application/octet-stream for archives.
 contract_mode     = "relaxed"

@@ -1,0 +1,26 @@
+# OpenCode SaaS endpoints (Zen, auth, sharing) + GitHub Copilot proxy.
+#
+# `opencode.ai` hosts OpenCode's own services (auth, sharing).
+# `api.githubcopilot.com` is the Copilot chat completion endpoint.
+# `copilot-proxy.githubusercontent.com` is Copilot's CDN/proxy used
+# during the OAuth flow.
+
+[recipe]
+name = "opencode-ai"
+description = "OpenCode SaaS + GitHub Copilot endpoints"
+
+[[host]]
+domain            = "opencode.ai"
+methods           = ["GET", "POST", "HEAD"]
+content_types     = ["application/json"]
+
+[[host]]
+domain            = "api.githubcopilot.com"
+methods           = ["GET", "POST", "HEAD"]
+content_types     = ["application/json", "text/event-stream"]
+allow_credentials = ["github_pat"]
+
+[[host]]
+domain        = "copilot-proxy.githubusercontent.com"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"

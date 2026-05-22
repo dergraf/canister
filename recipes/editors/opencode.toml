@@ -1,0 +1,98 @@
+# Canister recipe for OpenCode — AI coding agent.
+#
+# OpenCode is a Go binary that talks to LLM providers (GitHub Copilot,
+# Anthropic, OpenAI, etc.) and runs developer tools (git, cargo, npm,
+# ripgrep, etc.) to assist with coding tasks.
+#
+# This recipe scopes filesystem access to the project working directory
+# and OpenCode's own state/config dirs. Network access to LLM APIs is
+# NOT baked in — compose with the relevant service recipes:
+#
+#   # GitHub Copilot
+#   recipes = ["opencode", "github", "opencode-ai"]
+#
+#   # Anthropic
+#   recipes = ["opencode", "anthropic", "opencode-ai"]
+#
+#   # OpenAI
+#   recipes = ["opencode", "openai", "opencode-ai"]
+#
+# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+#
+# Note: Run from the project directory you want OpenCode to work on.
+# The $PWD will be bind-mounted into the sandbox.
+
+[recipe]
+name = "opencode"
+description = "OpenCode AI coding agent: scoped filesystem (no network — compose with LLM service recipes)"
+version = "3"
+
+[filesystem]
+# OpenCode needs access to:
+# - The project directory (implicitly mounted writable as the working dir)
+# - Its own config and state dirs
+# System paths (/usr/lib, /usr/bin, /lib, /tmp, etc.) are provided by base.toml.
+# Language toolchains ($HOME/.cargo, $HOME/.rustup, /nix/store, etc.) should
+# be added via recipe composition in canister.toml, NOT baked in here.
+#
+# SECURITY: We intentionally do NOT mount:
+# - $HOME/.ssh        — SSH private keys. Use SSH_AUTH_SOCK (agent) instead.
+# - $HOME/.gitconfig  — may contain credential helpers or tokens. Git identity
+#                       is passed via GIT_AUTHOR_NAME/EMAIL env vars.
+# - $HOME/.cargo      — contains credentials.toml (crates.io tokens). Mount
+#                       via the cargo recipe when needed.
+# - $HOME/.gnupg      — GPG private keys.
+# - $HOME/.aws        — AWS credentials.
+# - $HOME/.kube       — Kubernetes config with tokens.
+allow = [
+    "$HOME/.opencode",
+    "$HOME/.config/opencode",
+]
+# OpenCode writes to its state dir (SQLite DB, logs, tool output).
+allow_write = [
+    "$HOME/.local/share/opencode",
+]
+deny = [
+    # Universal denies (/etc/shadow, /etc/gshadow, /root) already live in
+    # base.toml — recipe focuses on credential / token files OpenCode
+    # has no business reading.
+    "$HOME/.ssh",
+    "$HOME/.gnupg",
+    "$HOME/.aws",
+    "$HOME/.kube",
+    "$HOME/.docker",
+    "$HOME/.npmrc",
+    "$HOME/.pypirc",
+    "$HOME/.netrc",
+    "$HOME/.config/gh",
+]
+
+[process]
+# OpenCode spawns subprocesses for tools (git, cargo, rg, etc.)
+max_pids = 256
+# Environment variables OpenCode and its tools need.
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "EDITOR",
+    "SHELL",
+    "USER",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "SSH_AUTH_SOCK",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "NODE_PATH",
+]

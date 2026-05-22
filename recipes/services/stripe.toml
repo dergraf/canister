@@ -5,7 +5,7 @@
 # bodies. Allow both — newer endpoints accept JSON too.
 
 [recipe]
-name        = "service:stripe"
+name = "stripe"
 description = "Stripe API contracts"
 
 [[host]]

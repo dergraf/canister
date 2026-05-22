@@ -1130,39 +1130,35 @@ fn shipped_service_recipes_all_parse() {
 
 #[test]
 fn shipped_top_level_recipes_all_parse() {
-    // Every recipe at `recipes/*.toml` and `recipes/tools/*.toml` must
-    // also parse cleanly with `deny_unknown_fields`. A misplaced field
-    // (e.g. `allow_ips` accidentally adopted by a preceding `[[host]]`
-    // block instead of `[network]`) breaks runtime loading without
-    // showing up in CI unless we round-trip each shipped file.
+    // Every recipe shipped under `recipes/` (excluding `services/`, which
+    // has its own dedicated test below) must parse cleanly with
+    // `deny_unknown_fields`. A misplaced field (e.g. `allow_ips`
+    // accidentally adopted by a preceding `[[host]]` block instead of
+    // `[network]`) breaks runtime loading without showing up in CI unless
+    // we round-trip each shipped file.
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut dirs = vec![repo_root.join("recipes"), repo_root.join("recipes/tools")];
-    // Recipes under recipes/services/ are covered by the dedicated
-    // `shipped_service_recipes_all_parse` test which additionally
-    // asserts each one declares a non-empty [[host]] block.
+    let recipes_root = repo_root.join("recipes");
     let mut parsed = 0;
-    while let Some(dir) = dirs.pop() {
-        for entry in
-            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+    for path in crate::profile::walk_recipes(&recipes_root) {
+        // Skip services/ — covered by `shipped_service_recipes_all_parse`
+        // which additionally asserts each declares a non-empty [[host]].
+        if path
+            .strip_prefix(&recipes_root)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .map(|c| c.as_os_str() == "services")
+            .unwrap_or(false)
         {
-            let path = entry.unwrap().path();
-            if path.is_dir() || path.extension().and_then(|s| s.to_str()) != Some("toml") {
-                continue;
-            }
-            // checksums.toml is the integrity manifest for the recipe
-            // bundle, not a recipe itself — different schema.
-            if path.file_name().and_then(|s| s.to_str()) == Some("checksums.toml") {
-                continue;
-            }
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            RecipeFile::parse(&content).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-            parsed += 1;
+            continue;
         }
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        RecipeFile::parse(&content).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        parsed += 1;
     }
     assert!(
         parsed >= 15,
-        "expected at least 15 shipped top-level + tools recipes, found {parsed}"
+        "expected at least 15 shipped non-service recipes, found {parsed}"
     );
 }
 

@@ -426,8 +426,8 @@ mod tests {
         );
         // Verify a known recipe exists.
         assert!(
-            cs.contains_key("elixir.toml"),
-            "elixir.toml should have a checksum"
+            cs.contains_key("languages/elixir.toml"),
+            "languages/elixir.toml should have a checksum"
         );
     }
 

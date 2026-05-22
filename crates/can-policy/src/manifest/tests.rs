@@ -107,10 +107,10 @@ fn reject_empty_sandbox_section() {
 }
 
 #[test]
-fn reject_sandbox_without_recipes_or_tools() {
-    // A sandbox with no recipes AND no tools has nothing to compose
-    // beyond the embedded base/default baseline — and the existing
-    // validation says that is not enough policy to be worth running.
+fn reject_sandbox_without_recipes() {
+    // A sandbox with no recipes has nothing to compose beyond the embedded
+    // base/default baseline — validation says that is not enough policy to
+    // be worth running.
     let toml = r#"
 [sandbox.dev]
 command = "nvim"
@@ -118,12 +118,12 @@ command = "nvim"
     let result = Manifest::parse(toml);
     assert!(
         result.is_err(),
-        "sandbox without recipes or tools should be rejected"
+        "sandbox without recipes should be rejected"
     );
 }
 
 #[test]
-fn reject_sandbox_with_empty_recipes_and_no_tools() {
+fn reject_sandbox_with_empty_recipes() {
     let toml = r#"
 [sandbox.dev]
 recipes = []
@@ -132,49 +132,24 @@ command = "nvim"
     let result = Manifest::parse(toml);
     assert!(
         result.is_err(),
-        "sandbox with empty recipes and no tools should be rejected"
+        "sandbox with empty recipes should be rejected"
     );
 }
 
 #[test]
-fn accept_sandbox_with_only_tools() {
+fn reject_legacy_tools_field() {
+    // The `tools = [...]` field was removed in favour of putting every
+    // building-block under `recipes = [...]`. Any manifest still using
+    // the old name must fail loudly so the user knows to migrate.
     let toml = r#"
 [sandbox.dev]
 tools = ["npm"]
 command = "npm test"
 "#;
-    let manifest = Manifest::parse(toml).expect("manifest with only tools should parse");
-    let dev = manifest.get("dev").unwrap();
-    assert_eq!(dev.tools, vec!["npm"]);
-    assert!(dev.recipes.is_empty());
-}
-
-#[test]
-fn accept_sandbox_with_recipes_and_tools() {
-    let toml = r#"
-[sandbox.dev]
-recipes = ["nodejs"]
-tools = ["npm", "gh"]
-command = "npm test"
-"#;
-    let manifest = Manifest::parse(toml).expect("both fields together must parse");
-    let dev = manifest.get("dev").unwrap();
-    assert_eq!(dev.recipes, vec!["nodejs"]);
-    assert_eq!(dev.tools, vec!["npm", "gh"]);
-}
-
-#[test]
-fn reject_sandbox_with_empty_recipes_and_empty_tools() {
-    let toml = r#"
-[sandbox.dev]
-recipes = []
-tools = []
-command = "nvim"
-"#;
     let result = Manifest::parse(toml);
     assert!(
         result.is_err(),
-        "sandbox with both fields empty should be rejected"
+        "legacy `tools = [...]` field should now be rejected"
     );
 }
 

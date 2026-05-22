@@ -141,10 +141,11 @@ block permits the destination, a GitHub PAT bound for
    only in `--strict`.
 
 The shipped service contracts under `recipes/services/*.toml`
-(`github.toml`, `npm.toml`, …) already include the right
+(`github.toml`, `npm-registry.toml`, …) already include the right
 `allow_credentials` for their detector — composing
-`tools = ["npm", "gh"]` produces the right behaviour: npm tokens
-can only reach npmjs.org, GitHub PATs can only reach GitHub.
+`recipes = ["npm", "gh"]` (which pull the right host contracts in)
+produces the right behaviour: npm tokens can only reach npmjs.org,
+GitHub PATs can only reach GitHub.
 
 ### Extending scopes for self-hosted services
 
@@ -376,9 +377,9 @@ upstream recipe enabled, and can never *shrink* the scope set.
   every sandbox in the project.
 - **Per-sandbox**: same key under `[sandbox.<name>.network.dlp]`.
 - **Recipe-level**: drop a `[network.dlp]` block into a custom recipe.
-  Tool recipes (`tool:gh`, `tool:npm`, etc.) deliberately do **not**
-  ship `[network.dlp]` — they declare the right `[[host]]` blocks
-  with `allow_credentials`, and the scope check does the rest.
+  The shipped per-tool recipes (`gh`, `npm`, etc.) deliberately do
+  **not** ship `[network.dlp]` — they declare the right `[[host]]`
+  blocks with `allow_credentials`, and the scope check does the rest.
 
 ---
 

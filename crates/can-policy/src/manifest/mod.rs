@@ -58,20 +58,12 @@ pub struct SandboxDef {
 
     /// Recipe names to compose (resolved via the recipe search path).
     ///
-    /// Merged left-to-right on top of `base.toml`. May be empty when
-    /// `tools = [...]` is set instead — every sandbox must declare at
-    /// least one of `recipes` or `tools`.
+    /// Merged left-to-right on top of `base.toml`. Every sandbox must
+    /// declare at least one recipe. Recipes live in category subdirectories
+    /// under the recipe search path (`languages/`, `package-managers/`,
+    /// `vcs/`, …); names are looked up recursively.
     #[serde(default)]
     pub recipes: Vec<String>,
-
-    /// Curated tool shortcuts. Each name `npm` expands to recipe
-    /// `tool:npm`, looked up in the `tools/` sub-namespace of the
-    /// recipe search path. Tool recipes are small per-tool bundles
-    /// (filesystem paths + env passthrough + known egress domains)
-    /// shipped via the community registry. Composed BEFORE `recipes`
-    /// so explicit recipes can override tool defaults if needed.
-    #[serde(default)]
-    pub tools: Vec<String>,
 
     /// Command to run inside the sandbox.
     ///
@@ -175,10 +167,9 @@ impl SandboxDef {
     /// messages so the caller can identify which sandbox failed when
     /// iterating a `Manifest`.
     pub fn validate(&self, name: &str) -> Result<(), ConfigError> {
-        if self.recipes.is_empty() && self.tools.is_empty() {
+        if self.recipes.is_empty() {
             return Err(ConfigError::Validation(format!(
-                "sandbox '{name}' must list at least one entry in \
-                 `recipes = [...]` or `tools = [...]`"
+                "sandbox '{name}' must list at least one entry in `recipes = [...]`"
             )));
         }
         if self.command.is_empty() {

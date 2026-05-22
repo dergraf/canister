@@ -193,9 +193,9 @@ enum RecipeAction {
 
     /// Suggest recipes for a command.
     ///
-    /// Resolves the command binary and recommends tool recipes based on
+    /// Resolves the command binary and recommends recipes based on
     /// binary name matching and `match_prefix` patterns. Output is a
-    /// ready-to-paste `tools = [...]` or `recipes = [...]` line.
+    /// ready-to-paste `recipes = [...]` line.
     Suggest {
         /// The command to look up (not executed).
         #[arg(required = true)]

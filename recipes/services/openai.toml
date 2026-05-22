@@ -4,7 +4,7 @@
 # permitted for the audio + files endpoints; everything else is JSON.
 
 [recipe]
-name        = "service:openai"
+name = "openai"
 description = "OpenAI API contracts"
 
 [[host]]

@@ -1,0 +1,23 @@
+# Canister recipe — Node.js language runtime.
+#
+# Covers what's needed to *run* node: env vars the runtime honours
+# and read access to module paths already mounted via base.toml.
+# Does NOT permit network access or registry fetching — for
+# `npm install` / `yarn install` / `pnpm install`, compose with the
+# matching package-manager recipe.
+#
+#   recipes = ["node"]                  # just run node
+#   recipes = ["node", "npm"]           # plus npm install from npmjs.org
+
+[recipe]
+name = "node"
+description = "Node.js runtime (no registry access; compose with `npm`/`pnpm`/`yarn` for installs)"
+version = "1"
+
+[process]
+env_passthrough = [
+    "NODE_ENV",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_NO_WARNINGS",
+]

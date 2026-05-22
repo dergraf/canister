@@ -1,0 +1,14 @@
+# Yarn classic registry mirror.
+#
+# `registry.yarnpkg.com` is Yarn's npm-compatible mirror. It serves
+# the same JSON manifests + octet-stream tarballs as the npm registry.
+
+[recipe]
+name = "yarn-registry"
+description = "Yarn classic registry mirror (npm-compatible)"
+
+[[host]]
+domain            = "registry.yarnpkg.com"
+methods           = ["GET", "HEAD"]
+content_types     = ["application/json", "application/octet-stream"]
+max_request_bytes = 524288000   # 500 MiB

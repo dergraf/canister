@@ -1,0 +1,24 @@
+# Canister recipe — Python 3 language runtime.
+#
+# Covers what's needed to *run* python3: env vars the interpreter
+# honours, and read access to site-packages already mounted via
+# base.toml. Does NOT permit network access or PyPI fetching — for
+# `pip install`, compose with the `pip` recipe.
+#
+#   recipes = ["python"]                # just run python3 scripts
+#   recipes = ["python", "pip"]         # plus install from PyPI
+
+[recipe]
+name = "python"
+description = "Python 3 interpreter (no PyPI access; compose with `pip` for installs)"
+version = "1"
+
+[process]
+env_passthrough = [
+    "PYTHONPATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONUNBUFFERED",
+    "PYTHONIOENCODING",
+    "PYTHONHASHSEED",
+    "VIRTUAL_ENV",
+]

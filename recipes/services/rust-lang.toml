@@ -1,0 +1,14 @@
+# static.rust-lang.org — rustup toolchain distribution.
+#
+# rustup downloads toolchains, components, and channel manifests from
+# this CDN. Read-only (GET/HEAD); content set is heterogeneous (signed
+# manifests, tar.xz, sha256 files), so relaxed-mode is appropriate.
+
+[recipe]
+name = "rust-lang"
+description = "static.rust-lang.org rustup toolchain distribution"
+
+[[host]]
+domain        = "static.rust-lang.org"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"

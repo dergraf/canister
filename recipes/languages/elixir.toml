@@ -1,0 +1,47 @@
+# Canister recipe for Elixir/Erlang workloads.
+#
+# Covers only what the BEAM runtime itself needs: syscalls, env vars,
+# and PID budget. Network access (hex.pm, GitHub deps) and egress mode
+# are NOT baked in — compose with the appropriate service recipes:
+#
+#   recipes = ["elixir", "hex"]                # mix deps.get from Hex
+#   recipes = ["elixir", "hex", "github"]      # plus GitHub-sourced deps
+#
+# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest
+# to enforce the allow list.
+
+[recipe]
+name = "elixir-dev"
+description = "Elixir/Erlang runtime: BEAM syscalls + env (no network — compose with `hex`)"
+version = "3"
+
+[syscalls]
+# BEAM needs ptrace for tracing/debugging tools (:observer, :dbg).
+# BEAM uses memfd_create for JIT code loading (moved to deny list in
+# default baseline, allowed back here).
+allow_extra = ["ptrace", "memfd_create"]
+
+[process]
+# BEAM spawns many lightweight processes via OS threads; the default
+# scheduler count equals the CPU core count. 256 is generous for most
+# mix tasks and development servers.
+max_pids = 256
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "MIX_ENV",
+    "MIX_HOME",
+    "HEX_HOME",
+    "ERL_AFLAGS",
+    "ELIXIR_ERL_OPTIONS",
+    "RELEASE_COOKIE",
+    "RELEASE_NODE",
+    "RELEASE_DISTRIBUTION",
+    "SECRET_KEY_BASE",
+    "DATABASE_URL",
+    "PHX_HOST",
+    "PHX_SERVER",
+    "PORT",
+]

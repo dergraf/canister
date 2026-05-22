@@ -1,0 +1,36 @@
+# Canister recipe for the Go toolchain.
+#
+# Covers GOPATH / module cache filesystem layout and the env vars
+# `go build` / `go run` honour. Network access to the module proxy is
+# NOT baked in — compose with `go-proxy` when fetching modules:
+#
+#   recipes = ["go"]                     # build/test with locally vendored deps
+#   recipes = ["go", "go-proxy"]         # plus `go mod download` from the proxy
+
+[recipe]
+name = "go"
+description = "Go toolchain: GOPATH + module cache + config (no proxy — compose with `go-proxy`)"
+version = "2"
+
+[filesystem]
+allow = [
+    "$HOME/.config/go/env",
+]
+allow_write = [
+    "$HOME/go",
+    "$HOME/.cache/go-build",
+]
+
+[process]
+env_passthrough = [
+    "GOPATH",
+    "GOROOT",
+    "GOBIN",
+    "GOPROXY",
+    "GONOSUMCHECK",
+    "GONOSUMDB",
+    "GOPRIVATE",
+    "GOFLAGS",
+    "GOMODCACHE",
+    "CGO_ENABLED",
+]

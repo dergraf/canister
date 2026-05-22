@@ -9,4 +9,4 @@ pub use config::{
     SyscallConfig, expand_env_vars,
 };
 pub use manifest::{MANIFEST_FILENAME, Manifest, SandboxDef, discover_manifest};
-pub use profile::{BaselineSource, ResolvedBaseline, SeccompProfile, resolve_base};
+pub use profile::{BaselineSource, ResolvedBaseline, SeccompProfile, resolve_base, walk_recipes};

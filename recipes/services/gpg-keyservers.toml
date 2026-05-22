@@ -1,0 +1,19 @@
+# Public PGP keyservers.
+#
+# Used by GPG to fetch and refresh public keys (`gpg --recv-keys`,
+# `gpg --refresh-keys`). The OpenPGP HKP protocol travels over HTTPS
+# with text/plain responses for armored keys and JSON for VKS lookups.
+
+[recipe]
+name = "gpg-keyservers"
+description = "Public PGP keyservers (openpgp.org + Ubuntu)"
+
+[[host]]
+domain        = "keys.openpgp.org"
+methods       = ["GET", "HEAD"]
+content_types = ["application/json", "text/plain", "application/pgp-keys"]
+
+[[host]]
+domain        = "keyserver.ubuntu.com"
+methods       = ["GET", "HEAD"]
+content_types = ["text/plain", "application/pgp-keys", "text/html"]

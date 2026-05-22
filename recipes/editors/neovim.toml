@@ -1,0 +1,70 @@
+# Canister recipe for Neovim with LSP support.
+#
+# Mounts the user's full Neovim configuration (config, data, state, cache)
+# so plugin managers (lazy.nvim), LSP servers (via Mason), tree-sitter
+# parsers, and other tooling work out of the box.
+#
+# System paths (/usr/lib, /usr/bin, /lib, /tmp, etc.) are provided by
+# base.toml — this recipe only adds Neovim-specific paths. Network
+# access for plugin / LSP / Mason updates is NOT baked in. Compose with
+# the service recipes for whichever ecosystems you actually use:
+#
+#   recipes = ["neovim", "github"]                           # plugins from GitHub
+#   recipes = ["neovim", "github", "luarocks"]               # plus rocks
+#   recipes = ["neovim", "github", "npm-registry", "pypi"]   # plus Mason LSPs
+#
+# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+
+[recipe]
+name = "neovim"
+description = "Neovim editor: config + plugin dirs (no network — compose with `github` etc.)"
+version = "3"
+
+[filesystem]
+allow = [
+    # Neovim XDG directories
+    "$HOME/.config/nvim",
+    "$HOME/.local/share/nvim",
+    "$HOME/.local/state/nvim",
+    "$HOME/.cache/nvim",
+]
+
+[process]
+max_pids = 256
+allow_execve = []
+env_passthrough = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TERM",
+    "COLORTERM",
+    "TERMINFO",
+    "USER",
+    "SHELL",
+    "EDITOR",
+    "VISUAL",
+
+    # XDG directories (so nvim finds its config)
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+
+    # Nix
+    "NIX_PATH",
+    "NIX_PROFILES",
+
+    # LSP / language tooling
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "GOROOT",
+    "NODE_PATH",
+    "npm_config_prefix",
+]
+
+[syscalls]
+# Neovim + LSP servers need ptrace (for debugging) and
+# memfd_create (used by various runtimes)
+allow_extra = ["ptrace", "memfd_create"]

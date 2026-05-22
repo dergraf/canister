@@ -6,7 +6,7 @@
 # a relaxed sibling block to avoid enumerating every model.
 
 [recipe]
-name        = "service:huggingface"
+name = "huggingface"
 description = "Hugging Face Hub contracts"
 
 [[host]]

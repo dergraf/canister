@@ -1,0 +1,40 @@
+# Canister recipe for Cargo (Rust) toolchain.
+#
+# Cargo installs binaries to $HOME/.cargo/bin and stores the toolchain
+# (rustc, rustup) under $HOME/.rustup. Auto-detected when invoking
+# binaries from either prefix.
+
+[recipe]
+name = "cargo"
+description = "Rust/Cargo toolchain: registry cache + config; credentials.toml denied (use CARGO_REGISTRIES_* env)"
+version = "3"
+match_prefix = ["$HOME/.cargo", "$HOME/.rustup"]
+# Network access to crates.io is NOT baked in. Compose with `crates-io`
+# (and `rust-lang` for rustup distributions) when fetching:
+#   recipes = ["cargo", "crates-io"]
+
+[filesystem]
+allow = [
+    "$HOME/.cargo/config.toml",
+    "$HOME/.cargo/config",
+    "$HOME/.rustup",
+]
+allow_write = [
+    "$HOME/.cargo/registry",
+    "$HOME/.cargo/git",
+    "$HOME/.cargo/advisory-db",
+]
+deny = [
+    "$HOME/.cargo/credentials.toml",
+    "$HOME/.cargo/credentials",
+]
+
+[process]
+env_passthrough = [
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+    "CARGO_NET_GIT_FETCH_WITH_CLI",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+]

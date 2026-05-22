@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>canister · unprivileged Linux sandboxes</title>
+  <meta name="description" content="Unprivileged Linux sandbox with namespaces, seccomp, an L7 egress proxy and DLP. Pick the recipes you need; get a working canister.toml.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/png" href="canister.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="status-strip">
+    <div class="container status-strip-inner">
+      <a class="strip-link" href="https://dergraf.org">dergraf.org ↗</a>
+      <a class="strip-link strip-link-right" href="https://github.com/dergraf/canister">github ↗</a>
+    </div>
+  </div>
+
+  <header class="hero">
+    <div class="container hero-grid">
+      <div class="hero-text">
+        <h1>
+          <span class="brand">canister</span>
+          <span class="brand-cursor">_</span>
+        </h1>
+        <p class="brand-tag">// unprivileged Linux sandboxes — namespaces, seccomp, L7 egress proxy with DLP</p>
+        <p class="tagline">Run any command inside layered isolation: <em>user / mount / pid / net namespaces</em>, a 187-syscall seccomp allow list, USER_NOTIF supervisor for argument-level filtering, capability dropping, cgroups v2 limits, /proc hardening, and an inline egress proxy that contracts every outbound HTTP call.</p>
+
+        <div class="terminal-window install-window" aria-label="Install command">
+          <div class="terminal-titlebar">
+            <span class="window-mark" aria-hidden="true"></span>
+            <span class="terminal-title">~ — install canister</span>
+          </div>
+<pre class="terminal-body"><code><span class="prompt">$</span> <span class="cmd">mkdir</span> -p ~/.local/bin
+<span class="prompt">$</span> <span class="cmd">curl</span> -fsSL https://github.com/dergraf/canister/releases/download/latest/canister-x86_64-linux.tar.gz \
+    | <span class="cmd">tar</span> xz -C ~/.local/bin
+<span class="prompt">$</span> <span class="cmd">can</span> --version
+<span class="ok">canister 0.1.0  ✓</span></code></pre>
+        </div>
+
+        <ul class="feature-strip" aria-label="Capabilities">
+          <li>seccomp BPF</li>
+          <li>USER_NOTIF supervisor</li>
+          <li>cgroups v2</li>
+          <li>L7 egress proxy</li>
+          <li>DLP scanner</li>
+          <li>pasta networking</li>
+          <li>AppArmor / SELinux</li>
+        </ul>
+
+        <p class="hero-notes">
+          Filtered networking needs <code>pasta</code> from the <code>passt</code> package on the host
+          (no daemon — it runs only for the sandbox's lifetime). Hardened distros
+          (Ubuntu 24.04+, Fedora 41+) need <code>sudo can setup</code> once to install the
+          AppArmor / SELinux policy that grants user-namespace creation. After that,
+          everyday <code>can run</code> / <code>can up</code> stays fully unprivileged.
+        </p>
+
+        <p class="links">
+          <a class="primary" href="docs/">Reference docs →</a>
+          <a href="#builder">Skip to the builder</a>
+        </p>
+      </div>
+      <div class="hero-logo-wrap">
+        <img class="hero-logo" src="canister.png" alt="" aria-hidden="true">
+      </div>
+    </div>
+  </header>
+
+  <main id="builder" class="builder">
+    <div class="container">
+      <section class="builder-intro">
+        <h2><span class="section-marker">§01</span> Build a <code>canister.toml</code></h2>
+        <p>Recipes ship pre-baked. Pick the ones that match your project — language runtimes, package managers, VCS tools, container CLIs, service contracts — and the picker emits a manifest you can paste at the project root. Auto-detected recipes (<span class="badge-auto-inline">auto</span>) compose automatically when invoking a binary under their <code>match_prefix</code>; explicit picks always win on top.</p>
+      </section>
+
+      <div id="builder-status" class="status-banner" hidden></div>
+
+      <section class="sandboxes" id="sandboxes" aria-label="Sandbox definitions">
+        <!-- sandbox cards rendered here -->
+      </section>
+
+      <p class="add-sandbox-row">
+        <button id="add-sandbox" class="btn btn-add" type="button">
+          <span class="btn-glyph">+</span> add sandbox
+        </button>
+      </p>
+
+      <section class="output-section">
+        <header class="output-header-row">
+          <h2><span class="section-marker">§02</span> Run it — two ways</h2>
+          <p>
+            <strong>The manifest is optional.</strong> Drop a <code>canister.toml</code> at your project root for repeatable, named sandboxes and run <code>can up &lt;name&gt;</code>. Or skip the file entirely and paste the equivalent <code>can run</code> line below — same recipe composition, no file on disk.
+          </p>
+        </header>
+
+        <div class="output-grid">
+          <div class="terminal-window output-window">
+            <div class="terminal-titlebar">
+              <span class="window-mark" aria-hidden="true"></span>
+              <span class="terminal-title">canister.toml — drop at project root</span>
+              <button id="copy-output" class="btn btn-copy" type="button">Copy</button>
+            </div>
+            <pre id="output" class="terminal-body" aria-live="polite"><code></code></pre>
+          </div>
+
+          <div class="terminal-window output-window">
+            <div class="terminal-titlebar">
+              <span class="window-mark window-mark-alt" aria-hidden="true"></span>
+              <span class="terminal-title">can run — direct invocation (no file)</span>
+              <button id="copy-cli" class="btn btn-copy" type="button">Copy</button>
+            </div>
+            <pre id="output-cli" class="terminal-body" aria-live="polite"><code></code></pre>
+          </div>
+        </div>
+
+        <p class="output-help"><span class="output-arrow">↳</span> With the manifest: <code>can up &lt;sandbox-name&gt;</code>. Without: paste the matching <code>can run</code> line. Both compose the same recipe stack — the manifest just remembers the choice for next time.</p>
+      </section>
+    </div>
+  </main>
+
+  <template id="sandbox-template">
+    <article class="sandbox-card" data-sandbox-card>
+      <header class="sandbox-card-header">
+        <h3 class="sandbox-title">
+          <span class="bracket">[</span>sandbox<span class="bracket">·</span><span class="sandbox-name-echo" data-name-echo>dev</span><span class="bracket">]</span>
+        </h3>
+        <button class="btn btn-remove" type="button" data-remove-sandbox aria-label="Remove sandbox">✕</button>
+      </header>
+
+      <div class="sandbox-fields">
+        <label class="field"><span>name</span><input type="text" data-field="name" placeholder="dev"></label>
+        <label class="field field-wide"><span>command</span><input type="text" data-field="command" placeholder="bash"></label>
+        <label class="field"><span>egress</span>
+          <select data-field="egress">
+            <option value="">— inherit —</option>
+            <option value="none">none</option>
+            <option value="proxy-only">proxy-only</option>
+            <option value="direct">direct</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="picker">
+        <div class="picker-controls">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input type="search" data-recipe-search placeholder="filter recipes…  (e.g. python, github, kubectl, hex)" aria-label="Search recipes">
+          <span class="picker-summary" data-picker-summary aria-live="polite"></span>
+        </div>
+        <div class="picker-list" data-recipe-list aria-label="Available recipes"></div>
+      </div>
+    </article>
+  </template>
+
+  <footer class="site-footer">
+    <div class="container">
+      <p>
+        <span class="footer-mark">canister</span>
+        ·
+        <a href="https://github.com/dergraf/canister">source</a>
+        ·
+        <a href="docs/">reference</a>
+        ·
+        <a href="https://github.com/dergraf/canister/issues">issues</a>
+      </p>
+      <p class="footer-sub">picker data is generated by <code>can-docgen</code> from the same TOML files that ship in the binary — what you see is what runs.</p>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script data-goatcounter="https://dergraf.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
+</body>
+</html>

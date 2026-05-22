@@ -1,0 +1,23 @@
+# Go module proxy + checksum database.
+#
+# `proxy.golang.org` is the public module proxy: GETs return JSON
+# version lists, .info metadata, .mod files, or .zip module archives.
+# `sum.golang.org` is the checksum database (Merkle-tree signed
+# verification). Together they cover everything `go mod download`
+# / `go get` does over HTTPS by default.
+
+[recipe]
+name = "go-proxy"
+description = "Go module proxy + checksum database"
+
+[[host]]
+domain        = "proxy.golang.org"
+methods       = ["GET", "HEAD"]
+# Module archives can be large for vendored deps; content set spans
+# json/octet-stream/text per endpoint.
+contract_mode = "relaxed"
+
+[[host]]
+domain        = "sum.golang.org"
+methods       = ["GET", "HEAD"]
+content_types = ["text/plain", "application/json"]

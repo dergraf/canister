@@ -1,0 +1,25 @@
+# Hex.pm — Elixir/Erlang package registry.
+#
+# `hex.pm` serves the JSON API and `mix hex.publish` POSTs tarballs.
+# `repo.hex.pm` is the read-only package store (octet-stream tarballs +
+# signature files). `builds.hex.pm` hosts precompiled OTP/Elixir builds.
+
+[recipe]
+name = "hex"
+description = "Hex.pm Elixir/Erlang package registry"
+
+[[host]]
+domain            = "hex.pm"
+methods           = ["GET", "HEAD", "POST"]
+content_types     = ["application/json", "application/octet-stream"]
+max_request_bytes = 104857600   # 100 MiB
+
+[[host]]
+domain        = "repo.hex.pm"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"
+
+[[host]]
+domain        = "builds.hex.pm"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"

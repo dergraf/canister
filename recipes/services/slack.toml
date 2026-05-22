@@ -6,7 +6,7 @@
 # explicit that JSON is preferred for new code).
 
 [recipe]
-name        = "service:slack"
+name = "slack"
 description = "Slack API contracts"
 
 [[host]]

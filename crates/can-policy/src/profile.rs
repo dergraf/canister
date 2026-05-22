@@ -231,6 +231,53 @@ pub fn resolve_base() -> Result<RecipeFile, ConfigError> {
     RecipeFile::parse(EMBEDDED_BASE)
 }
 
+/// Recursively walk `dir` and return all `.toml` recipe files (sorted),
+/// excluding the infrastructure baselines `default.toml`, `base.toml`,
+/// and the `checksums.toml` manifest.
+///
+/// Returns an empty vector if `dir` does not exist. Recipes live in
+/// category subdirectories (e.g., `languages/`, `package-managers/`); the
+/// walk descends into all of them.
+pub fn walk_recipes(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_recipes_into(dir, &mut out);
+    out.sort();
+    out
+}
+
+fn walk_recipes_into(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if is_user_recipe_file(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    subdirs.sort();
+    out.extend(files);
+    for sub in subdirs {
+        walk_recipes_into(&sub, out);
+    }
+}
+
+fn is_user_recipe_file(path: &std::path::Path) -> bool {
+    if path.extension().is_none_or(|ext| ext != "toml") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    !matches!(stem, "default" | "base" | "checksums")
+}
+
 /// Directories searched for the default baseline, in priority order.
 ///
 /// This is also used by `can-cli` for recipe discovery.

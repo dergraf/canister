@@ -1,0 +1,14 @@
+# LuaRocks — Lua package registry.
+#
+# Used by neovim plugin managers (lazy.nvim, rocks.nvim) and by Lua
+# tooling generally. Read-only HTTP fetches return rockspec metadata
+# (text) and .rock archives (octet-stream).
+
+[recipe]
+name = "luarocks"
+description = "LuaRocks Lua package registry"
+
+[[host]]
+domain        = "luarocks.org"
+methods       = ["GET", "HEAD"]
+content_types = ["application/json", "application/octet-stream", "text/plain"]

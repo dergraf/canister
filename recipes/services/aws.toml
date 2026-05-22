@@ -9,7 +9,7 @@
 # (used by most services) and `application/xml` (S3 / SQS legacy).
 
 [recipe]
-name        = "service:aws"
+name = "aws"
 description = "AWS regional endpoint contracts"
 
 [[host]]

@@ -58,4 +58,10 @@ allow = [
 deny = [
     "/etc/shadow",
     "/etc/gshadow",
+    # `/root` is the root user's home — sandboxed processes never need
+    # to read it, and recipes used to redundantly add it. Pull it up
+    # once at the baseline so per-recipe denies stay focused on the
+    # tool-specific files that actually need protecting (credentials,
+    # cache directories, etc.).
+    "/root",
 ]

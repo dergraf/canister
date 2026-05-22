@@ -6,7 +6,7 @@
 # to `upload.pypi.org`.
 
 [recipe]
-name        = "service:pypi"
+name = "pypi"
 description = "PyPI + pythonhosted contracts"
 
 [[host]]

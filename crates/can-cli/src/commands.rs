@@ -7,7 +7,7 @@ use can_policy::config::EgressMode;
 use can_policy::profile::baseline_search_dirs;
 use can_policy::{
     Manifest, RecipeFile, SandboxConfig, SandboxDef, SeccompProfile, discover_manifest,
-    resolve_base,
+    resolve_base, walk_recipes,
 };
 use can_sandbox::SandboxOpts;
 use can_sandbox::capabilities::KernelCapabilities;
@@ -17,46 +17,12 @@ use can_sandbox::mac::{self, PolicyStatus};
 ///
 /// Rules:
 /// - If the argument contains `/` or ends with `.toml`, treat as a file path.
-/// - If the argument starts with `tool:`, search `tools/{rest}.toml` across
-///   `baseline_search_dirs()`. Tool recipes are a curated namespace of
-///   small per-tool config bundles (npm, gh, kubectl, …) shipped via the
-///   community recipe registry.
-/// - Otherwise, search for `{name}.toml` across `baseline_search_dirs()`.
-///
-/// Returns the resolved path, or an error if the name is not found.
+/// - Otherwise, search each `baseline_search_dirs()` entry recursively for
+///   a file whose stem matches `arg`. First search dir with a match wins;
+///   recipe names must be globally unique within a single search dir, so
+///   two recipes with the same stem in different category subdirs of the
+///   same dir is an error.
 pub(crate) fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
-    // tool:NAME → search `tools/NAME.toml` across the recipe search path.
-    // Checked BEFORE the file-path branch so that `tool:foo/bar` produces
-    // a clear "tool name must be a bare identifier" error rather than a
-    // confusing "file not found: tool:foo/bar".
-    if let Some(tool_name) = arg.strip_prefix("tool:") {
-        anyhow::ensure!(
-            !tool_name.is_empty(),
-            "invalid recipe name: bare 'tool:' has no tool name"
-        );
-        anyhow::ensure!(
-            !tool_name.contains(':') && !tool_name.contains('/'),
-            "invalid tool name '{tool_name}': must be a bare identifier (no ':' or '/')"
-        );
-        let filename = format!("{tool_name}.toml");
-        for dir in baseline_search_dirs() {
-            let candidate = dir.join("tools").join(&filename);
-            if candidate.is_file() {
-                tracing::debug!(name = arg, path = %candidate.display(), "resolved tool recipe");
-                return Ok(candidate);
-            }
-        }
-        anyhow::bail!(
-            "tool recipe '{arg}' not found. Searched for 'tools/{filename}' in:\n{}\n\n\
-             Run `can init` to install the curated tool recipe set.",
-            baseline_search_dirs()
-                .iter()
-                .map(|d| format!("  {}", d.display()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
     // Treat as file path if it contains a separator or ends with .toml.
     if arg.contains('/') || arg.ends_with(".toml") {
         let path = PathBuf::from(arg);
@@ -64,18 +30,36 @@ pub(crate) fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    // Name-based lookup: search for {name}.toml in search dirs.
-    let filename = format!("{arg}.toml");
+    // Name-based lookup: recursively scan each search dir.
     for dir in baseline_search_dirs() {
-        let candidate = dir.join(&filename);
-        if candidate.is_file() {
-            tracing::debug!(name = arg, path = %candidate.display(), "resolved recipe by name");
-            return Ok(candidate);
+        let mut matches: Vec<PathBuf> = walk_recipes(&dir)
+            .into_iter()
+            .filter(|p| p.file_stem().and_then(|s| s.to_str()) == Some(arg))
+            .collect();
+        match matches.len() {
+            0 => continue,
+            1 => {
+                let path = matches.pop().unwrap();
+                tracing::debug!(name = arg, path = %path.display(), "resolved recipe by name");
+                return Ok(path);
+            }
+            _ => {
+                anyhow::bail!(
+                    "recipe '{arg}' is ambiguous within {} — matched:\n{}\n\
+                     Rename one of the files so recipe stems are unique.",
+                    dir.display(),
+                    matches
+                        .iter()
+                        .map(|p| format!("  {}", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
         }
     }
 
     anyhow::bail!(
-        "recipe '{arg}' not found. Searched for '{filename}' in:\n{}",
+        "recipe '{arg}' not found. Searched for '{arg}.toml' recursively in:\n{}",
         baseline_search_dirs()
             .iter()
             .map(|d| format!("  {}", d.display()))
@@ -156,31 +140,17 @@ fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<Sandbox
 
 /// Discover recipes whose `match_prefix` matches the resolved command path.
 ///
-/// Scans all `.toml` recipe files across the recipe search path, expands
-/// env vars in `match_prefix`, and returns those where the command path
-/// starts with a matching prefix.
+/// Walks all `.toml` recipe files across the recipe search path (recursively
+/// into category subdirectories), expands env vars in `match_prefix`, and
+/// returns those where the command path starts with a matching prefix.
 ///
-/// `default.toml` and `base.toml` are excluded (they serve different roles).
+/// `default.toml`, `base.toml`, and `checksums.toml` are excluded by
+/// `walk_recipes`.
 fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile)>> {
     let mut matches = Vec::new();
 
     for dir in baseline_search_dirs() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().is_some_and(|ext| ext == "toml")
-                    && p.file_stem().is_some_and(|s| s != "default" && s != "base")
-            })
-            .collect();
-        paths.sort();
-
-        for path in paths {
+        for path in walk_recipes(&dir) {
             let recipe = match RecipeFile::from_file(&path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -224,12 +194,8 @@ fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile
 /// 1. `base.toml` — essential OS filesystem mounts (always loaded)
 /// 2. Auto-detected recipes — matched by `match_prefix` against the
 ///    resolved command binary path
-/// 3. `tools = [...]` — each entry `foo` is expanded to `tool:foo` and
-///    resolved via the `tools/` sub-namespace, merged left-to-right.
-///    Composed BEFORE explicit `recipes` so users can override tool
-///    defaults from a project recipe.
-/// 4. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
-/// 5. Manifest overrides (filesystem, network, etc. from the sandbox definition)
+/// 3. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
+/// 4. Manifest overrides (filesystem, network, etc. from the sandbox definition)
 fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
     // 1. Start with base.toml.
     let mut merged = resolve_base().context("loading base.toml")?;
@@ -265,25 +231,7 @@ fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
         }
     }
 
-    // 3. Expand `tools = [...]` into `tool:<name>` entries and merge.
-    for tool in &def.tools {
-        let arg = format!("tool:{tool}");
-        let path = resolve_recipe_path(&arg)?;
-        let recipe = RecipeFile::from_file(&path)
-            .with_context(|| format!("loading tool recipe: {}", path.display()))?;
-        tracing::info!(
-            recipe = recipe.display_name(
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-            ),
-            path = %path.display(),
-            "loaded tool recipe (from manifest)"
-        );
-        merged = merged.merge(recipe);
-    }
-
-    // 4. Merge recipes listed in the manifest.
+    // 3. Merge recipes listed in the manifest.
     for recipe_name in &def.recipes {
         let path = resolve_recipe_path(recipe_name)?;
         let recipe = RecipeFile::from_file(&path)
@@ -1079,90 +1027,33 @@ fn print_monitor_exit_summary(exit_code: i32, config: &SandboxConfig) {
 mod tests {
     use super::*;
 
-    // The validation branches of `resolve_recipe_path` (rejecting malformed
-    // `tool:` names, treating paths-with-slashes as files) don't depend on
-    // the recipe search path, so they can be unit-tested deterministically.
-    // The "happy path" lookup is covered by tests/integration/t_recipes.sh
-    // which exercises real recipe directories.
+    // The path-shape branches of `resolve_recipe_path` don't depend on the
+    // recipe search path, so they can be unit-tested deterministically.
+    // The "happy path" lookup and ambiguity errors are covered by
+    // tests/integration/t_recipes.sh which exercises real recipe trees.
 
     #[test]
-    fn resolve_recipe_path_rejects_bare_tool_prefix() {
-        let err = resolve_recipe_path("tool:").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("bare 'tool:'"),
-            "expected bare-tool error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_recipe_path_rejects_tool_name_with_colon() {
-        let err = resolve_recipe_path("tool:foo:bar").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("must be a bare identifier"),
-            "expected bare-identifier error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_recipe_path_rejects_tool_name_with_slash() {
-        // `tool:foo/bar` could be confused with a relative path. Reject it
-        // explicitly so users get a clear error rather than a confusing
-        // "recipe file not found".
-        let err = resolve_recipe_path("tool:foo/bar").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("must be a bare identifier"),
-            "expected bare-identifier error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_recipe_path_treats_dotslash_toml_as_file_not_tool() {
-        // Regression: a literal file path containing the substring "tool:"
-        // would only be possible via a leading `./` or absolute path,
-        // both of which hit the file-path branch first. This pins the
-        // ordering: file-path check wins over tool-prefix check.
-        let err = resolve_recipe_path("./tool:foo.toml").unwrap_err();
+    fn resolve_recipe_path_treats_slash_as_file_path() {
+        // Path-with-slash → file-not-found error rather than a bare-name lookup.
+        let err = resolve_recipe_path("./does-not-exist.toml").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("recipe file not found"),
-            "expected file-not-found error (file branch took over), got: {msg}"
+            "expected file-not-found error, got: {msg}"
         );
     }
 
     #[test]
-    fn resolve_recipe_path_missing_tool_recipe_mentions_init_hint() {
-        // When the curated tool recipe isn't installed, the error must
-        // tell the user how to fix it (`can init`) rather than leaving
-        // them to figure out the conventional `tools/` layout.
-        let err = resolve_recipe_path("tool:definitely-no-such-tool").unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("can init"),
-            "expected init hint in error, got: {msg}"
-        );
-        assert!(
-            msg.contains("tools/definitely-no-such-tool.toml"),
-            "expected searched-filename in error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_recipe_path_missing_bare_name_does_not_mention_init_hint() {
-        // The bare-name error path is distinct from the tool error path —
-        // pin that we don't leak the tool-specific hint into the generic
-        // recipe-not-found message.
+    fn resolve_recipe_path_missing_bare_name_explains_search_path() {
         let err = resolve_recipe_path("definitely-no-such-recipe").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            !msg.contains("can init"),
-            "init hint should not appear for non-tool recipes, got: {msg}"
-        );
-        assert!(
             msg.contains("definitely-no-such-recipe.toml"),
             "expected filename in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("recursively"),
+            "expected hint that search is recursive, got: {msg}"
         );
     }
 }

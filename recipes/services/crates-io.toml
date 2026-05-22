@@ -1,0 +1,25 @@
+# crates.io — Rust crate registry.
+#
+# `crates.io` serves the web + publish API (cargo publish POSTs to here).
+# `index.crates.io` is the sparse HTTP index (JSON deltas) introduced in
+# Cargo 1.68. `static.crates.io` is the crate-tarball CDN.
+
+[recipe]
+name = "crates-io"
+description = "crates.io Rust crate registry"
+
+[[host]]
+domain            = "crates.io"
+methods           = ["GET", "HEAD", "POST", "PUT", "DELETE"]
+content_types     = ["application/json", "application/octet-stream"]
+max_request_bytes = 104857600   # 100 MiB
+
+[[host]]
+domain        = "index.crates.io"
+methods       = ["GET", "HEAD"]
+content_types = ["application/json", "text/plain"]
+
+[[host]]
+domain        = "static.crates.io"
+methods       = ["GET", "HEAD"]
+contract_mode = "relaxed"
