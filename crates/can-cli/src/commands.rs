@@ -39,7 +39,9 @@ pub(crate) fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
         match matches.len() {
             0 => continue,
             1 => {
-                let path = matches.pop().unwrap();
+                let path = matches.pop().ok_or_else(|| {
+                    anyhow::anyhow!("internal error: expected exactly one recipe match")
+                })?;
                 tracing::debug!(name = arg, path = %path.display(), "resolved recipe by name");
                 return Ok(path);
             }
