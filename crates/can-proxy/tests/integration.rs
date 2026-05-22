@@ -8,9 +8,11 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use reqwest::{Client, Proxy};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 async fn start_test_proxy() -> SocketAddr {
     let ca = Arc::new(DynamicCa::generate().unwrap());
     let config = can_proxy::server::ProxyServerConfig::new(ca);
@@ -89,8 +91,61 @@ async fn start_test_upstream() -> SocketAddr {
     addr
 }
 
+async fn start_test_tls_upstream() -> SocketAddr {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = CertificateDer::from(cert.serialize_der().unwrap());
+    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.serialize_private_key_der()));
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls_acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = tls_acceptor.accept(stream).await.unwrap();
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    if req.uri().path() == "/echo" {
+                        let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain")
+                            .body(Full::new(bytes).map_err(|never| match never {}).boxed())
+                            .unwrap();
+                        return Ok::<_, hyper::Error>(resp);
+                    }
+
+                    let resp = Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(
+                            Full::new(bytes::Bytes::from_static(b"not found"))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap();
+                    Ok::<_, hyper::Error>(resp)
+                });
+
+                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                    panic!("upstream TLS server error: {err}");
+                }
+            });
+        }
+    });
+
+    addr
+}
+
 #[tokio::test]
 async fn test_http_passthrough() {
+    let upstream = start_test_upstream().await;
     let addr = start_test_proxy().await;
     let proxy_url = format!("http://{}", addr);
 
@@ -99,36 +154,44 @@ async fn test_http_passthrough() {
         .build()
         .unwrap();
 
+    let payload = "hello via http proxy";
+    let url = format!("http://127.0.0.1:{}/echo", upstream.port());
     let res = client
-        .get("http://httpbin.org/get")
+        .post(url)
+        .body(payload)
         .send()
         .await
         .expect("Failed to send request");
 
     assert_eq!(res.status(), 200);
     let body = res.text().await.unwrap();
-    assert!(body.contains("\"url\": \"http://httpbin.org/get\""));
+    assert_eq!(body, payload);
 }
 
 #[tokio::test]
 async fn test_https_passthrough() {
+    let upstream = start_test_tls_upstream().await;
     let addr = start_test_proxy().await;
     let proxy_url = format!("http://{}", addr);
 
     let client = Client::builder()
         .proxy(Proxy::all(&proxy_url).unwrap())
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
 
+    let payload = "hello via https proxy";
+    let url = format!("https://127.0.0.1:{}/echo", upstream.port());
     let res = client
-        .get("https://httpbin.org/get")
+        .post(url)
+        .body(payload)
         .send()
         .await
         .expect("Failed to send request");
 
     assert_eq!(res.status(), 200);
     let body = res.text().await.unwrap();
-    assert!(body.contains("\"url\": \"https://httpbin.org/get\""));
+    assert_eq!(body, payload);
 }
 
 #[tokio::test]
