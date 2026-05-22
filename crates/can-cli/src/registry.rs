@@ -18,6 +18,8 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use can_policy::walk_recipes;
+
 /// Default GitHub repository for recipes (same repo as canister itself).
 const DEFAULT_REPO: &str = "dergraf/canister";
 
@@ -120,43 +122,42 @@ fn clone_and_install(
         );
     }
 
-    // Create destination directory.
+    let installed = install_from_recipes_dir(&recipes_dir, dest_dir, checksums.as_ref())?;
+
+    // Clean up temp directory (best-effort).
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    Ok(installed)
+}
+
+fn install_from_recipes_dir(
+    recipes_dir: &Path,
+    dest_dir: &Path,
+    checksums: Option<&HashMap<String, String>>,
+) -> Result<Vec<String>> {
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("creating directory: {}", dest_dir.display()))?;
 
-    // Copy .toml files, skipping infrastructure recipes.
     let mut installed = Vec::new();
 
-    let entries = std::fs::read_dir(&recipes_dir)
-        .with_context(|| format!("reading {}", recipes_dir.display()))?;
+    for path in walk_recipes(recipes_dir) {
+        let rel = path.strip_prefix(recipes_dir).with_context(|| {
+            format!(
+                "computing recipe path relative to {} for {}",
+                recipes_dir.display(),
+                path.display()
+            )
+        })?;
+        let name = rel.to_string_lossy().to_string();
 
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        if !name.ends_with(".toml") {
-            continue;
-        }
-
-        // Skip infrastructure files — embedded in the binary or not recipes.
-        if name == "default.toml" || name == "base.toml" || name == "checksums.toml" {
-            tracing::debug!(file = name, "skipping infrastructure file");
-            continue;
-        }
-
-        // Read and validate before copying.
-        let content = std::fs::read_to_string(&path).with_context(|| format!("reading {name}"))?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
 
         let _recipe: can_policy::RecipeFile =
             toml::from_str(&content).with_context(|| format!("invalid recipe: {name}"))?;
 
-        // Verify checksum if enabled.
-        if let Some(ref cs) = checksums {
-            if let Some(expected) = cs.get(name) {
+        if let Some(cs) = checksums {
+            if let Some(expected) = cs.get(&name) {
                 let actual = sha256_hex(content.as_bytes());
                 if actual != *expected {
                     anyhow::bail!(
@@ -177,16 +178,17 @@ fn clone_and_install(
             }
         }
 
-        let dest_path = dest_dir.join(name);
+        let dest_path = dest_dir.join(rel);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating directory: {}", parent.display()))?;
+        }
         std::fs::write(&dest_path, &content)
             .with_context(|| format!("writing {}", dest_path.display()))?;
 
-        installed.push(name.to_string());
+        installed.push(name.clone());
         tracing::debug!(file = name, "installed recipe");
     }
-
-    // Clean up temp directory (best-effort).
-    let _ = std::fs::remove_dir_all(&tmp);
 
     installed.sort();
     Ok(installed)
@@ -221,7 +223,7 @@ fn print_manual_instructions(repo: &str, branch: &str, dest_dir: &Path) {
     println!("  Or clone with git:");
     println!("     git clone --depth 1 {url}.git /tmp/canister-recipes");
     println!(
-        "     cp /tmp/canister-recipes/recipes/*.toml {}",
+        "     cp -r /tmp/canister-recipes/recipes/* {}",
         dest_dir.display()
     );
 }
@@ -450,5 +452,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn install_from_recipes_dir_installs_nested_paths() {
+        let root = tempdir().unwrap();
+        let recipes_dir = root.join("recipes");
+        let dest_dir = root.join("dest");
+
+        std::fs::create_dir_all(recipes_dir.join("languages")).unwrap();
+        std::fs::write(
+            recipes_dir.join("example.toml"),
+            include_str!("../../../recipes/example.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            recipes_dir.join("languages/elixir.toml"),
+            include_str!("../../../recipes/languages/elixir.toml"),
+        )
+        .unwrap();
+
+        let mut checksums = HashMap::new();
+        checksums.insert(
+            "example.toml".to_string(),
+            sha256_hex(include_str!("../../../recipes/example.toml").as_bytes()),
+        );
+        checksums.insert(
+            "languages/elixir.toml".to_string(),
+            sha256_hex(include_str!("../../../recipes/languages/elixir.toml").as_bytes()),
+        );
+
+        let installed =
+            install_from_recipes_dir(&recipes_dir, &dest_dir, Some(&checksums)).unwrap();
+        assert_eq!(installed, vec!["example.toml", "languages/elixir.toml"]);
+        assert!(dest_dir.join("example.toml").exists());
+        assert!(dest_dir.join("languages/elixir.toml").exists());
     }
 }
