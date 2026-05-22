@@ -151,14 +151,14 @@ code { font-size: 0.92em; }
 
 .hero-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
-  gap: 2.5rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1.5rem;
   align-items: start;
   position: relative;
 }
-@media (max-width: 820px) {
-  .hero-grid { grid-template-columns: 1fr; }
-  .hero-logo-wrap { display: none; }
+
+.hero-text {
+  max-width: 1020px;
 }
 
 .hero h1 {
@@ -188,7 +188,7 @@ code { font-size: 0.92em; }
 .tagline {
   font-size: 1.15rem;
   color: var(--fg-muted);
-  max-width: 720px;
+  max-width: 980px;
   margin: 0 0 2rem;
   line-height: 1.6;
 }
@@ -197,21 +197,6 @@ code { font-size: 0.92em; }
   font-style: normal;
   font-family: var(--font-mono);
   font-size: 0.95em;
-}
-
-.hero-logo-wrap {
-  position: relative;
-  align-self: center;
-}
-.hero-logo {
-  width: 100%;
-  max-width: 320px;
-  height: auto;
-  display: block;
-  /* The shipped art has a near-black canvas — blend it into the dark hero */
-  mix-blend-mode: lighten;
-  filter: drop-shadow(0 12px 32px rgba(95, 216, 122, 0.18))
-          drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
 }
 
 .install-compact { display: none; }
@@ -268,7 +253,7 @@ code { font-size: 0.92em; }
 .terminal-body .cmd { color: var(--amber-soft); }
 .terminal-body .ok { color: var(--accent-glow); }
 
-.install-window { margin: 0 0 1.25rem; max-width: 760px; }
+.install-window { margin: 0 0 1.25rem; max-width: 980px; }
 
 .feature-strip {
   display: flex;
@@ -290,7 +275,7 @@ code { font-size: 0.92em; }
 }
 
 .hero-notes {
-  max-width: 720px;
+  max-width: 980px;
   color: var(--fg-muted);
   font-size: 0.98rem;
   line-height: 1.6;
@@ -1111,8 +1096,6 @@ code { font-size: 0.92em; }
   .hero-grid {
     gap: 1.2rem;
   }
-
-  .hero-logo-wrap { display: none; }
 
   .hero h1 {
     font-size: clamp(2rem, 11vw, 2.6rem);
