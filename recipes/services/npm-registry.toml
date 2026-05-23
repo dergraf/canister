@@ -6,6 +6,7 @@
 [recipe]
 name = "npm-registry"
 description = "npm registry contracts"
+suggests = ["npm", "node"]
 
 [[host]]
 domain            = "registry.npmjs.org"

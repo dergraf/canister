@@ -19,6 +19,7 @@
 name = "npm"
 description = "npm: cache + per-project config; ~/.npmrc denied (use NPM_TOKEN env)"
 version = "1"
+suggests = ["node", "npm-registry"]
 
 [filesystem]
 # Cache and per-user config dir (XDG layout). Cache is writable so

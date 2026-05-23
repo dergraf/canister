@@ -82,6 +82,7 @@ allow = [
     "fchown",
     "lchown",
     "fchownat",
+    "utimensat",
 
     # Directory operations
     "mkdir",

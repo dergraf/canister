@@ -11,6 +11,7 @@
 name = "go"
 description = "Go toolchain: GOPATH + module cache + config (no proxy — compose with `go-proxy`)"
 version = "2"
+suggests = ["go-proxy", "git", "github"]
 
 [filesystem]
 allow = [

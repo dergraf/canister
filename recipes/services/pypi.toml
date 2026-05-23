@@ -8,6 +8,7 @@
 [recipe]
 name = "pypi"
 description = "PyPI + pythonhosted contracts"
+suggests = ["pip", "uv", "python"]
 
 [[host]]
 domain            = "pypi.org"

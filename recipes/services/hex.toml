@@ -7,6 +7,7 @@
 [recipe]
 name = "hex"
 description = "Hex.pm Elixir/Erlang package registry"
+suggests = ["elixir"]
 
 [[host]]
 domain            = "hex.pm"

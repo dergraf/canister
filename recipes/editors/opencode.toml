@@ -26,6 +26,7 @@
 name = "opencode"
 description = "OpenCode AI coding agent: scoped filesystem (no network — compose with LLM service recipes)"
 version = "3"
+suggests = ["git", "github", "anthropic", "openai", "opencode-ai"]
 
 [filesystem]
 # OpenCode needs access to:

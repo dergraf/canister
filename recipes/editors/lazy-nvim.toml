@@ -1,0 +1,34 @@
+# Canister recipe — lazy.nvim plugin manager for Neovim.
+#
+# lazy.nvim clones plugins from GitHub (and occasionally luarocks)
+# into $XDG_DATA_HOME/nvim/lazy/ on first launch and on `:Lazy sync`.
+# The clone target lives under ~/.local/share/nvim/ which the
+# `neovim` recipe already mounts; this recipe exists to surface the
+# network and tooling dependencies the plugin manager itself needs:
+#
+#   recipes = ["neovim", "lazy-nvim", "git", "github"]
+#
+# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+#
+# Add `luarocks` to the recipe list if any of your plugins declare
+# rocks dependencies (e.g. via `:Lazy build`).
+
+[recipe]
+name = "lazy-nvim"
+description = "lazy.nvim plugin manager (clones plugins via git; compose with `neovim`, `git`, `github`)"
+version = "1"
+suggests = ["neovim", "git", "github", "luarocks"]
+
+[filesystem]
+# Lazy keeps its own log + state under nvim's data dir (already mounted
+# by the neovim recipe). The lockfile lives in the project working dir.
+# Nothing additional to mount here; this recipe is primarily a discovery
+# hint for the builder's suggests graph.
+allow = []
+
+[process]
+env_passthrough = [
+    # Lazy honours these for offline / single-plugin modes.
+    "LAZY_PATH",
+    "LAZY_STDPATH",
+]

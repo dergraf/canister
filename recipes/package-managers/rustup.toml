@@ -2,6 +2,7 @@
 name = "rustup"
 description = "rustup: toolchain + update config; read-only except for toolchain installs"
 version = "1"
+suggests = ["cargo", "rust-lang", "crates-io"]
 
 [filesystem]
 allow = [

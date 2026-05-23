@@ -75,20 +75,183 @@
     <div class="container">
       <section class="builder-intro">
         <h2><span class="section-marker">§01</span> Build a <code>canister.toml</code></h2>
-        <p>Recipes ship pre-baked. Pick the ones that match your project — language runtimes, package managers, VCS tools, container CLIs, service contracts — and the picker emits a manifest you can paste at the project root. Auto-detected recipes (<span class="badge-auto-inline">auto</span>) compose automatically when invoking a binary under their <code>match_prefix</code>; explicit picks always win on top.</p>
+        <p>Answer a handful of questions about your project — language, how it's installed, editor, where the code lives — and the builder composes the matching recipes for you. Each section unhides as you answer the previous one; suggested companions are pre-checked and explain themselves on hover. Open <em>Advanced</em> at the bottom to edit the recipe list directly.</p>
       </section>
 
       <div id="builder-status" class="status-banner" hidden></div>
 
-      <section class="sandboxes" id="sandboxes" aria-label="Sandbox definitions">
-        <!-- sandbox cards rendered here -->
+      <section class="wizard" id="wizard" aria-label="Guided builder">
+        <!-- Step 1 — Goal -->
+        <section class="wiz-step is-active" data-step="goal" aria-labelledby="step-goal-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">01</span>
+            <h3 class="wiz-step-title" id="step-goal-title">What are you setting up?</h3>
+            <p class="wiz-step-hint">Picks reasonable egress + strict defaults later.</p>
+          </header>
+          <div class="chip-group" data-chip-group="goal" role="radiogroup" aria-label="Goal"></div>
+        </section>
+
+        <!-- Step 2 — Languages -->
+        <section class="wiz-step" data-step="languages" aria-labelledby="step-lang-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">02</span>
+            <h3 class="wiz-step-title" id="step-lang-title">Which languages are you using?</h3>
+            <p class="wiz-step-hint">Pick one or more. Suggested companions (registries, VCS) appear below.</p>
+          </header>
+          <div class="chip-group" data-chip-group="languages" aria-label="Languages"></div>
+          <div class="chip-suggested" data-suggested-for="languages" hidden>
+            <p class="suggested-label">Suggested companions</p>
+            <div class="chip-group chip-group-suggested" data-chip-group="languages-suggested"></div>
+          </div>
+        </section>
+
+        <!-- Step 3 — Toolchain installer -->
+        <section class="wiz-step" data-step="installer" aria-labelledby="step-installer-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">03</span>
+            <h3 class="wiz-step-title" id="step-installer-title">Where do your tools live on disk?</h3>
+            <p class="wiz-step-hint">Pick every installer your toolchain lives under. Standard system paths (<code>/bin</code>, <code>/sbin</code>, <code>/usr/bin</code>, <code>/usr/sbin</code>, <code>/usr/lib</code>, <code>/usr/local/bin</code>, <code>/usr/share</code>, <code>/tmp</code>, common <code>/etc</code> files) are already mounted by <code>base.toml</code> — skip this step if that's where everything lives.</p>
+          </header>
+          <div class="chip-group" data-chip-group="installers" aria-label="Toolchain installers"></div>
+        </section>
+
+        <!-- Step 4 — Editor -->
+        <section class="wiz-step" data-step="editor" aria-labelledby="step-editor-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">04</span>
+            <h3 class="wiz-step-title" id="step-editor-title">Editor & dev tooling?</h3>
+            <p class="wiz-step-hint">If you pick Neovim, its plugin manager appears in suggested companions.</p>
+          </header>
+          <div class="chip-group" data-chip-group="editors" aria-label="Editors"></div>
+          <div class="chip-suggested" data-suggested-for="editors" hidden>
+            <p class="suggested-label">Suggested companions</p>
+            <div class="chip-group chip-group-suggested" data-chip-group="editors-suggested"></div>
+          </div>
+        </section>
+
+        <!-- Step 5 — Forge & VCS -->
+        <section class="wiz-step" data-step="forge" aria-labelledby="step-forge-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">05</span>
+            <h3 class="wiz-step-title" id="step-forge-title">Source &amp; forge?</h3>
+            <p class="wiz-step-hint">Picking a forge auto-adds <code>git</code>.</p>
+          </header>
+          <div class="chip-group" data-chip-group="forges" aria-label="Forges and VCS"></div>
+        </section>
+
+        <!-- Step 6 — Package managers & registries -->
+        <section class="wiz-step" data-step="services" aria-labelledby="step-services-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">06</span>
+            <h3 class="wiz-step-title" id="step-services-title">Package managers &amp; registries?</h3>
+            <p class="wiz-step-hint">Local package-manager tools (npm, pip, cargo …) and the registries they fetch from. Pre-checked items are suggested by your language picks.</p>
+          </header>
+          <div class="chip-group" data-chip-group="services" aria-label="Package managers and registries"></div>
+        </section>
+
+        <!-- Step 7 — Remote APIs & SaaS -->
+        <section class="wiz-step" data-step="apis" aria-labelledby="step-apis-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">07</span>
+            <h3 class="wiz-step-title" id="step-apis-title">Remote APIs &amp; SaaS</h3>
+            <p class="wiz-step-hint">AI inference (Anthropic, OpenAI, …) and SaaS providers (AWS, Slack, Stripe). Each one is a per-host contract — methods, content types, DLP scope all pre-baked.</p>
+          </header>
+          <div class="chip-group" data-chip-group="apis" aria-label="Remote APIs and SaaS"></div>
+        </section>
+
+        <!-- Step 8 — Custom hosts (advanced) -->
+        <section class="wiz-step" data-step="hosts" aria-labelledby="step-hosts-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">08</span>
+            <h3 class="wiz-step-title" id="step-hosts-title">Additional network hosts</h3>
+            <p class="wiz-step-hint">Add bespoke <code>[[host]]</code> entries to your sandbox — internal services, on-prem APIs, anything not covered by a shipped recipe. DLP credential scope ties a detector to this host so a token meant for it isn't blocked, but the same token leaking to a different upstream still is.</p>
+          </header>
+          <div class="hosts-list" data-hosts-list></div>
+          <button class="btn btn-add" type="button" data-add-host>
+            <span class="btn-glyph">+</span> add host
+          </button>
+        </section>
+
+        <!-- Step 9 — Egress & strict -->
+        <section class="wiz-step" data-step="egress" aria-labelledby="step-egress-title">
+          <header class="wiz-step-head">
+            <span class="wiz-step-num">09</span>
+            <h3 class="wiz-step-title" id="step-egress-title">Network &amp; strict mode</h3>
+            <p class="wiz-step-hint">Defaults follow from your goal pick.</p>
+          </header>
+          <div class="wiz-egress-row">
+            <fieldset class="wiz-fieldset">
+              <legend>egress</legend>
+              <label class="wiz-radio"><input type="radio" name="wiz-egress" value=""><span>inherit</span></label>
+              <label class="wiz-radio"><input type="radio" name="wiz-egress" value="none"><span>none</span></label>
+              <label class="wiz-radio"><input type="radio" name="wiz-egress" value="proxy-only"><span>proxy-only</span></label>
+              <label class="wiz-radio"><input type="radio" name="wiz-egress" value="direct"><span>direct</span></label>
+            </fieldset>
+            <label class="wiz-strict">
+              <input type="checkbox" data-wiz-strict>
+              <span><strong>strict</strong> — abort if any isolation layer fails</span>
+            </label>
+          </div>
+        </section>
       </section>
 
-      <p class="add-sandbox-row">
-        <button id="add-sandbox" class="btn btn-add" type="button">
-          <span class="btn-glyph">+</span> add sandbox
-        </button>
-      </p>
+      <template id="host-row-template">
+        <div class="host-row" data-host-row>
+          <header class="host-row-head">
+            <label class="host-row-field host-row-domain">
+              <span>domain</span>
+              <input type="text" data-host-field="domain" placeholder="api.internal.example.com">
+            </label>
+            <label class="host-row-field host-row-mode">
+              <span>contract</span>
+              <select data-host-field="contract_mode">
+                <option value="">— default (strict) —</option>
+                <option value="strict">strict</option>
+                <option value="relaxed">relaxed</option>
+              </select>
+            </label>
+            <button class="btn btn-remove" type="button" data-remove-host aria-label="Remove host">✕</button>
+          </header>
+          <div class="host-row-grid">
+            <label class="host-row-field">
+              <span>methods</span>
+              <input type="text" data-host-field="methods" placeholder="GET,POST">
+            </label>
+            <label class="host-row-field">
+              <span>content-types</span>
+              <input type="text" data-host-field="content_types" placeholder="application/json">
+            </label>
+            <label class="host-row-field">
+              <span>paths</span>
+              <input type="text" data-host-field="paths" placeholder="/v1/,/health">
+            </label>
+            <label class="host-row-field">
+              <span>max body bytes</span>
+              <input type="text" data-host-field="max_request_bytes" placeholder="1048576">
+            </label>
+          </div>
+          <div class="host-row-creds">
+            <span class="host-row-creds-label">DLP credential scope <em>(downgrade Block → Warn on this host)</em></span>
+            <div class="chip-group chip-group-small" data-host-creds></div>
+          </div>
+        </div>
+      </template>
+
+      <details class="advanced" id="advanced">
+        <summary>
+          <span class="adv-marker">⚙</span> Advanced — full recipe list, multi-sandbox
+          <span class="adv-hint">edit picks directly · add more sandboxes</span>
+        </summary>
+        <section class="sandboxes" id="sandboxes" aria-label="Sandbox definitions">
+          <!-- sandbox cards rendered here -->
+        </section>
+
+        <p class="add-sandbox-row">
+          <button id="add-sandbox" class="btn btn-add" type="button">
+            <span class="btn-glyph">+</span> add sandbox
+          </button>
+        </p>
+      </details>
 
       <section class="output-section">
         <header class="output-header-row">
@@ -171,6 +334,7 @@
     </div>
   </footer>
 
+  <script src="inference.js"></script>
   <script src="app.js"></script>
   <script data-goatcounter="https://dergraf.goatcounter.com/count"
           async src="//gc.zgo.at/count.js"></script>

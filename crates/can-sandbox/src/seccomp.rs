@@ -455,6 +455,7 @@ fn syscall_number(name: &str) -> Result<i64, SeccompError> {
         "fchown" => libc::SYS_fchown,
         "lchown" => libc::SYS_lchown,
         "fchownat" => libc::SYS_fchownat,
+        "utimensat" => libc::SYS_utimensat,
 
         // Directory operations
         "mkdir" => libc::SYS_mkdir,
@@ -1018,6 +1019,15 @@ mod tests {
         );
         let filter = build_filter(&profile, DenyAction::KillProcess, SeccompMode::AllowList);
         assert!(filter.is_ok());
+    }
+
+    #[test]
+    fn default_baseline_allows_utimensat_for_file_touch() {
+        let profile = default_profile();
+        assert!(
+            profile.allow_syscalls.iter().any(|s| s == "utimensat"),
+            "default baseline must allow utimensat so tools can touch files in /tmp"
+        );
     }
 
     // --- Common tests ---

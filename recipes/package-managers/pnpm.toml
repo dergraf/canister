@@ -2,6 +2,7 @@
 name = "pnpm"
 description = "pnpm: global store + config; auth tokens denied (use NPM_TOKEN env)"
 version = "1"
+suggests = ["node", "npm-registry"]
 
 [filesystem]
 allow_write = [

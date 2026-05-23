@@ -74,48 +74,16 @@ pub(crate) fn resolve_recipe_path(arg: &str) -> Result<PathBuf> {
 ///
 /// Composition order:
 /// 1. `base.toml` — essential OS filesystem mounts (always loaded)
-/// 2. Auto-detected recipes — matched by `match_prefix` against the
-///    resolved command binary path
-/// 3. Explicit `--recipe` arguments — merged left-to-right
+/// 2. Explicit `--recipe` arguments — merged left-to-right
 ///
 /// The seccomp baseline (`default.toml`) is resolved separately by the
 /// seccomp layer and is NOT part of this composition stack.
-fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<SandboxConfig> {
+fn load_recipes(recipe_args: &[String], _command: Option<&str>) -> Result<SandboxConfig> {
     // 1. Start with base.toml (essential OS mounts).
     let mut merged = resolve_base().context("loading base.toml")?;
     tracing::debug!("loaded base.toml (essential OS mounts)");
 
-    // 2. Auto-detect recipes based on the resolved command path.
-    if let Some(cmd) = command {
-        match can_sandbox::resolve_command(cmd) {
-            Ok(command_path) => {
-                let auto_recipes = discover_auto_recipes(&command_path)?;
-                for (path, recipe) in &auto_recipes {
-                    let name = recipe.display_name(
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown"),
-                    );
-                    tracing::info!(
-                        recipe = name,
-                        path = %path.display(),
-                        command = %command_path.display(),
-                        "auto-detected recipe for command"
-                    );
-                }
-                for (_path, recipe) in auto_recipes {
-                    merged = merged.merge(recipe);
-                }
-            }
-            Err(e) => {
-                // Command resolution may fail (e.g., command not found).
-                // Skip auto-detection; the sandbox will report the error later.
-                tracing::debug!(command = cmd, error = %e, "skipping auto-detection (command resolution failed)");
-            }
-        }
-    }
-
-    // 3. Merge explicit --recipe arguments left-to-right.
+    // 2. Merge explicit --recipe arguments left-to-right.
     for arg in recipe_args {
         let path = resolve_recipe_path(arg)?;
         let recipe = RecipeFile::from_file(&path)
@@ -140,100 +108,18 @@ fn load_recipes(recipe_args: &[String], command: Option<&str>) -> Result<Sandbox
         .context("resolving merged recipe")
 }
 
-/// Discover recipes whose `match_prefix` matches the resolved command path.
-///
-/// Walks all `.toml` recipe files across the recipe search path (recursively
-/// into category subdirectories), expands env vars in `match_prefix`, and
-/// returns those where the command path starts with a matching prefix.
-///
-/// `default.toml`, `base.toml`, and `checksums.toml` are excluded by
-/// `walk_recipes`.
-fn discover_auto_recipes(command_path: &Path) -> Result<Vec<(PathBuf, RecipeFile)>> {
-    let mut matches = Vec::new();
-
-    for dir in baseline_search_dirs() {
-        for path in walk_recipes(&dir) {
-            let recipe = match RecipeFile::from_file(&path) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(path = %path.display(), error = %e, "skipping recipe (parse error)");
-                    continue;
-                }
-            };
-
-            let prefixes = recipe.match_prefixes_expanded();
-            if prefixes.is_empty() {
-                continue;
-            }
-
-            let command_str = command_path.to_string_lossy();
-            let matched = prefixes
-                .iter()
-                .any(|prefix| command_str.starts_with(prefix));
-
-            if matched {
-                // Avoid duplicates: skip if we already matched a recipe with the same name.
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown");
-                let already_matched = matches.iter().any(|(p, _): &(PathBuf, RecipeFile)| {
-                    p.file_stem().and_then(|s| s.to_str()) == Some(stem)
-                });
-                if !already_matched {
-                    matches.push((path, recipe));
-                }
-            }
-        }
-    }
-
-    Ok(matches)
-}
-
 /// Load recipes for a manifest sandbox definition.
 ///
-/// Composition order (same as `load_recipes` but driven by manifest):
+/// Composition order:
 /// 1. `base.toml` — essential OS filesystem mounts (always loaded)
-/// 2. Auto-detected recipes — matched by `match_prefix` against the
-///    resolved command binary path
-/// 3. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
-/// 4. Manifest overrides (filesystem, network, etc. from the sandbox definition)
+/// 2. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
+/// 3. Manifest overrides (filesystem, network, etc. from the sandbox definition)
 fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
     // 1. Start with base.toml.
     let mut merged = resolve_base().context("loading base.toml")?;
     tracing::debug!("loaded base.toml (essential OS mounts)");
 
-    // 2. Auto-detect recipes based on the resolved command path.
-    let parts = def.command_parts();
-    let cmd_name = parts.first().map(|s| s.as_str());
-    if let Some(cmd) = cmd_name {
-        match can_sandbox::resolve_command(cmd) {
-            Ok(command_path) => {
-                let auto_recipes = discover_auto_recipes(&command_path)?;
-                for (path, recipe) in &auto_recipes {
-                    let name = recipe.display_name(
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown"),
-                    );
-                    tracing::info!(
-                        recipe = name,
-                        path = %path.display(),
-                        command = %command_path.display(),
-                        "auto-detected recipe for command"
-                    );
-                }
-                for (_path, recipe) in auto_recipes {
-                    merged = merged.merge(recipe);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(command = cmd, error = %e, "skipping auto-detection (command resolution failed)");
-            }
-        }
-    }
-
-    // 3. Merge recipes listed in the manifest.
+    // 2. Merge recipes listed in the manifest.
     for recipe_name in &def.recipes {
         let path = resolve_recipe_path(recipe_name)?;
         let recipe = RecipeFile::from_file(&path)

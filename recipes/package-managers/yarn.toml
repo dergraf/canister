@@ -2,6 +2,7 @@
 name = "yarn"
 description = "yarn: cache + config; auth tokens denied (use YARN_NPM_AUTH_TOKEN env)"
 version = "1"
+suggests = ["node", "yarn-registry"]
 
 [filesystem]
 allow = [

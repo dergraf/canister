@@ -48,7 +48,6 @@ fn print_recipe_entry(path: &Path, recipe: &RecipeFile) {
     let name = recipe.display_name(stem);
     let desc = recipe.description();
     let extras = format_syscall_extras(&recipe.syscalls);
-    let prefixes = recipe.match_prefixes();
 
     if desc.is_empty() {
         println!("  {name:<24} {extras:<30} {}", path.display());
@@ -58,10 +57,6 @@ fn print_recipe_entry(path: &Path, recipe: &RecipeFile) {
             "",
             path.display()
         );
-    }
-
-    if !prefixes.is_empty() {
-        println!("  {:<24} match: {}", "", prefixes.join(", "));
     }
 }
 
@@ -175,22 +170,6 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
             println!();
         }
 
-        // Match prefixes
-        let prefixes = recipe.match_prefixes();
-        if !prefixes.is_empty() {
-            println!("  Auto-detection prefixes:");
-            for prefix in prefixes {
-                let expanded = expand_env_vars(prefix);
-                if expanded == *prefix {
-                    println!("    {prefix}");
-                } else {
-                    let exists = Path::new(&expanded).exists();
-                    let marker = if exists { "+" } else { "-" };
-                    println!("    {prefix}  ->  {expanded} [{marker}]");
-                }
-            }
-            println!();
-        }
     }
 
     Ok(0)
@@ -198,9 +177,9 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
 
 /// Execute the `can recipe suggest` command.
 ///
-/// Takes a command line, resolves the binary, and recommends recipes
-/// whose name matches the binary basename or whose `match_prefix`
-/// covers the resolved binary path.
+/// Takes a command line and recommends recipes whose filename stem
+/// matches the binary basename (e.g. invoking `npm` suggests the `npm`
+/// recipe).
 pub fn suggest(command: &[String]) -> Result<i32> {
     let cmd = command
         .first()
@@ -220,24 +199,10 @@ pub fn suggest(command: &[String]) -> Result<i32> {
     let all = discover();
     let mut suggestions: Vec<String> = Vec::new();
 
-    for (path, _category, recipe) in &all {
+    for (path, _category, _recipe) in &all {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-        // Match by recipe stem → command basename (recipe "npm" matches `npm`).
         if stem == basename {
             suggestions.push(stem.to_string());
-            continue;
-        }
-
-        // Match by match_prefix against the resolved binary path.
-        if let Some(ref resolved_path) = resolved {
-            let resolved_str = resolved_path.to_string_lossy();
-            for prefix in recipe.match_prefixes_expanded() {
-                if resolved_str.starts_with(&prefix) {
-                    suggestions.push(stem.to_string());
-                    break;
-                }
-            }
         }
     }
 

@@ -14,6 +14,7 @@
 name = "elixir-dev"
 description = "Elixir/Erlang runtime: BEAM syscalls + env (no network — compose with `hex`)"
 version = "3"
+suggests = ["hex", "git", "gh"]
 
 [syscalls]
 # BEAM needs ptrace for tracing/debugging tools (:observer, :dbg).

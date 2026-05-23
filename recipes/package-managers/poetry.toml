@@ -2,6 +2,7 @@
 name = "poetry"
 description = "poetry: config + cache; auth.toml denied (use POETRY_HTTP_BASIC_* env)"
 version = "1"
+suggests = ["python", "pypi"]
 
 [filesystem]
 allow = [

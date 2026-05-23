@@ -2,6 +2,7 @@
 name = "pip"
 description = "pip: cache + config; ~/.pypirc denied (use PIP_INDEX_URL env for private indexes)"
 version = "1"
+suggests = ["python", "pypi"]
 
 [filesystem]
 allow = [

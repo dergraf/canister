@@ -157,6 +157,62 @@ deny_extra = ["personality", "seccomp"]
 }
 
 #[test]
+fn parse_recipe_with_suggests() {
+    let toml = r#"
+[recipe]
+name = "elixir-dev"
+suggests = ["hex", "git", "gh"]
+"#;
+    let recipe: RecipeFile = toml::from_str(toml).unwrap();
+    assert_eq!(recipe.suggests(), &["hex", "git", "gh"]);
+}
+
+#[test]
+fn recipe_without_suggests_is_empty() {
+    let toml = r#"
+[recipe]
+name = "minimal"
+"#;
+    let recipe: RecipeFile = toml::from_str(toml).unwrap();
+    assert!(recipe.suggests().is_empty());
+}
+
+/// Integrity check: every `suggests` target in every bundled recipe
+/// must resolve to an actual recipe filename stem. Catches typos at
+/// build time before they confuse the interactive builder.
+#[test]
+fn bundled_recipes_suggests_resolve() {
+    let recipes_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("recipes");
+    let paths = crate::walk_recipes(&recipes_dir);
+
+    let known: std::collections::HashSet<String> = paths
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+
+    let mut unresolved: Vec<(String, String)> = Vec::new();
+    for path in &paths {
+        let content = std::fs::read_to_string(path).expect("read recipe");
+        let recipe = RecipeFile::parse(&content).expect("parse recipe");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        for target in recipe.suggests() {
+            if !known.contains(target) {
+                unresolved.push((stem.to_string(), target.clone()));
+            }
+        }
+    }
+    assert!(
+        unresolved.is_empty(),
+        "recipes with unresolved `suggests` targets: {unresolved:?}"
+    );
+}
+
+#[test]
 fn recipe_defaults_to_empty_overrides() {
     let toml = "";
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
@@ -733,25 +789,6 @@ domain = "example.com"
     );
 }
 
-#[test]
-fn merge_match_prefix_preserved() {
-    let a = parse_recipe(
-        r#"
-[recipe]
-name = "nix"
-match_prefix = ["/nix/store"]
-"#,
-    );
-    let b = parse_recipe(
-        r#"
-[recipe]
-name = "elixir"
-"#,
-    );
-    let merged = a.merge(b);
-    assert_eq!(merged.display_name("fallback"), "elixir");
-    assert!(merged.match_prefixes().is_empty());
-}
 
 // ---------------------------------------------------------------
 // Environment variable expansion tests
@@ -846,24 +883,6 @@ allow_execve = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
         vec![PathBuf::from("/home/bob/.cargo/bin/rustc")]
     );
     unsafe { std::env::remove_var("_CANISTER_TEST_HOME2") };
-}
-
-#[test]
-fn expand_env_vars_match_prefixes_expanded() {
-    unsafe { std::env::set_var("_CANISTER_TEST_HOME3", "/home/carol") };
-    let recipe = parse_recipe(
-        r#"
-[recipe]
-name = "cargo"
-match_prefix = ["$_CANISTER_TEST_HOME3/.cargo"]
-"#,
-    );
-    assert_eq!(recipe.match_prefixes(), &["$_CANISTER_TEST_HOME3/.cargo"]);
-    assert_eq!(
-        recipe.match_prefixes_expanded(),
-        vec!["/home/carol/.cargo".to_string()]
-    );
-    unsafe { std::env::remove_var("_CANISTER_TEST_HOME3") };
 }
 
 #[test]

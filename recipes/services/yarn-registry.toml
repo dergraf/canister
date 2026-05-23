@@ -6,6 +6,7 @@
 [recipe]
 name = "yarn-registry"
 description = "Yarn classic registry mirror (npm-compatible)"
+suggests = ["yarn", "node"]
 
 [[host]]
 domain            = "registry.yarnpkg.com"

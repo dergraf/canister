@@ -19,6 +19,7 @@
 name = "neovim"
 description = "Neovim editor: config + plugin dirs (no network — compose with `github` etc.)"
 version = "3"
+suggests = ["lazy-nvim", "git", "github", "luarocks"]
 
 [filesystem]
 allow = [

@@ -9,6 +9,7 @@
 [recipe]
 name = "go-proxy"
 description = "Go module proxy + checksum database"
+suggests = ["go"]
 
 [[host]]
 domain        = "proxy.golang.org"

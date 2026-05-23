@@ -1,0 +1,35 @@
+# Canister recipe — asdf version manager.
+#
+# asdf installs language toolchains under ~/.asdf/installs/<plugin>/<version>
+# and exposes them via shims in ~/.asdf/shims. The shims dispatch to the
+# real binary, so when a sandboxed command resolves through a shim, the
+# realpath ends up under ~/.asdf/installs/...
+#
+# Compose with the language recipe you're actually using:
+#   recipes = ["asdf", "elixir", "hex"]
+#   recipes = ["asdf", "node", "npm", "npm-registry"]
+
+[recipe]
+name = "asdf"
+description = "asdf version manager (~/.asdf installs + shims)"
+version = "1"
+suggests = []
+
+[filesystem]
+allow = [
+    "$HOME/.asdf",
+    "$HOME/.tool-versions",
+    "$HOME/.asdfrc",
+]
+allow_write = [
+    "$HOME/.asdf/downloads",
+    "$HOME/.asdf/tmp",
+]
+
+[process]
+env_passthrough = [
+    "ASDF_DIR",
+    "ASDF_DATA_DIR",
+    "ASDF_CONFIG_FILE",
+    "ASDF_DEFAULT_TOOL_VERSIONS_FILENAME",
+]

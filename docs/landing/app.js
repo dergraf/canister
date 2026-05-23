@@ -10,7 +10,24 @@ const state = {
   byCategory: new Map(),
   sandboxes: [],
   nextId: 1,
+  // Lazily populated after recipes load.
+  inference: null,
+  wizard: { goal: 'develop', touched: new Set(['goal']) },
 };
+
+const GOAL_DEFAULTS = {
+  develop:    { egress: 'proxy-only', strict: false },
+  'run-only': { egress: 'none',       strict: true  },
+  build:      { egress: 'proxy-only', strict: false },
+  debug:      { egress: 'proxy-only', strict: false },
+};
+
+const GOAL_CHIPS = [
+  { id: 'develop',  label: 'Develop',  desc: 'edit + run + test locally · proxy-only egress' },
+  { id: 'run-only', label: 'Run only', desc: 'execute a compiled artifact · network off by default' },
+  { id: 'build',    label: 'Build',    desc: 'CI-style: compile + package · registries reachable' },
+  { id: 'debug',    label: 'Debug',    desc: 'attach a debugger / strace · ptrace allowed' },
+];
 
 const els = {
   status: document.getElementById('builder-status'),
@@ -21,6 +38,8 @@ const els = {
   copy: document.getElementById('copy-output'),
   copyCli: document.getElementById('copy-cli'),
   tpl: document.getElementById('sandbox-template'),
+  wizard: document.getElementById('wizard'),
+  advanced: document.getElementById('advanced'),
 };
 
 const CATEGORY_LABELS = {
@@ -47,9 +66,20 @@ async function init() {
     return;
   }
   state.byCategory = groupByCategory(state.recipes);
+  state.inference = window.Inference.enrich(state.recipes);
 
-  // Seed with a sensible default sandbox.
-  addSandbox({ name: 'dev', command: 'bash', egress: '', picks: new Set() });
+  // Seed with a sensible default sandbox seeded by the develop goal's
+  // defaults. The wizard always drives sandbox[0]; additional sandboxes
+  // (via Advanced → add) only have the picker.
+  const goalDefaults = GOAL_DEFAULTS[state.wizard.goal];
+  addSandbox({
+    name: 'dev',
+    command: 'bash',
+    egress: goalDefaults.egress,
+    strict: goalDefaults.strict,
+    picks: new Set(),
+  });
+  buildWizard();
   render();
 }
 
@@ -75,9 +105,24 @@ function addSandbox(initial) {
     name: initial?.name ?? `sandbox-${id}`,
     command: initial?.command ?? 'bash',
     egress: initial?.egress ?? '',
+    strict: initial?.strict ?? false,
     picks: initial?.picks ?? new Set(),
+    customHosts: initial?.customHosts ?? [],
+    nextHostId: initial?.nextHostId ?? 1,
     search: '',
   });
+}
+
+function blankHost() {
+  return {
+    domain: '',
+    methods: '',
+    content_types: '',
+    paths: '',
+    max_request_bytes: '',
+    contract_mode: '',
+    allow_credentials: new Set(),
+  };
 }
 
 function render() {
@@ -86,8 +131,397 @@ function render() {
   for (const sb of state.sandboxes) {
     els.sandboxes.appendChild(buildSandboxCard(sb));
   }
+  renderWizard();
   renderOutput();
 }
+
+// ---- Wizard ---------------------------------------------------------
+
+const STEPS = ['goal', 'languages', 'installer', 'editor', 'forge', 'services', 'apis', 'hosts', 'egress'];
+
+// DLP detector ids from `crates/can-dlp/src/ids.rs`. Surfaced as toggle
+// chips on each custom-host row so users can scope a credential to the
+// host that legitimately carries it.
+const DLP_DETECTORS = [
+  'github_pat', 'npm_token', 'aws_access_key', 'bearer_token',
+  'ssh_private_key', 'slack_token', 'generic_high_entropy', 'canary_token',
+  'openai_key', 'anthropic_key', 'google_api_key', 'stripe_key',
+  'postgres_uri', 'pkcs8_private_key',
+];
+
+function primarySandbox() { return state.sandboxes[0]; }
+
+function buildWizard() {
+  if (!els.wizard || !state.inference) return;
+  const inf = state.inference;
+
+  // ---- Step 1: Goal chips (radiogroup) ----
+  const goalGroup = els.wizard.querySelector('[data-chip-group="goal"]');
+  goalGroup.innerHTML = '';
+  for (const g of GOAL_CHIPS) {
+    goalGroup.appendChild(buildGoalChip(g));
+  }
+
+  // ---- Step 2: Languages ----
+  const langGroup = els.wizard.querySelector('[data-chip-group="languages"]');
+  langGroup.innerHTML = '';
+  for (const r of (inf.byRole.get('language') || [])) {
+    langGroup.appendChild(buildRecipeChip(r));
+  }
+
+  // ---- Step 3: Toolchain installers (curated subset of package-manager) ----
+  const installerGroup = els.wizard.querySelector('[data-chip-group="installers"]');
+  installerGroup.innerHTML = '';
+  const installers = (inf.byRole.get('package-manager') || [])
+    .filter(r => r.isInstaller)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of installers) installerGroup.appendChild(buildRecipeChip(r));
+
+  // ---- Step 4: Editors ----
+  const editorGroup = els.wizard.querySelector('[data-chip-group="editors"]');
+  editorGroup.innerHTML = '';
+  for (const r of (inf.byRole.get('editor') || [])) {
+    editorGroup.appendChild(buildRecipeChip(r));
+  }
+
+  // ---- Step 5: Forge & VCS ----
+  const forgeGroup = els.wizard.querySelector('[data-chip-group="forges"]');
+  forgeGroup.innerHTML = '';
+  const forges = [
+    ...(inf.byRole.get('vcs') || []),
+    ...(inf.byRole.get('service') || []).filter(r => r.isForge),
+  ];
+  for (const r of forges) forgeGroup.appendChild(buildRecipeChip(r));
+
+  // ---- Step 6: Package managers & registries ----
+  // PMs minus installers + services minus forges minus remote APIs.
+  const servicesGroup = els.wizard.querySelector('[data-chip-group="services"]');
+  servicesGroup.innerHTML = '';
+  const registriesAndPMs = [
+    ...(inf.byRole.get('package-manager') || []).filter(r => !r.isInstaller),
+    ...(inf.byRole.get('service') || []).filter(r => !r.isForge && !r.isRemoteApi),
+  ].sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of registriesAndPMs) servicesGroup.appendChild(buildRecipeChip(r));
+
+  // ---- Step 7: Remote APIs & SaaS ----
+  const apisGroup = els.wizard.querySelector('[data-chip-group="apis"]');
+  apisGroup.innerHTML = '';
+  const apis = (inf.byRole.get('service') || [])
+    .filter(r => r.isRemoteApi)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of apis) apisGroup.appendChild(buildRecipeChip(r));
+
+  // ---- Step 8: Custom hosts ----
+  const addHostBtn = els.wizard.querySelector('[data-add-host]');
+  if (addHostBtn) {
+    addHostBtn.addEventListener('click', () => {
+      const sb = primarySandbox();
+      const id = sb.nextHostId++;
+      sb.customHosts.push(Object.assign({ id }, blankHost()));
+      markTouched('hosts');
+      renderWizard();
+      renderOutput();
+    });
+  }
+
+  // ---- Step 9: Egress + strict ----
+  const sb = primarySandbox();
+  const egressRadios = els.wizard.querySelectorAll('input[name="wiz-egress"]');
+  for (const radio of egressRadios) {
+    radio.checked = (radio.value === sb.egress);
+    radio.addEventListener('change', () => {
+      sb.egress = radio.value;
+      markTouched('egress');
+      renderOutput();
+    });
+  }
+  const strictBox = els.wizard.querySelector('[data-wiz-strict]');
+  strictBox.checked = !!sb.strict;
+  strictBox.addEventListener('change', () => {
+    sb.strict = strictBox.checked;
+    markTouched('egress');
+    renderOutput();
+  });
+}
+
+function buildGoalChip(g) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'chip chip-goal';
+  btn.dataset.goal = g.id;
+  btn.setAttribute('role', 'radio');
+  btn.setAttribute('aria-checked', state.wizard.goal === g.id ? 'true' : 'false');
+  if (state.wizard.goal === g.id) btn.classList.add('is-selected');
+
+  const name = document.createElement('span');
+  name.className = 'chip-name';
+  name.textContent = g.label;
+  btn.appendChild(name);
+
+  const desc = document.createElement('span');
+  desc.className = 'chip-desc';
+  desc.textContent = g.desc;
+  btn.appendChild(desc);
+
+  btn.addEventListener('click', () => {
+    state.wizard.goal = g.id;
+    const defaults = GOAL_DEFAULTS[g.id];
+    const sb = primarySandbox();
+    sb.egress = defaults.egress;
+    sb.strict = defaults.strict;
+    markTouched('goal');
+    renderWizard();
+    renderOutput();
+  });
+  return btn;
+}
+
+function buildRecipeChip(recipe, suggestedBy) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'chip chip-recipe';
+  btn.dataset.recipe = recipe.name;
+  const picked = primarySandbox().picks.has(recipe.name);
+  btn.setAttribute('aria-pressed', picked ? 'true' : 'false');
+  if (picked) btn.classList.add('is-selected');
+  if (suggestedBy) btn.classList.add('is-suggested');
+
+  const name = document.createElement('span');
+  name.className = 'chip-name';
+  name.textContent = recipe.name;
+  btn.appendChild(name);
+
+  const desc = document.createElement('span');
+  desc.className = 'chip-desc';
+  desc.textContent = recipe.description || '';
+  btn.appendChild(desc);
+
+  if (suggestedBy) {
+    const why = document.createElement('span');
+    why.className = 'chip-why';
+    const sources = [...suggestedBy];
+    const firstSource = sources[0];
+    why.textContent = sources.length === 1
+      ? `via ${firstSource}`
+      : `via ${firstSource} + ${sources.length - 1}`;
+    why.title = state.inference.explain(firstSource, recipe.name);
+    btn.appendChild(why);
+  }
+
+  btn.addEventListener('click', () => toggleRecipe(recipe.name));
+  return btn;
+}
+
+function toggleRecipe(name) {
+  const sb = primarySandbox();
+  if (sb.picks.has(name)) sb.picks.delete(name);
+  else sb.picks.add(name);
+  // Find which step contains this chip to mark touched.
+  const recipe = state.inference.byName.get(name);
+  if (recipe) {
+    if (recipe.role === 'language') markTouched('languages');
+    else if (recipe.role === 'package-manager') {
+      markTouched(recipe.isInstaller ? 'installer' : 'services');
+    } else if (recipe.role === 'editor') markTouched('editor');
+    else if (recipe.role === 'vcs' || recipe.isForge) markTouched('forge');
+    else if (recipe.role === 'service') {
+      markTouched(recipe.isRemoteApi ? 'apis' : 'services');
+    }
+  }
+  // Refresh picker rows too so they reflect the new pick state.
+  syncPickerSelection();
+  renderWizard();
+  renderOutput();
+}
+
+function syncPickerSelection() {
+  const sb = primarySandbox();
+  if (!els.sandboxes) return;
+  // Only the primary sandbox card needs syncing — the wizard never touches others.
+  const primaryCard = els.sandboxes.querySelector(`[data-sandbox-card][data-id="${sb.id}"]`);
+  if (!primaryCard) return;
+  for (const row of primaryCard.querySelectorAll('.recipe-row')) {
+    const name = row.dataset.name;
+    const picked = sb.picks.has(name);
+    row.classList.toggle('selected', picked);
+    const tog = row.querySelector('.recipe-toggle');
+    if (tog) tog.setAttribute('aria-pressed', picked ? 'true' : 'false');
+  }
+}
+
+function markTouched(step) {
+  const idx = STEPS.indexOf(step);
+  if (idx < 0) {
+    state.wizard.touched.add(step);
+    return;
+  }
+  // Reveal every step up to and including `step`, plus the next one so
+  // the user always sees "what to answer next". This handles the case
+  // where the user jumps ahead in the wizard (e.g. clicks a chip in
+  // step 7 without touching step 5).
+  for (let i = 0; i <= Math.min(idx + 1, STEPS.length - 1); i++) {
+    state.wizard.touched.add(STEPS[i]);
+  }
+}
+
+function renderWizard() {
+  if (!els.wizard || !state.inference) return;
+
+  // 1) Refresh chip pressed-state across all recipe chips.
+  const sb = primarySandbox();
+  for (const btn of els.wizard.querySelectorAll('.chip-recipe')) {
+    const name = btn.dataset.recipe;
+    const picked = sb.picks.has(name);
+    btn.setAttribute('aria-pressed', picked ? 'true' : 'false');
+    btn.classList.toggle('is-selected', picked);
+  }
+  // Goal chips
+  for (const btn of els.wizard.querySelectorAll('.chip-goal')) {
+    const sel = btn.dataset.goal === state.wizard.goal;
+    btn.setAttribute('aria-checked', sel ? 'true' : 'false');
+    btn.classList.toggle('is-selected', sel);
+  }
+
+  // 2) Render "suggested companions" sub-sections for steps that have them.
+  renderSuggestedFor('languages');
+  renderSuggestedFor('editors');
+
+  // 2b) Render custom-host rows.
+  renderCustomHosts();
+
+  // 3) Show/hide steps based on `touched`.
+  for (const step of STEPS) {
+    const sec = els.wizard.querySelector(`[data-step="${step}"]`);
+    if (!sec) continue;
+    sec.classList.toggle('is-active', state.wizard.touched.has(step));
+  }
+
+  // 4) Sync egress + strict.
+  for (const radio of els.wizard.querySelectorAll('input[name="wiz-egress"]')) {
+    radio.checked = (radio.value === sb.egress);
+  }
+  const strictBox = els.wizard.querySelector('[data-wiz-strict]');
+  if (strictBox) strictBox.checked = !!sb.strict;
+}
+
+function renderCustomHosts() {
+  const listEl = els.wizard && els.wizard.querySelector('[data-hosts-list]');
+  if (!listEl) return;
+  const sb = primarySandbox();
+  const tpl = document.getElementById('host-row-template');
+  if (!tpl) return;
+
+  listEl.innerHTML = '';
+  for (const host of sb.customHosts) {
+    listEl.appendChild(buildHostRow(host, tpl));
+  }
+}
+
+function buildHostRow(host, tpl) {
+  const frag = tpl.content.cloneNode(true);
+  const row = frag.querySelector('[data-host-row]');
+  row.dataset.hostId = host.id;
+
+  const updateAndRefresh = () => {
+    markTouched('hosts');
+    renderOutput();
+  };
+
+  for (const input of row.querySelectorAll('[data-host-field]')) {
+    const field = input.dataset.hostField;
+    input.value = host[field] ?? '';
+    input.addEventListener('input', () => {
+      host[field] = input.value;
+      updateAndRefresh();
+    });
+    input.addEventListener('change', () => {
+      host[field] = input.value;
+      updateAndRefresh();
+    });
+  }
+
+  // Credential-scope chips.
+  const credBox = row.querySelector('[data-host-creds]');
+  for (const det of DLP_DETECTORS) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip chip-cred';
+    const on = host.allow_credentials.has(det);
+    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+    if (on) chip.classList.add('is-selected');
+    chip.textContent = det;
+    chip.addEventListener('click', () => {
+      if (host.allow_credentials.has(det)) host.allow_credentials.delete(det);
+      else host.allow_credentials.add(det);
+      chip.setAttribute('aria-pressed', host.allow_credentials.has(det) ? 'true' : 'false');
+      chip.classList.toggle('is-selected', host.allow_credentials.has(det));
+      updateAndRefresh();
+    });
+    credBox.appendChild(chip);
+  }
+
+  const removeBtn = row.querySelector('[data-remove-host]');
+  removeBtn.addEventListener('click', () => {
+    const sb = primarySandbox();
+    sb.customHosts = sb.customHosts.filter(h => h.id !== host.id);
+    renderWizard();
+    renderOutput();
+  });
+
+  return frag;
+}
+
+function renderSuggestedFor(step) {
+  const wrap = els.wizard.querySelector(`[data-suggested-for="${step}"]`);
+  if (!wrap) return;
+  const targetGroup = wrap.querySelector(`[data-chip-group="${step}-suggested"]`);
+  targetGroup.innerHTML = '';
+
+  // Identify the "source" recipes — recipes picked from this step's group.
+  const sourceRoles = step === 'languages' ? ['language'] : ['editor'];
+  const sb = primarySandbox();
+  const sourcePicks = new Set();
+  for (const role of sourceRoles) {
+    for (const r of state.inference.byRole.get(role) || []) {
+      if (sb.picks.has(r.name)) sourcePicks.add(r.name);
+    }
+  }
+
+  if (sourcePicks.size === 0) {
+    wrap.hidden = true;
+    return;
+  }
+
+  // Build the offered set directly — include already-picked targets so
+  // accepting a suggestion shows the chip flipping to selected rather
+  // than disappearing. The chip's source attribution survives even when
+  // the recipe also happens to live in a later section.
+  const offered = new Map();   // name -> Set<sourceName>
+  for (const srcName of sourcePicks) {
+    const src = state.inference.byName.get(srcName);
+    if (!src) continue;
+    for (const target of src.suggests) {
+      if (target === srcName) continue;
+      if (!state.inference.byName.has(target)) continue;
+      if (!offered.has(target)) offered.set(target, new Set());
+      offered.get(target).add(srcName);
+    }
+  }
+
+  if (offered.size === 0) {
+    wrap.hidden = true;
+    return;
+  }
+
+  wrap.hidden = false;
+  const targets = [...offered.keys()].sort();
+  for (const t of targets) {
+    const recipe = state.inference.byName.get(t);
+    if (!recipe) continue;
+    targetGroup.appendChild(buildRecipeChip(recipe, offered.get(t)));
+  }
+}
+
 
 function buildSandboxCard(sb) {
   const frag = els.tpl.content.cloneNode(true);
@@ -197,16 +631,6 @@ function buildRecipeRow(recipe, sb) {
   nameEl.className = 'recipe-name';
   nameEl.textContent = recipe.name;
   nameWrap.appendChild(nameEl);
-
-  const auto = (recipe.match_prefix && recipe.match_prefix.length > 0);
-  if (auto) {
-    const badge = document.createElement('span');
-    badge.className = 'badge-auto';
-    badge.setAttribute('tabindex', '0');
-    badge.dataset.tooltip = `Auto-detected: canister composes this recipe automatically when the resolved binary path starts with one of its match_prefix entries (${recipe.match_prefix.join(', ')}). You don't need to list it explicitly under recipes = [...].`;
-    badge.textContent = 'auto';
-    nameWrap.appendChild(badge);
-  }
   toggle.appendChild(nameWrap);
 
   toggle.addEventListener('click', (e) => {
@@ -215,6 +639,7 @@ function buildRecipeRow(recipe, sb) {
     toggle.setAttribute('aria-pressed', pressed ? 'true' : 'false');
     row.classList.toggle('selected', pressed);
     if (pressed) sb.picks.add(recipe.name); else sb.picks.delete(recipe.name);
+    if (sb === primarySandbox()) renderWizard();
     renderOutput();
   });
 
@@ -344,9 +769,6 @@ function renderRecipeDetail(host, recipe) {
 
   // -- Other policy bits --
   const extras = [];
-  if (recipe.match_prefix && recipe.match_prefix.length) {
-    extras.push(['match_prefix', recipe.match_prefix.join(', '), 'Auto-detected when the resolved binary path starts with one of these.']);
-  }
   if (s.egress) extras.push(['egress', s.egress, 'Recipe-level egress stance (overrides sandbox default).']);
   if (s.strict === true) extras.push(['strict', 'true', 'Aborts the sandbox if any isolation layer fails to set up.']);
   if (typeof s.max_pids === 'number') extras.push(['max_pids', String(s.max_pids), 'Cgroup pids.max limit for this sandbox.']);
@@ -481,10 +903,30 @@ function renderOutput() {
     const picks = [...sb.picks].sort();
     lines.push(`recipes = [${picks.map(p => `"${p}"`).join(', ')}]`);
     lines.push(`command = "${escapeToml(sb.command || '')}"`);
+    if (sb.strict) lines.push('strict = true');
     if (sb.egress) {
       lines.push('');
       lines.push(`[sandbox.${name}.network]`);
       lines.push(`egress = "${sb.egress}"`);
+    }
+    // ---- Custom [[sandbox.X.host]] blocks ----
+    for (const host of (sb.customHosts || [])) {
+      const domain = (host.domain || '').trim();
+      if (!domain) continue;   // skip empty rows so users can add → edit
+      lines.push('');
+      lines.push(`[[sandbox.${name}.host]]`);
+      lines.push(`domain = "${escapeToml(domain)}"`);
+      const methods = csvToArray(host.methods);
+      if (methods.length) lines.push(`methods = [${methods.map(m => `"${escapeToml(m.toUpperCase())}"`).join(', ')}]`);
+      const cts = csvToArray(host.content_types);
+      if (cts.length) lines.push(`content_types = [${cts.map(m => `"${escapeToml(m)}"`).join(', ')}]`);
+      const paths = csvToArray(host.paths);
+      if (paths.length) lines.push(`paths = [${paths.map(p => `"${escapeToml(p)}"`).join(', ')}]`);
+      const cap = parsePositiveInt(host.max_request_bytes);
+      if (cap !== null) lines.push(`max_request_bytes = ${cap}`);
+      if (host.contract_mode) lines.push(`contract_mode = "${host.contract_mode}"`);
+      const creds = [...host.allow_credentials].sort();
+      if (creds.length) lines.push(`allow_credentials = [${creds.map(d => `"${escapeToml(d)}"`).join(', ')}]`);
     }
     lines.push('');
 
@@ -522,6 +964,21 @@ function renderOutput() {
 
 function escapeToml(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function csvToArray(s) {
+  return String(s || '')
+    .split(/[,\s]+/)
+    .map(t => t.trim())
+    .filter(Boolean);
+}
+
+function parsePositiveInt(s) {
+  const t = String(s || '').trim();
+  if (!t) return null;
+  if (!/^\d+$/.test(t)) return null;
+  const n = parseInt(t, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 els.addSandbox.addEventListener('click', () => {

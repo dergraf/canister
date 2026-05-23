@@ -1,0 +1,35 @@
+# Canister recipe — mise (formerly rtx) polyglot version manager.
+#
+# mise installs language toolchains under ~/.local/share/mise/installs
+# and exposes them via shims in ~/.local/share/mise/shims. Configuration
+# lives in ~/.config/mise/config.toml plus per-project .mise.toml files.
+#
+# Compose with the language recipe you're actually using:
+#   recipes = ["mise", "node", "npm", "npm-registry"]
+#   recipes = ["mise", "python", "uv", "pypi"]
+
+[recipe]
+name = "mise"
+description = "mise polyglot version manager (~/.local/share/mise + config)"
+version = "1"
+suggests = []
+
+[filesystem]
+allow = [
+    "$HOME/.config/mise",
+]
+allow_write = [
+    "$HOME/.local/share/mise",
+    "$HOME/.local/state/mise",
+    "$HOME/.cache/mise",
+]
+
+[process]
+env_passthrough = [
+    "MISE_DATA_DIR",
+    "MISE_CONFIG_DIR",
+    "MISE_CACHE_DIR",
+    "MISE_STATE_DIR",
+    "MISE_SHELL",
+    "MISE_ENV",
+]

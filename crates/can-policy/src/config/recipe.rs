@@ -39,15 +39,13 @@ pub struct RecipeMeta {
     #[serde(default)]
     pub version: Option<String>,
 
-    /// Path prefixes that trigger auto-detection of this recipe.
+    /// Other recipe names that compose naturally with this one.
     ///
-    /// When running a binary whose resolved path starts with one of these
-    /// prefixes, this recipe is automatically composed into the recipe stack.
-    /// Supports environment variable expansion (`$HOME`, `$USER`, etc.).
-    ///
-    /// Example: `["/nix/store"]` for the Nix package manager.
+    /// Read by the interactive builder to surface companion recipes
+    /// ("you picked elixir → consider hex, git, gh"). Not used at
+    /// runtime — purely a UI/UX hint. Empty by default.
     #[serde(default)]
-    pub match_prefix: Vec<String>,
+    pub suggests: Vec<String>,
 }
 
 /// A recipe file — the only entry point for parsing policy TOML files.
@@ -218,20 +216,12 @@ impl RecipeFile {
             .unwrap_or("")
     }
 
-    /// Get the match_prefix patterns for auto-detection.
-    pub fn match_prefixes(&self) -> &[String] {
+    /// Get the names of recipes this one suggests as natural companions.
+    pub fn suggests(&self) -> &[String] {
         self.recipe
             .as_ref()
-            .map(|m| m.match_prefix.as_slice())
+            .map(|m| m.suggests.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Get the match_prefix patterns with environment variables expanded.
-    pub fn match_prefixes_expanded(&self) -> Vec<String> {
-        self.match_prefixes()
-            .iter()
-            .map(|s| expand_env_vars(s))
-            .collect()
     }
 }
 

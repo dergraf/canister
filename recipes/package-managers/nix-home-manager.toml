@@ -1,0 +1,38 @@
+# Canister recipe — Nix home-manager.
+#
+# home-manager installs user-scoped packages under the per-user profile
+# at ~/.nix-profile and stores its own state under ~/.local/state/nix
+# and ~/.local/state/home-manager. Configuration lives in
+# ~/.config/home-manager (or ~/.config/nixpkgs/home.nix on older setups).
+#
+# Composes with `nix` (which mounts /nix/store for the binaries the
+# profile symlinks into).
+#
+#   recipes = ["nix", "nix-home-manager"]
+
+[recipe]
+name = "nix-home-manager"
+description = "Nix home-manager profile (~/.nix-profile + per-user state)"
+version = "1"
+suggests = ["nix"]
+
+[filesystem]
+allow = [
+    "$HOME/.nix-profile",
+    "$HOME/.config/home-manager",
+    "$HOME/.config/nixpkgs",
+]
+allow_write = [
+    "$HOME/.local/state/nix",
+    "$HOME/.local/state/home-manager",
+    "$HOME/.cache/nix",
+]
+
+[process]
+env_passthrough = [
+    "NIX_PATH",
+    "NIX_PROFILES",
+    "NIX_USER_PROFILE_DIR",
+    "NIX_SSL_CERT_FILE",
+    "HOME_MANAGER_BACKUP_EXT",
+]

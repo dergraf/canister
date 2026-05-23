@@ -12,6 +12,7 @@
 name = "python"
 description = "Python 3 interpreter (no PyPI access; compose with `pip` for installs)"
 version = "1"
+suggests = ["pip", "uv", "poetry", "pypi", "git"]
 
 [process]
 env_passthrough = [

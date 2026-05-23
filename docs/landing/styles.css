@@ -1326,3 +1326,354 @@ code { font-size: 0.92em; }
     transition-duration: 0s !important;
   }
 }
+
+/* =========================================================================
+   Wizard — progressive single-page guided form
+   ========================================================================= */
+
+.wizard {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 2rem 0 1.5rem;
+}
+
+.wiz-step {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.1rem 1.25rem 1.25rem;
+  /* Not-yet-touched steps are visually dimmed as a "you haven't reached
+     this yet" cue, but stay clickable — users can jump ahead and the
+     interaction promotes that step (and everything before it) to active. */
+  opacity: 0.6;
+  transition: opacity 180ms ease;
+}
+.wiz-step.is-active {
+  opacity: 1;
+  border-color: var(--border-strong);
+}
+
+.wiz-step-head {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 0.85rem;
+  row-gap: 0.2rem;
+  margin-bottom: 0.85rem;
+  align-items: baseline;
+}
+.wiz-step-num {
+  grid-row: 1 / span 2;
+  grid-column: 1;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  font-size: 0.85rem;
+  letter-spacing: 0.08em;
+  padding-top: 0.3rem;
+}
+.wiz-step-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 1.05rem;
+  color: var(--fg);
+  letter-spacing: -0.005em;
+}
+.wiz-step-hint {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+.wiz-step-hint code {
+  font-size: 0.85em;
+}
+
+/* ---- Chips ---- */
+
+.chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+.chip-group-suggested {
+  gap: 0.5rem;
+}
+
+.chip {
+  --chip-bg: var(--surface-alt);
+  --chip-border: var(--border);
+  --chip-fg: var(--fg);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  background: var(--chip-bg);
+  border: 1px solid var(--chip-border);
+  color: var(--chip-fg);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.8rem;
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  cursor: pointer;
+  text-align: left;
+  min-width: 12ch;
+  max-width: 28ch;
+  transition: border-color 120ms ease, background 120ms ease, transform 80ms ease;
+}
+.chip:hover {
+  border-color: var(--accent-strong);
+  background: var(--surface-hi);
+}
+.chip:active { transform: translateY(1px); }
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chip.is-selected {
+  --chip-bg: rgba(95, 216, 122, 0.10);
+  --chip-border: var(--accent);
+  --chip-fg: var(--accent-glow);
+}
+
+.chip.is-suggested {
+  border-style: dashed;
+}
+.chip.is-suggested.is-selected {
+  border-style: solid;
+}
+
+.chip-name {
+  font-weight: 600;
+  font-size: 0.92rem;
+  letter-spacing: -0.01em;
+}
+.chip-desc {
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+  line-height: 1.4;
+}
+.chip.is-selected .chip-desc { color: var(--fg); }
+
+.chip-auto {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--bg-deep);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 0.05rem 0.32rem;
+  border-radius: 3px;
+  margin-left: 0.35rem;
+  text-transform: uppercase;
+  vertical-align: 0.15em;
+  cursor: help;
+}
+.chip-why {
+  font-size: 0.7rem;
+  color: var(--amber-soft);
+  font-style: italic;
+  cursor: help;
+}
+
+/* Goal chips are slightly wider — they carry a longer description. */
+.chip-goal { min-width: 16ch; max-width: 34ch; }
+
+/* ---- Suggested companions sub-section ---- */
+.chip-suggested {
+  margin-top: 0.85rem;
+  padding: 0.7rem 0.85rem 0.85rem;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.18);
+}
+.suggested-label {
+  margin: 0 0 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--amber-soft);
+}
+
+/* ---- Egress / strict row ---- */
+.wiz-egress-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 1.5rem;
+}
+.wiz-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.85rem 0.6rem;
+  margin: 0;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+.wiz-fieldset legend {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  padding: 0 0.4rem;
+}
+.wiz-radio,
+.wiz-strict {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  cursor: pointer;
+  color: var(--fg);
+}
+.wiz-radio input,
+.wiz-strict input {
+  accent-color: var(--accent);
+}
+.wiz-strict {
+  align-self: center;
+  color: var(--fg-muted);
+}
+.wiz-strict strong { color: var(--fg); }
+
+/* ---- Advanced (collapsed picker) ---- */
+.advanced {
+  margin-top: 2rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+.advanced > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 0.85rem 1.1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--fg);
+}
+.advanced > summary::-webkit-details-marker { display: none; }
+.advanced > summary::marker { display: none; }
+.advanced[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+.adv-marker {
+  color: var(--accent);
+  font-size: 1.05rem;
+}
+.adv-hint {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: 0.78rem;
+}
+.advanced > .sandboxes,
+.advanced > .add-sandbox-row {
+  padding: 0 1.1rem;
+}
+.advanced > .sandboxes { padding-top: 1rem; }
+.advanced > .add-sandbox-row { padding-bottom: 1rem; }
+
+/* =========================================================================
+   Wizard — custom hosts step
+   ========================================================================= */
+
+.hosts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  margin-bottom: 0.85rem;
+}
+
+.host-row {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.85rem 0.85rem;
+}
+
+.host-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.65rem;
+  margin-bottom: 0.6rem;
+}
+.host-row-head .btn-remove { margin-left: auto; }
+
+.host-row-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14ch, 1fr));
+  gap: 0.5rem 0.85rem;
+}
+
+.host-row-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  flex: 1 1 14ch;
+}
+.host-row-field input,
+.host-row-field select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+.host-row-field input:focus,
+.host-row-field select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.host-row-domain { flex: 2 1 28ch; }
+
+.host-row-creds {
+  margin-top: 0.7rem;
+}
+.host-row-creds-label {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin-bottom: 0.4rem;
+}
+.host-row-creds-label em {
+  font-style: italic;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg-dim);
+}
+
+.chip-group-small { gap: 0.35rem; }
+
+.chip.chip-cred {
+  padding: 0.25rem 0.55rem;
+  min-width: 0;
+  font-size: 0.76rem;
+  flex-direction: row;
+  align-items: center;
+}
+.chip.chip-cred .chip-name { display: none; }    /* avoid double label */
+
+.wiz-step [data-add-host] {
+  margin-top: 0.35rem;
+}

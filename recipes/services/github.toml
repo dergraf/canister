@@ -11,6 +11,7 @@
 [recipe]
 name = "github"
 description = "GitHub REST + GraphQL API contracts"
+suggests = ["git", "gh"]
 
 [[host]]
 domain            = "api.github.com"

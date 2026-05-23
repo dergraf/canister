@@ -22,6 +22,7 @@
 name = "gh"
 description = "gh: editor/pager/host config; hosts.yml token denied (use env vars)"
 version = "1"
+suggests = ["git", "github"]
 
 [filesystem]
 # We intentionally do NOT broadly mount $HOME/.config/gh because

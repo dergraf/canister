@@ -384,7 +384,6 @@ fn generate_merge_semantics(out_dir: &Path) -> Result<()> {
     out.push_str("## Composition Order\n\n");
     out.push_str("```\n");
     out.push_str("base.toml (always loaded first)\n");
-    out.push_str("  → auto-detected recipes (match_prefix against command binary)\n");
     out.push_str("  → explicit --recipe args (left to right)\n");
     out.push_str("  → manifest overrides (for `can up`)\n");
     out.push_str("  = final SandboxConfig\n");
@@ -598,34 +597,26 @@ fn generate_builtin_recipes(out_dir: &Path) -> Result<()> {
     out.push_str("## Overview\n\n");
     for (category, paths) in &by_category {
         out.push_str(&format!("### `{category}/`\n\n"));
-        out.push_str("| Recipe | Description | Auto-detected |\n");
-        out.push_str("|--------|-------------|---------------|\n");
+        out.push_str("| Recipe | Description |\n");
+        out.push_str("|--------|-------------|\n");
         for path in paths {
             let content = std::fs::read_to_string(path)?;
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let (description, match_prefix) = match RecipeFile::parse(&content) {
+            let description = match RecipeFile::parse(&content) {
                 Ok(recipe) => {
                     let desc = recipe.description().to_string();
-                    let prefixes = recipe.match_prefixes().to_vec();
-                    (
-                        if desc.is_empty() {
-                            "—".to_string()
-                        } else {
-                            desc
-                        },
-                        if prefixes.is_empty() {
-                            "No".to_string()
-                        } else {
-                            format!("Yes (`{}`)", prefixes.join("`, `"))
-                        },
-                    )
+                    if desc.is_empty() {
+                        "—".to_string()
+                    } else {
+                        desc
+                    }
                 }
-                Err(_) => ("—".to_string(), "No".to_string()),
+                Err(_) => "—".to_string(),
             };
-            out.push_str(&format!("| `{name}` | {description} | {match_prefix} |\n"));
+            out.push_str(&format!("| `{name}` | {description} |\n"));
         }
         out.push('\n');
     }
@@ -711,7 +702,7 @@ fn generate_recipes_data_json() -> Result<()> {
         let filesystem_deny: Vec<String> =
             fs.deny.iter().map(|p| p.display().to_string()).collect();
         let env_passthrough = recipe.process.env_passthrough.clone();
-        let match_prefix = recipe.match_prefixes().to_vec();
+        let suggests = recipe.suggests().to_vec();
         let egress = recipe
             .network
             .egress
@@ -731,7 +722,7 @@ fn generate_recipes_data_json() -> Result<()> {
             "name": name,
             "category": category,
             "description": recipe.description(),
-            "match_prefix": match_prefix,
+            "suggests": suggests,
             "summary": {
                 "host_domains": host_domains,
                 "host_contracts": host_contracts,
