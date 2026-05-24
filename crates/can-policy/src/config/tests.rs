@@ -789,7 +789,6 @@ domain = "example.com"
     );
 }
 
-
 // ---------------------------------------------------------------
 // Environment variable expansion tests
 //

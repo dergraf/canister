@@ -169,9 +169,7 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
             }
             println!();
         }
-
     }
-
     Ok(0)
 }
 
