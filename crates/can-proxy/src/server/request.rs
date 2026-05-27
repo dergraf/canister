@@ -222,6 +222,15 @@ pub(super) async fn handle_inner_request(
             BodyOutcome::Refused(resp) => return Ok(resp),
         };
 
+    // Fake→real secret swap (DLP only): the sandbox carries only fake
+    // credentials; substitute the real value into headers bound for a
+    // host authorized for that credential. Runs after the scan above
+    // (which sees the fake) and only on authorized hosts, so the real
+    // secret never reaches an unauthorized destination.
+    if let Some(ctx) = dlp.as_ref() {
+        super::secret_swap::swap_in_headers(&ctx.swaps, &ctx.scanner, &host, &mut parts.headers);
+    }
+
     let mut upstream_req = Request::from_parts(parts, req_body);
     if original_scheme == "h2c" {
         egress::sanitize_h2c_headers(&mut upstream_req);
@@ -411,6 +420,12 @@ async fn buffer_and_scan_body(
     ) {
         return BodyOutcome::Refused(resp);
     }
+
+    // Swap fakes for real secrets in the (scanned) body before it goes
+    // upstream — only for swaps authorized at `host`. `content_length` is
+    // recomputed from the post-swap bytes so a length-changing swap keeps
+    // the forwarded `Content-Length` correct.
+    let bytes = super::secret_swap::swap_in_body(&ctx.swaps, &ctx.scanner, host, bytes);
 
     let len = bytes.len();
     BodyOutcome::Ready {

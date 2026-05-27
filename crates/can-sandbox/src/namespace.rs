@@ -177,6 +177,46 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     };
     let canary_values: Vec<String> = canary_set.as_ref().map(|c| c.values()).unwrap_or_default();
 
+    // Fake-secret swap (DLP): for each configured `[network.dlp].fake_secrets`
+    // entry, capture the real host value and generate a fake matching its
+    // credential pattern. The fake (under the real env-var name) goes to the
+    // sandbox; the proxy gets the `fake → real` map and swaps on authorized
+    // egress. The real value is never placed in the child environment. Gated
+    // on DLP/proxy egress, like canaries.
+    let mut fake_env: Vec<(String, String)> = Vec::new();
+    let mut secret_swaps: Vec<can_proxy::server::SecretSwap> = Vec::new();
+    if dlp_enabled {
+        for fs in dlp_config.map(|d| d.fake_secrets.as_slice()).unwrap_or(&[]) {
+            let Ok(real) = std::env::var(&fs.env) else {
+                tracing::warn!(
+                    env = %fs.env,
+                    "fake_secrets: host env var not set; skipping (sandbox will not receive it)"
+                );
+                continue;
+            };
+            let Some(fake) = can_dlp::generate_fake(&fs.credential) else {
+                tracing::warn!(
+                    env = %fs.env,
+                    credential = %fs.credential,
+                    "fake_secrets: unknown credential (no generatable pattern); skipping"
+                );
+                continue;
+            };
+            fake_env.push((fs.env.clone(), fake.clone()));
+            secret_swaps.push(can_proxy::server::SecretSwap {
+                fake,
+                real,
+                detector: fs.credential.clone(),
+            });
+        }
+        if !fake_env.is_empty() {
+            tracing::info!(
+                count = fake_env.len(),
+                "DLP fake secrets active (real values held by proxy)"
+            );
+        }
+    }
+
     // Create pipes for parent-child synchronization.
     //
     // The protocol has two phases:
@@ -247,6 +287,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                     dns_cache.clone(),
                     opts.monitor,
                     canary_values.clone(),
+                    secret_swaps,
                 ) {
                     Ok((addr, port)) => {
                         dns_addr = addr;
@@ -312,6 +353,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 proxy_ca,
                 dns_cache,
                 canary_set.as_ref(),
+                &fake_env,
             );
             match result {
                 Ok(()) => std::process::exit(0),
@@ -332,6 +374,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 /// plus a shared TTL-aware DNS cache used by proxy/notifier components.
 ///
 /// Returns the DNS address configured inside the namespace by pasta.
+#[allow(clippy::too_many_arguments)]
 fn setup_parent_network(
     child_pid: u32,
     config: &SandboxConfig,
@@ -340,6 +383,7 @@ fn setup_parent_network(
     _dns_cache: Option<DnsCache>,
     monitor: bool,
     canary_values: Vec<String>,
+    secret_swaps: Vec<can_proxy::server::SecretSwap>,
 ) -> Result<(String, u16), can_net::NetError> {
     if !can_net::pasta::is_available() {
         tracing::warn!(
@@ -426,7 +470,8 @@ fn setup_parent_network(
                         .with_proxy_config(config.proxy.clone())
                         .with_strict(config.strict)
                         .with_monitor(monitor)
-                        .with_canaries(canary_values);
+                        .with_canaries(canary_values)
+                        .with_secret_swaps(secret_swaps);
                     if let Some(target) = host_loopback_target {
                         proxy_server_config = proxy_server_config.with_host_loopback_target(target);
                     }
@@ -513,6 +558,7 @@ fn child_entry(
     proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
     dns_cache: Option<DnsCache>,
     canary_set: Option<&can_dlp::CanarySet>,
+    fake_env: &[(String, String)],
 ) -> Result<(), NamespaceError> {
     // Build clone flags for the first unshare: user + PID [+ net] namespaces.
     //
@@ -920,6 +966,17 @@ fn child_entry(
             if let Ok(e) = CString::new(format!("{key}={val}")) {
                 filtered_env.push(e);
             }
+        }
+    }
+
+    // Inject fake secrets under their real env-var names. Remove any
+    // same-named entry first (e.g. one that arrived via env_passthrough)
+    // so the real host value can never reach the sandbox — only the fake.
+    for (name, fake) in fake_env {
+        let prefix = format!("{name}=");
+        filtered_env.retain(|e| !e.to_bytes().starts_with(prefix.as_bytes()));
+        if let Ok(e) = CString::new(format!("{name}={fake}")) {
+            filtered_env.push(e);
         }
     }
 

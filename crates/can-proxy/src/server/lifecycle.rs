@@ -11,6 +11,7 @@ use tracing::{error, info};
 use super::dlp_ctx::DlpCtx;
 use super::limits::ProxyLimits;
 use super::request::handle_proxy_request;
+use super::secret_swap::SecretSwap;
 use crate::ca::DynamicCa;
 use crate::contracts::ContractTable;
 use crate::policy::OutboundPolicy;
@@ -39,6 +40,10 @@ pub struct ProxyServerConfig {
     /// the sandbox after `setns()` when `network.allow_host_loopback`
     /// is `true`; used to resolve the `host.canister.local` alias.
     pub host_loopback_target: Option<std::net::IpAddr>,
+    /// Fake→real env-var secret substitutions. The sandbox holds only the
+    /// fakes; the proxy swaps in the real value on egress to an authorized
+    /// host. Empty unless `[network.dlp] fake_secrets` is configured.
+    pub secret_swaps: Vec<SecretSwap>,
 }
 
 impl ProxyServerConfig {
@@ -52,6 +57,7 @@ impl ProxyServerConfig {
             canaries: Vec::new(),
             hosts: Vec::new(),
             host_loopback_target: None,
+            secret_swaps: Vec::new(),
         }
     }
 
@@ -87,6 +93,11 @@ impl ProxyServerConfig {
 
     pub fn with_host_loopback_target(mut self, target: std::net::IpAddr) -> Self {
         self.host_loopback_target = Some(target);
+        self
+    }
+
+    pub fn with_secret_swaps(mut self, secret_swaps: Vec<SecretSwap>) -> Self {
+        self.secret_swaps = secret_swaps;
         self
     }
 }

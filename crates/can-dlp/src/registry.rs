@@ -276,7 +276,14 @@ pub const REGISTRY: &[DetectorDef] = &[
         default_action: DetectorAction::Block,
         home_domains: &["*.slack.com"],
         scope_policy: ScopePolicy::HomeAndScopes,
-        canary: None,
+        canary: Some(CanarySpec {
+            env_var: "CANISTER_CANARY_SLACK_TOKEN",
+            // Fixed `xoxb-` + two zero-filled numeric groups so the random
+            // tail lands where the regex expects the 24-char secret.
+            prefix: "xoxb-000000000000-000000000000-",
+            random_len: 24,
+            charset: Charset::Alnum,
+        }),
         test_vectors: &[
             TestVector {
                 input: "xoxb-111111111111-222222222222-AAAAAAAAAAAAAAAAAAAAAAAA",
@@ -319,7 +326,12 @@ pub const REGISTRY: &[DetectorDef] = &[
         default_action: DetectorAction::Block,
         home_domains: &["api.openai.com"],
         scope_policy: ScopePolicy::HomeAndScopes,
-        canary: None,
+        canary: Some(CanarySpec {
+            env_var: "CANISTER_CANARY_OPENAI_KEY",
+            prefix: "sk-",
+            random_len: 48,
+            charset: Charset::Alnum,
+        }),
         test_vectors: &[
             TestVector {
                 input: "sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -342,7 +354,12 @@ pub const REGISTRY: &[DetectorDef] = &[
         default_action: DetectorAction::Block,
         home_domains: &["api.anthropic.com"],
         scope_policy: ScopePolicy::HomeAndScopes,
-        canary: None,
+        canary: Some(CanarySpec {
+            env_var: "CANISTER_CANARY_ANTHROPIC_KEY",
+            prefix: "sk-ant-api03-",
+            random_len: 32,
+            charset: Charset::Alnum,
+        }),
         test_vectors: &[
             TestVector {
                 input: "sk-ant-api03-Az_-Az_-Az_-Az_-Az_-Az_-Az_-Az_-Az_-Az_-",
@@ -394,7 +411,12 @@ pub const REGISTRY: &[DetectorDef] = &[
         default_action: DetectorAction::Block,
         home_domains: &["api.stripe.com"],
         scope_policy: ScopePolicy::HomeAndScopes,
-        canary: None,
+        canary: Some(CanarySpec {
+            env_var: "CANISTER_CANARY_STRIPE_KEY",
+            prefix: "sk_live_",
+            random_len: 32,
+            charset: Charset::Alnum,
+        }),
         test_vectors: &[
             TestVector {
                 input: "sk_live_AAAAAAAAAAAAAAAAAAAAAAAA",

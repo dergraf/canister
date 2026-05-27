@@ -15,7 +15,7 @@ pub mod streaming;
 pub mod transforms;
 pub mod unescape;
 
-pub use canary::CanarySet;
+pub use canary::{CanarySet, generate_fake};
 pub use detectors::{DetectorAction, DetectorId, PatternSet};
 pub use entropy::{PerHostEntropyBudget, SessionEntropyBudget};
 pub use error::DlpError;

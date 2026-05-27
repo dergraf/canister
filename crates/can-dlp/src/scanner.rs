@@ -38,6 +38,20 @@ impl DlpScanner {
         &self.patterns
     }
 
+    /// Whether `detector_id`'s credential is authorized to flow to
+    /// `host` under the current scope table (home domains +
+    /// `[[host]] allow_credentials`). The fake-secret swap uses this as
+    /// its single authorization gate: it swaps a fake for the real value
+    /// only where this returns `true`, independent of enforcement mode —
+    /// so monitor mode never leaks a real secret to an unauthorized host.
+    /// Unknown ids return `false` (fail closed).
+    pub fn credential_allowed(&self, detector_id: &str, host: &str) -> bool {
+        match crate::registry::lookup(detector_id) {
+            Some(def) => self.scopes.is_allowed(DetectorId::new(def.id), host),
+            None => false,
+        }
+    }
+
     /// Whether a given detector's verdict for `host` should escalate to
     /// a block under the scanner's current scope configuration. The
     /// streaming path uses this because it doesn't go through

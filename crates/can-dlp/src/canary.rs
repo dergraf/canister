@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::registry::{Charset, REGISTRY};
+use crate::registry::{Charset, REGISTRY, lookup};
 
 /// One generated canary: which detector it belongs to, where it lives
 /// in the worker's env, and its random value.
@@ -62,6 +62,30 @@ impl CanarySet {
     pub fn entries(&self) -> impl Iterator<Item = &CanaryValue> {
         self.values.iter()
     }
+}
+
+/// Generate a *fake* credential value matching `detector_id`'s pattern,
+/// for the env-var fake-secret swap (`[network.dlp] fake_secrets`). The
+/// value is shaped by the detector's [`crate::registry::CanarySpec`] so
+/// it fires that detector's regex — exactly the property that lets the
+/// scanner block it when it flows to an unauthorized host.
+///
+/// Returns `None` when the detector is unknown or has no generation spec.
+/// Callers fail safe by leaving the variable unset (never injecting the
+/// real secret) rather than substituting an unrecognizable fake.
+///
+/// Distinct from [`CanarySet`]: a faked secret is injected under the
+/// *real* env-var name and is swappable at authorized hosts, whereas a
+/// canary is a pure honeypot injected under `CANISTER_CANARY_*` and never
+/// swapped.
+pub fn generate_fake(detector_id: &str) -> Option<String> {
+    let spec = lookup(detector_id)?.canary?;
+    let mut rng = rand::thread_rng();
+    let random = match spec.charset {
+        Charset::Alnum => random_alnum(&mut rng, spec.random_len),
+        Charset::UpperAlnum => random_upper_alnum(&mut rng, spec.random_len),
+    };
+    Some(format!("{}{}", spec.prefix, random))
 }
 
 fn random_alnum(rng: &mut impl Rng, len: usize) -> String {
@@ -155,6 +179,33 @@ mod tests {
                 av.detector_id
             );
         }
+    }
+
+    #[test]
+    fn generate_fake_fires_its_detector() {
+        // A faked secret must match its credential detector's regex so the
+        // scanner can block it when it flows to an unauthorized host.
+        let ps = PatternSet::new().unwrap();
+        for def in REGISTRY {
+            if def.canary.is_none() {
+                continue;
+            }
+            let fake = generate_fake(def.id)
+                .unwrap_or_else(|| panic!("generate_fake returned None for {}", def.id));
+            let findings = ps.scan(&fake);
+            assert!(
+                findings.iter().any(|f| f.detector.as_str() == def.id),
+                "fake for {} (value={fake:?}) did not fire its own detector",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn generate_fake_unknown_detector_is_none() {
+        assert!(generate_fake("no_such_detector").is_none());
+        // `bearer_token` is a real detector but has no canary/generation spec.
+        assert!(generate_fake("bearer_token").is_none());
     }
 
     #[test]

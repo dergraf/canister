@@ -26,6 +26,9 @@ pub(super) struct DlpCtx {
     /// Layer cap for `decode_layers` calls outside `DlpScanner` —
     /// specifically the response-side canary scan.
     pub(super) max_decode_depth: usize,
+    /// Fake→real env-var secret substitutions, applied to authorized
+    /// egress just before forwarding. Empty unless `fake_secrets` is set.
+    pub(super) swaps: Arc<Vec<super::secret_swap::SecretSwap>>,
 }
 
 impl DlpCtx {
@@ -96,6 +99,7 @@ impl DlpCtx {
             dns_entropy_threshold: dns_threshold,
             canaries: Arc::new(canary_bytes),
             max_decode_depth: max_depth,
+            swaps: Arc::new(config.secret_swaps.clone()),
         }))
     }
 }
