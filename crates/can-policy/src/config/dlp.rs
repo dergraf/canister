@@ -43,6 +43,29 @@ pub struct DlpConfig {
     /// requests are blocked. Default: 8192.
     #[serde(default)]
     pub session_entropy_budget: Option<u64>,
+
+    /// Env-var secrets the sandbox should never see in cleartext. For
+    /// each entry the sandbox is given a *fake* value (matching the
+    /// named credential's format); the proxy swaps it for the real host
+    /// value only on egress to a host authorized for that credential
+    /// (`[[host]] allow_credentials` / the detector's home domains). A
+    /// secret the sandbox encrypts and exfiltrates therefore only ever
+    /// leaks the useless fake. See `docs/refusals.md`.
+    #[serde(default)]
+    pub fake_secrets: Vec<FakeSecret>,
+}
+
+/// One env-var secret to fake-and-swap. `env` is the variable name the
+/// real secret normally arrives in (e.g. `GITHUB_TOKEN`); `credential`
+/// is the DLP detector id (e.g. `github_pat`) that classifies it. The
+/// detector governs both fake generation (the fake matches its pattern)
+/// and swap authorization (the fake is swapped wherever that detector is
+/// in scope).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FakeSecret {
+    pub env: String,
+    pub credential: String,
 }
 
 impl DlpConfig {
@@ -92,8 +115,24 @@ impl DlpConfig {
             session_entropy_budget: overlay
                 .session_entropy_budget
                 .or(self.session_entropy_budget),
+            fake_secrets: merge_fake_secrets(self.fake_secrets, overlay.fake_secrets),
         }
     }
+}
+
+/// Union two `fake_secrets` lists keyed by `env`: base order is
+/// preserved, and an overlay entry for an already-declared `env`
+/// overrides its `credential` (last-Some-wins, matching the rest of the
+/// DLP merge) rather than producing two conflicting fakes for one var.
+fn merge_fake_secrets(base: Vec<FakeSecret>, overlay: Vec<FakeSecret>) -> Vec<FakeSecret> {
+    let mut out = base;
+    for o in overlay {
+        match out.iter_mut().find(|e| e.env == o.env) {
+            Some(existing) => existing.credential = o.credential,
+            None => out.push(o),
+        }
+    }
+    out
 }
 
 /// Lift `DlpConfig::merge_inner` over `Option<DlpConfig>`. The DLP

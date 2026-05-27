@@ -24,6 +24,7 @@ mod passthrough;
 mod request;
 mod response_scan;
 mod responses;
+mod secret_swap;
 mod stream_scan;
 mod tunnel;
 mod upstream;
@@ -31,3 +32,4 @@ mod util;
 
 pub use lifecycle::{ProxyError, ProxyServer, ProxyServerConfig};
 pub use limits::ProxyLimits;
+pub use secret_swap::SecretSwap;
