@@ -577,35 +577,44 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
 }
 
 /// Remove the SELinux policy module.
+///
+/// `semodule -r canister` deletes the `canister_t` type that *this* process is
+/// running as (the binary transitions into it), after which the kernel denies
+/// any further operation from our now-undefined context. So every side effect
+/// we own — reference-file cleanup, logging — happens *before* the removal, we
+/// inherit stdio with `.status()` rather than capturing pipes (which we'd have
+/// to read back after the context is gone), and `semodule -r` is the last
+/// fallible step with no I/O after it.
 fn remove_module() -> Result<(), SetupError> {
     if !is_module_loaded() {
         return Err(SetupError::NotInstalled);
     }
 
-    let output = std::process::Command::new("semodule")
-        .args(["-r", MODULE_NAME])
-        .output()
-        .map_err(|e| SetupError::Command {
-            cmd: "semodule -r".to_string(),
-            source: e,
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SetupError::ToolFailed {
-            tool: "semodule -r".to_string(),
-            stderr: stderr.to_string(),
-        });
-    }
-
-    // Clean up reference file.
+    // Clean up the reference copy and log *before* the destructive step.
     let _ = std::fs::remove_file(POLICY_REF_PATH);
     // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path; parent()
     // is always Some.
     let ref_dir = Path::new(POLICY_REF_PATH).parent().unwrap();
     let _ = std::fs::remove_dir(ref_dir);
+    tracing::info!("removing SELinux policy module");
 
-    tracing::info!("SELinux policy module removed");
+    let status = std::process::Command::new("semodule")
+        .args(["-r", MODULE_NAME])
+        .status()
+        .map_err(|e| SetupError::Command {
+            cmd: "semodule -r".to_string(),
+            source: e,
+        })?;
+
+    // If removal failed the module (and canister_t) are still present, so the
+    // context is intact and the caller can safely report this error.
+    if !status.success() {
+        return Err(SetupError::ToolFailed {
+            tool: "semodule -r".to_string(),
+            stderr: format!("semodule -r exited with status {status}"),
+        });
+    }
+
     Ok(())
 }
 
