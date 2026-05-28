@@ -16,7 +16,7 @@
 #
 #   recipes = ["git", "gh", "github"]
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest.
 
 [recipe]
 name = "gh"
@@ -29,7 +29,7 @@ suggests = ["git", "github"]
 # hosts.yml lives there and contains the OAuth token. Mount only the
 # user preferences file. `gh` falls back to defaults if config.yml is
 # absent on the host, so this is safe to declare.
-allow = [
+read = [
     "$HOME/.config/gh/config.yml",
 ]
 deny = [

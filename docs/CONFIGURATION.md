@@ -4,7 +4,7 @@ Canister uses TOML configuration files with strict schema validation. Unknown
 fields are rejected at parse time.
 
 When no config file is provided (`can run -- command`), default policy uses
-**proxy-only egress** with strict filesystem defaults and the default seccomp baseline.
+**proxy egress** with strict filesystem defaults and the default seccomp baseline.
 
 ## Table of Contents
 
@@ -26,6 +26,7 @@ When no config file is provided (`can run -- command`), default policy uses
 - [process](#process)
 - [resources](#resources)
 - [syscalls](#syscalls)
+- [unsafe](#unsafe)
 - [proxy](#proxy)
 - [Strict Mode](#strict-mode)
 - [Monitor Mode](#monitor-mode)
@@ -52,7 +53,7 @@ recipes = ["neovim", "elixir", "nix"]
 command = "nvim"
 
 [sandbox.dev.filesystem]
-allow_write = ["$HOME/.local/share/nvim"]
+write = ["$HOME/.local/share/nvim"]
 
 [[sandbox.dev.host]]
 domain = "api.myproject.dev"
@@ -87,12 +88,13 @@ cpu_percent = 100
 Each sandbox can include optional override sections that merge on top of the
 composed recipes. These use the same schema as recipe files:
 
-- `[sandbox.<name>.filesystem]` — `allow`, `allow_write`, `deny`
-- `[sandbox.<name>.network]` — `egress`, `allow_ips`, `ports`, `contract_mode`
+- `[sandbox.<name>.filesystem]` — `read`, `write`, `deny`
+- `[sandbox.<name>.network]` — `egress` (`none`/`proxy`), `contract_mode`
 - `[[sandbox.<name>.host]]` — one or more per-destination contracts (see [`[[host]]`](#host) below)
-- `[sandbox.<name>.process]` — `max_pids`, `allow_execve`, `env_passthrough`
+- `[sandbox.<name>.process]` — `max_pids`, `exec`, `env_passthrough`
 - `[sandbox.<name>.resources]` — `memory_mb`, `cpu_percent`
-- `[sandbox.<name>.syscalls]` — `allow_extra`, `deny_extra`, `seccomp_mode`, `notifier`
+- `[sandbox.<name>.syscalls]` — `allow_extra`, `deny_extra`, `notifier`
+- `[sandbox.<name>.unsafe]` — isolation-weakening knobs (see [`[unsafe]`](#unsafe)); the manifest is the trusted place to opt into these
 
 Overrides follow the same [merge semantics](#merge-semantics) as recipe
 composition: Vec fields are unioned, scalar fields use last-Some-wins,
@@ -199,8 +201,8 @@ When multiple recipes are merged, each field type follows a specific strategy:
 |---|---|---|
 | `Vec` fields (paths, domains, syscalls, env vars) | **Union** — deduplicated, order preserved | Two recipes allowing `/a` and `/b` → `["/a", "/b"]` |
 | `strict` (`Option<bool>`) | **OR** — any `Some(true)` wins, can never be loosened | Recipe A: `strict = true`, Recipe B: omitted → `true` |
-| `egress` (`Option<EgressMode>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `egress = "proxy-only"`, Recipe B: `egress = "direct"` → `direct` |
-| `seccomp_mode` (`Option<SeccompMode>`) | **Last-Some-wins** | Same as `egress` |
+| `egress` (`Option<EgressMode>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `egress = "none"`, Recipe B: `egress = "proxy"` → `proxy` |
+| `[unsafe]` fields (bools / vecs) | **OR / union** — security-monotonic, a weakening in any layer stays | Recipe A: `host_loopback = true`, Recipe B: omitted → `true` |
 | Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-Some-wins** | Recipe A: `max_pids = 64`, Recipe B: `max_pids = 128` → `128` |
 | `RecipeMeta` | **Overlay** — later recipe's metadata wins if present | — |
 
@@ -247,13 +249,13 @@ Recipe paths support environment variable expansion:
 | `${XDG_CONFIG_HOME}` | Value of `$XDG_CONFIG_HOME` |
 | `$$` | Literal `$` |
 
-Expansion applies to `[filesystem].allow`, `[filesystem].deny`,
-`[process].allow_execve`, and `[recipe].match_prefix`. It is performed
+Expansion applies to `[filesystem].read`, `[filesystem].deny`,
+`[process].exec`, and `[recipe].match_prefix`. It is performed
 during config resolution (after merge, before the sandbox uses the paths).
 
 ```toml
 [filesystem]
-allow = ["$HOME/.cargo", "$HOME/.rustup", "$HOME/project"]
+read = ["$HOME/.cargo", "$HOME/.rustup", "$HOME/project"]
 
 [recipe]
 match_prefix = ["$HOME/.cargo"]
@@ -291,12 +293,17 @@ paths and essential system paths are bind-mounted read-only.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allow` | `string[]` | `[]` | Paths to bind-mount read-only into the sandbox |
-| `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** allow) |
+| `read` | `string[]` | `[]` | Paths bind-mounted **read-only** into the sandbox |
+| `write` | `string[]` | `[]` | Paths bind-mounted **writable** — changes persist on the host |
+| `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** `read`/`write`) |
+
+Note: read access still matters — a *readable* credential file is exactly
+what the DLP layer exists to stop from leaving. `read` names the grant
+honestly; `write` is the one that persists to the host.
 
 **Behavior:**
 
-- Deny rules take precedence over allow rules.
+- Deny rules take precedence over `read`/`write` rules.
 - Paths are matched by prefix: allowing `/usr/lib` also allows `/usr/lib/python3`.
 - Essential paths are defined in `recipes/base.toml` (embedded in the binary,
   overridable on disk) and always bind-mounted: `/bin`, `/sbin`, `/usr/bin`,
@@ -312,7 +319,8 @@ paths and essential system paths are bind-mounted read-only.
 
 ```toml
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/tmp/workspace", "/home/user/data"]
+read  = ["/usr/lib", "/usr/bin", "/home/user/data"]
+write = ["/tmp/workspace"]
 deny  = ["/etc/shadow", "/etc/passwd", "/root", "/home/user/.ssh"]
 ```
 
@@ -336,21 +344,21 @@ sandbox. Each package manager has a recipe with `match_prefix` patterns:
 1. The command path is **canonicalized** (all symlinks resolved) at startup.
 2. Each discovered recipe's `match_prefix` is checked against the resolved path.
 3. Matching recipes are merged into the composition chain, bringing their
-   `[filesystem].allow` paths, `[process].allow_execve` entries, and any
+   `[filesystem].read` paths, `[process].exec` entries, and any
    other policy fields.
 4. For content-addressed stores like `/nix/store`, the entire tree is mounted.
    Binaries reference sibling store entries freely, making individual-entry
    mounting impractical.
 
 **Security note:** Auto-detection makes the prefix *visible* inside the
-sandbox but does not grant execution permission. The `[process] allow_execve`
-list independently controls what binaries can be executed. Package
-manager recipes include `allow_execve` prefix rules (e.g., `/nix/store/*`)
-to authorize execution within the mounted tree.
+sandbox but does not grant execution permission. The `[process] exec`
+policy independently controls what binaries can be executed. Package
+manager recipes that restrict exec use `exec = ["/nix/store/*", …]`
+prefix rules to authorize execution within the mounted tree.
 
 **Adding a new package manager:** Create a new `.toml` recipe with
-appropriate `match_prefix`, `[filesystem].allow`, and
-`[process].allow_execve` entries. No Rust code changes needed.
+appropriate `match_prefix`, `[filesystem].read`, and (if restricting
+exec) `[process].exec` entries. No Rust code changes needed.
 
 ---
 
@@ -361,10 +369,12 @@ explicitly allowed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `egress` | `"proxy-only" \| "none" \| "direct"` | `"proxy-only"` | Outbound networking mode |
-| `allow_ips` | `string[]` | `[]` | Allowed IPs or CIDR ranges (IPv4 and IPv6) |
-| `ports` | `string[]` | `[]` | Port forwarding specs (`[ip:]hostPort:containerPort[/protocol]`) |
+| `egress` | `"proxy" \| "none"` | `"proxy"` | Outbound networking mode. Unfiltered/direct egress is `[unsafe] unfiltered_egress` (it disables DLP + contract gates). |
 | `contract_mode` | `"strict" \| "relaxed"` | `"strict"` | Default for hosts without a `[[host]]` block. `strict` refuses; `relaxed` allows + logs. |
+
+IP-literal egress (`reachable_ips`) and port forwarding (`expose_ports`)
+moved to [`[unsafe]`](#unsafe): both bypass the per-host contract and DLP
+gates, so they are quarantined where the cost is visible.
 
 FQDN egress goes through the top-level [`[[host]]`](#host) table, not
 this section. Each `[[host]]` block names a domain and the request
@@ -377,11 +387,12 @@ The effective egress mode determines isolation behavior:
 | `egress` | Mode | Description |
 |----------|------|-------------|
 | `none` | **None** | No outbound network. Empty network namespace, loopback only. |
-| `proxy-only` | **Filtered** | Outbound traffic must go through local proxy (kernel-enforced). |
-| `direct` | **Full/Filtered** | Direct outbound. If allowlists/ports are set, filtered mode is used for policy checks; otherwise full host network namespace. |
+| `proxy` | **Filtered** | Outbound traffic must go through local proxy (kernel-enforced). |
+| `[unsafe] unfiltered_egress = true` | **Full/Filtered** | Direct outbound — **DLP and contract gates do not run**. Filtered for policy checks when `reachable_ips`/`expose_ports` are set; otherwise full host network namespace. |
 
-Specifying `ports` automatically upgrades None mode to Filtered
-mode (port forwarding requires a functional network namespace with pasta).
+Specifying `[unsafe] expose_ports` automatically upgrades None mode to
+Filtered mode (port forwarding requires a functional network namespace
+with pasta).
 
 **Domain matching:**
 
@@ -389,13 +400,13 @@ Domains are matched including subdomains. Allowing `pypi.org` also allows
 `files.pythonhosted.org` if listed, but does **not** automatically allow
 subdomains of `pypi.org`. Each domain must be listed explicitly.
 
-**IP/CIDR matching:**
+**IP/CIDR matching** (via [`[unsafe] reachable_ips`](#unsafe)):
 
 IPs support both exact match and CIDR notation:
 
 ```toml
-[network]
-allow_ips = [
+[unsafe]
+reachable_ips = [
     "93.184.216.34",        # exact IPv4
     "10.0.0.0/8",           # IPv4 CIDR
     "2606:2800:220:1::/64", # IPv6 CIDR
@@ -423,7 +434,7 @@ the namespace. DNS is handled via a link-local address:
 
 ```toml
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [[host]]
 domain = "pypi.org"
 
@@ -446,10 +457,9 @@ can run -p 127.0.0.1:3000:3000 -p 5432:5432/tcp -- my-app
 ```
 
 ```toml
-# Config usage
-[network]
-egress = "proxy-only"
-ports = ["8080:80", "127.0.0.1:3000:3000", "5353:53/udp"]
+# Config usage (port forwarding is an isolation-weakening inbound exposure)
+[unsafe]
+expose_ports = ["8080:80", "127.0.0.1:3000:3000", "5353:53/udp"]
 ```
 
 Syntax: `[ip:]hostPort:containerPort[/protocol]`
@@ -552,7 +562,7 @@ reachable. See [DLP](DLP.md) for the full threat model and detector
 list.
 
 DLP only runs when traffic is inspectable, i.e. when
-`network.egress = "proxy-only"`.
+`network.egress = "proxy"`.
 
 ```toml
 [network.dlp]
@@ -562,6 +572,13 @@ max_decode_depth = 32             # base64/hex/percent recursion cap
 decompress = true                 # gzip/deflate/brotli before scan
 dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
 session_entropy_budget = 8192     # cumulative high-entropy bytes/session
+
+# Env-var secrets to fake-and-swap: the sandbox runs with a fake value,
+# the proxy substitutes the real one only on egress to a host authorised
+# for that credential. See DLP.md § Fake-Secret Swap.
+fake_secrets = [
+  { env = "GITHUB_TOKEN", credential = "github_pat" },
+]
 
 # Extend credential scope by adding allow_credentials on the host:
 [[host]]
@@ -575,12 +592,13 @@ allow_credentials = ["github_pat"]
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | `bool` | `false` | Enable DLP scanning. Implicitly `true` under `--strict` when `egress = "proxy-only"`. |
+| `enabled` | `bool` | `false` | Enable DLP scanning. Implicitly `true` under `--strict` when `egress = "proxy"`. |
 | `canary_tokens` | `bool` | `true` when DLP enabled | Inject fake credentials into the sandbox env and treat any outbound appearance as exfiltration. |
 | `max_decode_depth` | `usize` | `32` | Encoding chain recursion depth (base64 / hex / percent). |
 | `decompress` | `bool` | `true` | Inflate gzip / deflate / brotli bodies before scanning. |
 | `dns_entropy_threshold` | `f64` | `4.5` | Shannon entropy per DNS label above which the hostname is blocked. |
 | `session_entropy_budget` | `u64` | `8192` | Cumulative high-entropy bytes allowed across one sandbox session before further requests are blocked. |
+| `fake_secrets` | `{ env, credential }[]` | `[]` | Env-var secrets the sandbox never sees in cleartext: it receives a fake matching `credential`'s pattern, and the proxy swaps in the real host value only on egress to a host authorised for that credential. `credential` must be a detector with a generatable pattern (`github_pat`, `npm_token`, `openai_key`, `anthropic_key`, `slack_token`, `stripe_key`). Dropped for untrusted recipes, like `allow_credentials`. See [DLP](DLP.md#fake-secret-swap). |
 
 Credential-flow scope is configured per host via the
 `allow_credentials` field on [`[[host]]`](#host).
@@ -617,7 +635,7 @@ enabled.
 
 ### Interaction with `--strict` / `--monitor`
 
-- `--strict` implicitly enables DLP (when `egress = "proxy-only"`) and
+- `--strict` implicitly enables DLP (when `egress = "proxy"`) and
   promotes `generic_high_entropy` from `warn` to `block`.
 - `--monitor` logs DLP findings at `warn!` level but forwards the
   request, adding an `x-canister-dlp-warning` header so the sandboxed
@@ -636,7 +654,7 @@ Controls process creation, environment filtering, and executable restrictions.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_pids` | `int` (optional) | none | Maximum number of processes (via `RLIMIT_NPROC`) |
-| `allow_execve` | `string[]` | `[]` | Executables the sandbox may exec (empty = allow all) |
+| `exec` | `"any" \| "entrypoint-only" \| string[]` | `"any"` | Which binaries may be exec'd. An explicit list is an allow-list (entries ending `/*` are prefix rules). |
 | `env_passthrough` | `string[]` | `[]` | Environment variables to pass from host (all others stripped) |
 
 **PID namespace isolation:**
@@ -661,10 +679,14 @@ returns `EAGAIN`. This is a per-UID limit, which is effective inside the
 sandbox's user namespace (where the process runs as UID 0 mapped to the host
 user).
 
-**`allow_execve` validation:**
+**`exec` validation:**
 
-When non-empty, the resolved command path must match one of the listed paths.
-If the command is not in the allow list, execution is rejected before forking.
+`exec = "any"` (the default) places no restriction. `exec = "entrypoint-only"`
+permits only the sandbox entrypoint command (child execs denied once the
+USER_NOTIF supervisor enforces it). An explicit list is an allow-list: the
+resolved command path must match a listed path, else execution is rejected
+before forking. (Replaces the old `allow_execve = []`-means-"any" footgun —
+an empty intent is now stated, not implied.)
 
 **Prefix rules:** Entries ending in `/*` match any binary under that
 directory tree. For example, `/nix/store/*` allows any binary whose resolved
@@ -675,15 +697,15 @@ hashes.
 
 **Ongoing enforcement:** When the USER_NOTIF supervisor is active (kernel
 5.9+, default), every `execve()` and `execveat()` call inside the sandbox is
-intercepted and validated against `allow_execve`. This means child processes
-cannot exec arbitrary binaries. When the notifier is disabled (kernel < 5.9
-or `notifier = false`), only the initial command is validated, and child
-processes can exec any binary visible in the mount namespace.
+intercepted and validated against the `exec` allow-list. This means child
+processes cannot exec arbitrary binaries. When the notifier is disabled
+(kernel < 5.9 or `notifier = false`), only the initial command is validated,
+and child processes can exec any binary visible in the mount namespace.
 
 ```toml
 [process]
 max_pids = 64
-allow_execve = ["/usr/bin/python3", "/usr/bin/pip", "/nix/store/*"]
+exec = ["/usr/bin/python3", "/usr/bin/pip", "/nix/store/*"]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM", "VIRTUAL_ENV"]
 ```
 
@@ -746,10 +768,13 @@ either IS the baseline (uses `allow`/`deny`) or EXTENDS it (uses
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `seccomp_mode` | `string` | `"allow-list"` | Seccomp mode: `"allow-list"` (default deny) or `"deny-list"` (default allow) |
-| `allow_extra` | `string[]` | `[]` | Syscalls to add to the baseline allow list |
+| `allow_extra` | `string[]` | `[]` | Syscalls to add to the baseline allow list. **Dangerous syscalls** (`ptrace`, `bpf`, `mount`, `io_uring_*`, `personality`, `seccomp`, …) are rejected here — they must go in [`[unsafe] extra_syscalls`](#unsafe). |
 | `deny_extra` | `string[]` | `[]` | Syscalls to add to the deny list (also removed from allow list) |
 | `notifier` | `bool` (optional) | auto-detect | Enable/disable the USER_NOTIF supervisor for argument-level syscall filtering |
+
+Seccomp is **always default-deny (allow-list)**. Flipping to default-allow
+(deny-list) inverts the security posture, so it is `[unsafe] seccomp_default_allow`
+rather than a `[syscalls]` field.
 
 ### Absolute fields (for `default.toml` only)
 
@@ -763,29 +788,30 @@ or `deny_extra` in the same `[syscalls]` section is a validation error.
 
 **Seccomp modes:**
 
-| Mode | Default action | Listed syscalls | Use case |
+| Mode | Default action | Listed syscalls | How to select |
 |------|---------------|-----------------|----------|
-| `allow-list` | DENY all | Only baseline + `allow_extra` syscalls permitted | Production, CI (recommended) |
-| `deny-list` | ALLOW all | Only baseline deny + `deny_extra` syscalls blocked | Compatibility, unknown workloads |
+| allow-list | DENY all | Only baseline + `allow_extra` permitted | Default (recommended) |
+| deny-list | ALLOW all | Only baseline deny + `deny_extra` blocked | `[unsafe] seccomp_default_allow = true` |
 
 **Examples:**
 
 ```toml
-# Elixir/BEAM: needs ptrace for observer/dbg/recon
+# Add a benign syscall to the baseline allow list.
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 
-# Strict: also block personality for extra hardening
+# Block personality for extra hardening (deny is always fine).
 [syscalls]
 deny_extra = ["personality"]
 
-# Full override: add io_uring support
-[syscalls]
-allow_extra = ["ptrace", "personality", "seccomp", "io_uring_setup", "io_uring_enter", "io_uring_register"]
+# Dangerous syscalls (ptrace, io_uring, …) are isolation-weakening and
+# must be declared explicitly in [unsafe]:
+[unsafe]
+extra_syscalls = ["ptrace", "io_uring_setup", "io_uring_enter", "io_uring_register"]
 
-# Deny-list mode for maximum compatibility
-[syscalls]
-seccomp_mode = "deny-list"
+# Default-allow seccomp (inverts the posture) is also an [unsafe] knob:
+[unsafe]
+seccomp_default_allow = true
 ```
 
 See [SECCOMP.md](SECCOMP.md) for details on the baseline syscall set and
@@ -804,10 +830,11 @@ provides argument-level filtering for `connect()`, `clone()`/`clone3()`,
 | omitted | Auto-detect: enabled if kernel >= 5.9 and not in monitor mode |
 
 When the notifier is active, `connect()` calls are filtered against the
-resolved IPs from each `[[host]].domain` and `allow_ips`, `clone()`/`clone3()` are
-blocked from creating new namespaces, `socket()` is blocked from creating
-`AF_NETLINK` or `SOCK_RAW` sockets, and `execve()`/`execveat()` are validated
-against `allow_execve` paths for every execution (not just the initial command).
+resolved IPs from each `[[host]].domain` and `[unsafe] reachable_ips`,
+`clone()`/`clone3()` are blocked from creating new namespaces, `socket()` is
+blocked from creating `AF_NETLINK` or `SOCK_RAW` sockets, and
+`execve()`/`execveat()` are validated against the `[process] exec` allow-list
+for every execution (not just the initial command).
 
 The notifier is merged using the **last-Some-wins** strategy during recipe
 composition, consistent with other `Option<bool>` scalar fields.
@@ -827,9 +854,45 @@ description.
 
 ---
 
+## `[unsafe]`
+
+Every setting that **lowers isolation below the baseline** lives here, and
+**nowhere else** — these fields are rejected in their old sections. The
+payoff: a recipe with no `[unsafe]` block is provably unable to weaken the
+sandbox, `grep -rL '\[unsafe\]' recipes/` is the audited-safe set, and `can`
+prints a one-line `⚠ unsafe` summary at runtime when any are active.
+
+| Field | Type | Default | Lowers isolation by… |
+|-------|------|---------|----------------------|
+| `unfiltered_egress` | `bool` | `false` | bypassing the proxy → **DLP and contract gates do not run** (was `egress = "direct"`) |
+| `reachable_ips` | `string[]` | `[]` | allowing IP-literal egress with no service identity — bypasses contract + DLP gates (was `[network] allow_ips`) |
+| `host_loopback` | `bool` | `false` | letting the sandbox reach host `127.0.0.1` services via `host.canister.local` (was `[network] allow_host_loopback`) |
+| `expose_ports` | `string[]` | `[]` | forwarding host ports into the sandbox — inbound exposure (was `[network] ports`) |
+| `seccomp_default_allow` | `bool` | `false` | flipping seccomp to default-**allow** (deny-list) — the inverse of the secure default (was `[syscalls] seccomp_mode = "deny-list"`) |
+| `extra_syscalls` | `string[]` | `[]` | adding high-risk syscalls (`ptrace`, `bpf`, `mount`, `io_uring_*`, …) rejected from `[syscalls] allow_extra` |
+
+**Trust:** like `[[host]] allow_credentials`, `[unsafe]` is dropped from
+*untrusted* (unpinned) recipes. Author project-specific weakenings in your
+`canister.toml` (`[sandbox.<name>.unsafe]`), which is trusted.
+
+**Validation:** declaring `unfiltered_egress` alongside DLP / `fake_secrets`
+/ `allow_credentials` is a parse error — those do nothing without the proxy.
+
+```toml
+[unsafe]
+unfiltered_egress = true              # direct egress — DLP & contracts OFF
+reachable_ips     = ["10.0.0.5/32"]
+host_loopback     = true
+expose_ports      = ["8080:80"]
+seccomp_default_allow = true
+extra_syscalls    = ["ptrace"]
+```
+
+---
+
 ## `[proxy]`
 
-L7 proxy settings used by proxy-only egress mode.
+L7 proxy settings used by proxy egress mode.
 
 ```toml
 [proxy]
@@ -846,7 +909,7 @@ upstream_request_timeout_ms = 30000  # 30 s (default)
 
 ### Enforcement semantics
 
-When `network.egress = "proxy-only"`:
+When `network.egress = "proxy"`:
 
 - sandboxed processes may only open outbound INET/INET6 connections to:
   - loopback proxy endpoint (`127.0.0.1:<proxy_port>` / `::1:<proxy_port>`)
@@ -913,7 +976,7 @@ can run --monitor --recipe my_policy.toml -- python3 script.py
 
 | Section | Normal | Monitor |
 |---------|--------|---------|
-| `[process].allow_execve` | Blocks unlisted commands | Logs warning, allows |
+| `[process].exec` | Blocks unlisted commands | Logs warning, allows |
 | `[process].env_passthrough` | Strips unlisted vars | Logs stripped count, passes all |
 | `[process].max_pids` | Enforces RLIMIT_NPROC | Logs limit, skips enforcement |
 | `[syscalls]` seccomp | Returns EPERM on denied syscalls | Logs to kernel audit, allows |
@@ -960,7 +1023,7 @@ The output is valid TOML and includes all resolved fields:
 strict = false
 
 [filesystem]
-allow = ["/bin", "/sbin", "/usr/bin", ...]
+read = ["/bin", "/sbin", "/usr/bin", ...]
 deny = ["/etc/shadow", "/etc/gshadow"]
 
 [network]
@@ -972,17 +1035,16 @@ domain = "repo.hex.pm"
 
 [[host]]
 domain = "builds.hex.pm"
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
-allow_execve = ["/nix/store/*"]
+exec = ["/nix/store/*"]
 env_passthrough = ["PATH", "HOME", ...]
 
 [resources]
 
 [syscalls]
-seccomp_mode = "allow-list"
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 ```
 
 This serves two purposes:
@@ -1018,7 +1080,7 @@ Allow pip installs from PyPI and access to a workspace directory.
 
 ```toml
 [filesystem]
-allow = [
+read = [
     "/usr/lib",
     "/usr/bin",
     "/usr/local/lib",
@@ -1027,7 +1089,7 @@ allow = [
 deny = ["/etc/shadow", "/root"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [[host]]
 domain = "pypi.org"
 
@@ -1043,7 +1105,7 @@ Allow npm registry access and a project directory.
 
 ```toml
 [filesystem]
-allow = [
+read = [
     "/usr/lib",
     "/usr/bin",
     "/usr/local",
@@ -1051,7 +1113,7 @@ allow = [
 ]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [[host]]
 domain = "registry.npmjs.org"
 
@@ -1068,7 +1130,7 @@ filesystem- and syscall-restricted.
 
 ```toml
 [filesystem]
-allow = ["/tmp/workspace"]
+read = ["/tmp/workspace"]
 
 [network]
 egress = "direct"
@@ -1080,7 +1142,7 @@ No network, no filesystem beyond essentials, strict seccomp.
 
 ```toml
 [filesystem]
-allow = ["/tmp/workspace"]
+read = ["/tmp/workspace"]
 deny  = ["/etc", "/root", "/home"]
 
 [network]
@@ -1096,21 +1158,20 @@ sandbox refuses to start. Denied syscalls kill the process immediately.
 strict = true
 
 [filesystem]
-allow = ["/tmp/workspace"]
+read = ["/tmp/workspace"]
 
 [network]
 egress = "none"
 
 [process]
 max_pids = 64
-allow_execve = ["/usr/bin/python3"]
+exec = ["/usr/bin/python3"]
 
 [resources]
 memory_mb = 512
 cpu_percent = 100
 
 [syscalls]
-seccomp_mode = "allow-list"
 ```
 
 ### Elixir/Erlang (mix tasks, iex, Phoenix)
@@ -1124,7 +1185,7 @@ name = "elixir"
 description = "Elixir/Erlang (BEAM VM) — mix, iex, Phoenix"
 
 [filesystem]
-allow = [
+read = [
     "/usr/lib",
     "/usr/bin",
     "/usr/local/lib",
@@ -1143,7 +1204,7 @@ domain = "repo.hex.pm"
 
 [[host]]
 domain = "builds.hex.pm"
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 max_pids = 256
@@ -1155,7 +1216,7 @@ env_passthrough = [
 ]
 
 [syscalls]
-allow_extra = ["ptrace"]   # BEAM tracing tools (:observer, :dbg, recon)
+allow_extra = ["statx"]   # BEAM tracing tools (:observer, :dbg, recon)
 ```
 
 Usage with composition:

@@ -10,19 +10,21 @@ use super::merge::union_vecs;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
-    /// Paths the sandboxed process is allowed to access (read-only).
+    /// Paths the sandboxed process may **read** (bind-mounted read-only).
+    /// Read access still matters: a readable secret is exactly what the
+    /// DLP layer exists to stop from leaving — name it honestly.
     #[serde(default)]
-    pub allow: Vec<PathBuf>,
+    pub read: Vec<PathBuf>,
 
-    /// Paths bind-mounted writable into the sandbox.
+    /// Paths bind-mounted **writable** into the sandbox.
     ///
     /// Use this for directories the sandboxed process must write to
     /// (e.g., database files, caches, state directories). These paths
-    /// are mounted writable — changes persist on the host.
+    /// are mounted writable — **changes persist on the host**.
     #[serde(default)]
-    pub allow_write: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
 
-    /// Paths explicitly denied (checked before allow and allow_write).
+    /// Paths explicitly denied (checked before `read` and `write`).
     #[serde(default)]
     pub deny: Vec<PathBuf>,
 
@@ -42,8 +44,8 @@ pub struct FilesystemConfig {
 impl FilesystemConfig {
     pub fn merge(self, overlay: Self) -> Self {
         Self {
-            allow: union_vecs(self.allow, overlay.allow),
-            allow_write: union_vecs(self.allow_write, overlay.allow_write),
+            read: union_vecs(self.read, overlay.read),
+            write: union_vecs(self.write, overlay.write),
             deny: union_vecs(self.deny, overlay.deny),
             mask: union_vecs(self.mask, overlay.mask),
         }

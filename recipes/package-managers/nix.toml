@@ -13,5 +13,5 @@ suggests = ["nix-home-manager"]
 [filesystem]
 # Mount the entire Nix store — binaries reference sibling entries
 # via rpaths and wrapper scripts.
-allow = ["/nix/store"]
+read = ["/nix/store"]
 

@@ -26,10 +26,10 @@ and loads it via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)` right before
 
 ### Two enforcement modes
 
-| Mode | Default action | Listed syscalls | Config value |
+| Mode | Default action | Listed syscalls | How to select |
 |------|---------------|-----------------|--------------|
-| **Allow-list** (default) | DENY | Only listed syscalls permitted | `seccomp_mode = "allow-list"` |
-| **Deny-list** | ALLOW | Only listed syscalls blocked | `seccomp_mode = "deny-list"` |
+| **Allow-list** (default) | DENY | Only listed syscalls permitted | default — no config needed |
+| **Deny-list** | ALLOW | Only listed syscalls blocked | `[unsafe] seccomp_default_allow = true` |
 
 **Allow-list mode** (recommended, default) inverts the security model:
 every syscall not explicitly in the baseline (plus `allow_extra`) is denied.
@@ -95,9 +95,8 @@ The `[syscalls]` section in a recipe TOML customizes the baseline:
 
 ```toml
 [syscalls]
-allow_extra = ["ptrace"]           # add to the allow list
+allow_extra = ["statx"]           # add to the allow list
 deny_extra  = ["personality"]      # add to deny list AND remove from allow list
-seccomp_mode = "allow-list"        # default; or "deny-list"
 ```
 
 **How overrides work:**
@@ -308,13 +307,13 @@ delivers the notification to the supervisor, regardless of what other filters re
 
 | Syscall | Argument inspected | Policy |
 |---------|-------------------|--------|
-| `connect()` | `sockaddr` (destination address) | Allow only IPs pre-resolved from each `[[host]]` block's `domain` and explicit `allow_ips`. Loopback and Unix domain sockets always allowed. |
+| `connect()` | `sockaddr` (destination address) | Allow only IPs pre-resolved from each `[[host]]` block's `domain` and explicit `reachable_ips`. Loopback and Unix domain sockets always allowed. |
 | `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution and dynamic allowlist population. Connected sockets (NULL dest_addr) allowed. |
 | `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing regardless of outbound restriction settings. |
 | `clone()` | `flags` (register value) | Deny namespace-creating flags: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` |
 | `clone3()` | `clone_args.flags` (read from userspace struct) | Same flag check as `clone()`, read from the `clone_args` struct via `/proc/<pid>/mem` |
 | `socket()` | `domain`, `type`, `protocol` (register values) | `SOCK_RAW` denied. `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only — all other netlink protocols denied. Normal TCP/UDP/Unix sockets allowed. |
-| `execve()` | `pathname` (read from userspace string) | Validate against `allow_execve` paths. If `allow_execve` is empty, allow all. |
+| `execve()` | `pathname` (read from userspace string) | Validate against `exec` paths. If `exec` is empty, allow all. |
 | `execveat()` | `pathname` (read from userspace string) | Same as `execve()`. Resolves the path relative to the `dirfd` argument. |
 
 ### TOCTOU protection
@@ -340,7 +339,7 @@ eliminates the most common race windows.
 
 For `connect()` filtering, the supervisor supports both exact IP matches and CIDR
 range matches (e.g., `10.0.0.0/8`, `2606:2800:220:1::/64`). The resolved IPs from
-each `[[host]]` block's `domain` are combined with any `allow_ips` CIDR ranges
+each `[[host]]` block's `domain` are combined with any `reachable_ips` CIDR ranges
 from the config to build the allowlist. Loopback addresses (`127.0.0.0/8`,
 `::1`) and `AF_UNIX` sockets are always permitted.
 
@@ -427,8 +426,7 @@ strict = false
 allow = ["/bin", "/sbin", ...]
 
 [syscalls]
-seccomp_mode = "allow-list"
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 ...
 ```
 

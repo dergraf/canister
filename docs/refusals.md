@@ -7,7 +7,7 @@ read the body.
 
 | Class                | Status                | `x-canister-error`        | Cause                                              |
 | -------------------- | --------------------- | ------------------------- | -------------------------------------------------- |
-| Connect refusal      | `502 Bad Gateway`     | `policy-blocked`          | Host wasn't reachable at all (no `[[host]]`, IP outside `allow_ips`) |
+| Connect refusal      | `502 Bad Gateway`     | `policy-blocked`          | Host wasn't reachable at all (no `[[host]]`, IP outside `reachable_ips`) |
 | Contract refusal     | `415` or `413`        | `contract-refused`        | Host *is* reachable but the request *shape* isn't allowed |
 | DLP detection        | `451 …Legal Reasons`  | `dlp-blocked`             | A credential / canary fired the regex             |
 | Upstream timeout     | `504 Gateway Timeout` | `upstream-timeout`        | Upstream didn't respond in time                   |
@@ -94,6 +94,25 @@ methods           = ["GET", "POST", "PATCH", "PUT", "DELETE"]
 content_types     = ["application/json"]
 allow_credentials = ["github_pat"]   # treat as a github_pat home
 ```
+
+### Fake secrets and the swap
+
+When a recipe declares `[network.dlp] fake_secrets` for an env-var
+secret (e.g. `GITHUB_TOKEN`), the sandbox only ever holds a **fake**
+value. What you observe at the proxy depends on the destination:
+
+- **Authorised host** (the credential's home domain or an
+  `allow_credentials` entry): the request goes through. The proxy
+  transparently swaps the fake for the real value before forwarding —
+  the sandboxed tool works as if it had the real token.
+- **Unauthorised host**: the fake matches its detector's regex and is
+  refused with `451 dlp-blocked`, the same as a real credential would
+  be. The real value never leaves the proxy.
+
+So a `451 dlp-blocked` naming a faked credential means the sandbox tried
+to send its (fake) token somewhere it isn't authorised. The fix is the
+same as above — add the host to `allow_credentials` if the credential
+legitimately belongs there. See [DLP](DLP.md#fake-secret-swap).
 
 ## I just want to debug something quickly
 

@@ -27,15 +27,15 @@ pub fn check_path(path: &Path, config: &FilesystemConfig) -> AccessDecision {
         }
     }
 
-    // Check allow list (read-only).
-    for allowed in &config.allow {
+    // Check read list (read-only).
+    for allowed in &config.read {
         if path.starts_with(allowed) {
             return AccessDecision::Allow;
         }
     }
 
-    // Check allow_write list (writable).
-    for allowed in &config.allow_write {
+    // Check write list (writable).
+    for allowed in &config.write {
         if path.starts_with(allowed) {
             return AccessDecision::Allow;
         }
@@ -110,8 +110,8 @@ mod tests {
     #[test]
     fn path_allowed() {
         let config = FilesystemConfig {
-            allow: vec![PathBuf::from("/usr/lib"), PathBuf::from("/tmp/workspace")],
-            allow_write: vec![],
+            read: vec![PathBuf::from("/usr/lib"), PathBuf::from("/tmp/workspace")],
+            write: vec![],
             deny: vec![],
             mask: vec![],
         };
@@ -132,8 +132,8 @@ mod tests {
     #[test]
     fn path_deny_overrides_allow() {
         let config = FilesystemConfig {
-            allow: vec![PathBuf::from("/etc")],
-            allow_write: vec![],
+            read: vec![PathBuf::from("/etc")],
+            write: vec![],
             deny: vec![PathBuf::from("/etc/shadow")],
             mask: vec![],
         };

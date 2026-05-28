@@ -15,7 +15,7 @@
 use std::ffi::CString;
 use std::path::Path;
 
-use can_policy::config::ProcessConfig;
+use can_policy::config::{ExecPolicy, ProcessConfig};
 
 /// Errors from process control operations.
 #[derive(Debug, thiserror::Error)]
@@ -103,25 +103,27 @@ pub fn filter_environment(config: &ProcessConfig) -> Vec<CString> {
     env
 }
 
-/// Validate that the resolved command path is in the `allow_execve` list.
+/// Validate that the resolved command path is permitted by the exec policy.
 ///
-/// If `allow_execve` is empty, all commands are allowed (no restriction).
-/// If non-empty, the command's canonical path must match one of the entries.
-///
-/// Entries ending in `/*` are treated as **prefix rules**: any executable
-/// whose canonical path starts with the directory prefix is allowed.
-/// For example, `/nix/store/*` allows any binary under `/nix/store/`.
+/// - `exec = "any"`: all commands allowed (no restriction).
+/// - `exec = "entrypoint-only"`: the initial command is always allowed
+///   (it *is* the entrypoint); child-exec denial is enforced by the
+///   USER_NOTIF supervisor once that lands, so today this validates like
+///   `any` for the initial exec.
+/// - `exec = [paths]`: the command's canonical path must match an entry.
+///   Entries ending in `/*` are **prefix rules** (e.g. `/nix/store/*`).
 pub fn validate_execve(command_path: &Path, config: &ProcessConfig) -> Result<(), ProcessError> {
-    if config.allow_execve.is_empty() {
-        return Ok(());
-    }
+    let allow_list = match config.exec() {
+        ExecPolicy::Mode(_) => return Ok(()),
+        ExecPolicy::Allow(paths) => paths,
+    };
 
     // Canonicalize the command path for comparison.
     let canonical = command_path
         .canonicalize()
         .unwrap_or_else(|_| command_path.to_path_buf());
 
-    for allowed in &config.allow_execve {
+    for allowed in &allow_list {
         let allowed_str = allowed.as_os_str().to_string_lossy();
 
         if let Some(prefix) = allowed_str.strip_suffix("/*") {
@@ -276,7 +278,7 @@ mod tests {
     fn filter_env_empty_passthrough_clears_all() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![],
+            exec: None,
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -291,7 +293,7 @@ mod tests {
 
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![],
+            exec: None,
             env_passthrough: vec![
                 "CANISTER_TEST_VAR".to_string(),
                 "NONEXISTENT_VAR".to_string(),
@@ -330,7 +332,7 @@ mod tests {
 
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![],
+            exec: None,
             env_passthrough: vec!["PATH".to_string()],
             env: std::collections::HashMap::new(),
         };
@@ -351,7 +353,7 @@ mod tests {
     fn validate_execve_empty_allow_list_permits_all() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![],
+            exec: None,
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -362,7 +364,7 @@ mod tests {
     fn validate_execve_allows_listed_command() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/bin/echo")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/bin/echo")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -374,7 +376,7 @@ mod tests {
     fn validate_execve_rejects_unlisted_command() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/bin/echo")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/bin/echo")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -387,7 +389,7 @@ mod tests {
     fn validate_execve_prefix_allows_nested_binary() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/nix/store/*")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -400,7 +402,7 @@ mod tests {
     fn validate_execve_prefix_rejects_outside_path() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/nix/store/*")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -414,7 +416,7 @@ mod tests {
         // because "store-extra" != "store".
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/nix/store/*")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/nix/store/*")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -429,7 +431,10 @@ mod tests {
     fn validate_execve_prefix_and_exact_coexist() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/nix/store/*"), PathBuf::from("/bin/echo")],
+            exec: Some(ExecPolicy::Allow(vec![
+                PathBuf::from("/nix/store/*"),
+                PathBuf::from("/bin/echo"),
+            ])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };
@@ -452,7 +457,7 @@ mod tests {
     fn extra_denied_syscalls_returns_empty_for_now() {
         let config = ProcessConfig {
             max_pids: None,
-            allow_execve: vec![PathBuf::from("/usr/bin/python3")],
+            exec: Some(ExecPolicy::Allow(vec![PathBuf::from("/usr/bin/python3")])),
             env_passthrough: vec![],
             env: std::collections::HashMap::new(),
         };

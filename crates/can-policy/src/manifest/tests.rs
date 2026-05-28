@@ -25,7 +25,7 @@ recipes = ["neovim", "elixir", "nix"]
 command = "nvim"
 
 [sandbox.dev.filesystem]
-allow_write = ["$HOME/.local/share/nvim"]
+write = ["$HOME/.local/share/nvim"]
 
 [[sandbox.dev.host]]
 domain = "api.myproject.dev"
@@ -36,7 +36,7 @@ recipes = ["elixir", "nix"]
 command = "mix test"
 
 [sandbox.test.network]
-egress = "proxy-only"
+egress = "proxy"
 
 [sandbox.ci]
 description = "CI — strict, no network"
@@ -58,7 +58,7 @@ cpu_percent = 100
     );
     assert_eq!(dev.recipes, vec!["neovim", "elixir", "nix"]);
     assert_eq!(dev.command, "nvim");
-    assert_eq!(dev.filesystem.allow_write.len(), 1);
+    assert_eq!(dev.filesystem.write.len(), 1);
     assert_eq!(dev.hosts.len(), 1);
     assert_eq!(dev.hosts[0].domain, "api.myproject.dev");
 
@@ -83,13 +83,13 @@ recipes = ["elixir"]
 command = "iex"
 
 [sandbox.dev.syscalls]
-allow_extra = ["ptrace"]
-deny_extra = ["personality"]
+allow_extra = ["statx"]
+deny_extra = ["close_range"]
 "#;
     let manifest = Manifest::parse(toml).unwrap();
     let dev = manifest.get("dev").unwrap();
-    assert_eq!(dev.syscalls.allow_extra, vec!["ptrace"]);
-    assert_eq!(dev.syscalls.deny_extra, vec!["personality"]);
+    assert_eq!(dev.syscalls.allow_extra, vec!["statx"]);
+    assert_eq!(dev.syscalls.deny_extra, vec!["close_range"]);
 }
 
 #[test]
@@ -251,23 +251,23 @@ command = "iex"
 strict = true
 
 [sandbox.dev.filesystem]
-allow_write = ["/tmp/state"]
+write = ["/tmp/state"]
 
 [[sandbox.dev.host]]
 domain = "hex.pm"
 
 [sandbox.dev.syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#;
     let manifest = Manifest::parse(toml).unwrap();
     let dev = manifest.get("dev").unwrap();
     let recipe: RecipeFile = dev.into();
 
     assert_eq!(recipe.strict, Some(true));
-    assert_eq!(recipe.filesystem.allow_write.len(), 1);
+    assert_eq!(recipe.filesystem.write.len(), 1);
     assert_eq!(recipe.hosts.len(), 1);
     assert_eq!(recipe.hosts[0].domain, "hex.pm");
-    assert_eq!(recipe.syscalls.allow_extra, vec!["ptrace"]);
+    assert_eq!(recipe.syscalls.allow_extra, vec!["statx"]);
 }
 
 #[test]
@@ -329,7 +329,7 @@ command = "iex"
 
 [sandbox.dev.syscalls]
 allow = ["read", "write"]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#;
     let result = Manifest::parse(toml);
     assert!(result.is_err(), "mixing allow and allow_extra should fail");

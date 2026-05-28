@@ -16,13 +16,14 @@ use super::env::expand_env_vars;
 use super::error::ConfigError;
 use super::filesystem::FilesystemConfig;
 use super::host::HostBlock;
-use super::network::NetworkConfig;
-use super::process::ProcessConfig;
+use super::network::{EgressMode, NetworkConfig};
+use super::process::{ExecPolicy, ProcessConfig};
 use super::proxy::ProxyConfig;
 use super::resources::ResourceConfig;
 use super::sandbox::SandboxConfig;
-use super::syscalls::SyscallConfig;
+use super::syscalls::{SeccompMode, SyscallConfig};
 use super::trust::recipe_checksum_matches;
+use super::unsafe_config::UnsafeConfig;
 
 /// Metadata section for recipe files.
 #[derive(Debug, Clone, Deserialize, Default, JsonSchema)]
@@ -102,6 +103,12 @@ pub struct RecipeFile {
     /// `contract_mode`).
     #[serde(default, rename = "host")]
     pub hosts: Vec<HostBlock>,
+
+    /// Isolation-weakening settings. Quarantined here so a recipe with no
+    /// `[unsafe]` block provably cannot lower the baseline. Folded into the
+    /// runtime network/syscall config at resolve time.
+    #[serde(default, rename = "unsafe")]
+    pub unsafe_block: UnsafeConfig,
 }
 
 impl RecipeFile {
@@ -128,16 +135,23 @@ impl RecipeFile {
         Ok(recipe)
     }
 
-    /// Drop `[[host]] allow_credentials` entries from this recipe
-    /// unless the recipe's SHA-256 matches the embedded
-    /// `recipes/checksums.toml` snapshot. Logs a warning so the
-    /// operator sees what was filtered.
+    /// Drop credential-trust entries from this recipe unless its SHA-256
+    /// matches the embedded `recipes/checksums.toml` snapshot. Covers both
+    /// `[[host]] allow_credentials` and `[network.dlp] fake_secrets`: each
+    /// routes a real credential to an authorized host, so an unpinned
+    /// third-party recipe must not be able to declare either. Logs a
+    /// warning so the operator sees what was filtered.
     fn drop_untrusted_scopes(&mut self, filename: &str, content: &str) {
         if filename.is_empty() {
             return;
         }
         let any_credentials = self.hosts.iter().any(|h| !h.allow_credentials.is_empty());
-        if !any_credentials {
+        let any_fakes = self
+            .network
+            .dlp
+            .as_ref()
+            .is_some_and(|d| !d.fake_secrets.is_empty());
+        if !any_credentials && !any_fakes {
             return;
         }
         if recipe_checksum_matches(filename, content) {
@@ -149,14 +163,24 @@ impl RecipeFile {
             .filter(|h| !h.allow_credentials.is_empty())
             .map(|h| (h.domain.clone(), h.allow_credentials.clone()))
             .collect();
+        let dropped_fakes: Vec<String> = self
+            .network
+            .dlp
+            .as_ref()
+            .map(|d| d.fake_secrets.iter().map(|f| f.env.clone()).collect())
+            .unwrap_or_default();
         tracing::warn!(
             recipe = filename,
             dropped = ?dropped,
-            "untrusted recipe: dropping [[host]].allow_credentials entries (recipe not pinned by checksum). \
+            dropped_fake_secrets = ?dropped_fakes,
+            "untrusted recipe: dropping [[host]].allow_credentials and [network.dlp].fake_secrets entries (recipe not pinned by checksum). \
              Move credential-scope entries into your project's canister.toml or pin the recipe via `can pull`."
         );
         for h in &mut self.hosts {
             h.allow_credentials.clear();
+        }
+        if let Some(dlp) = self.network.dlp.as_mut() {
+            dlp.fake_secrets.clear();
         }
     }
 
@@ -164,7 +188,42 @@ impl RecipeFile {
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
         let recipe: Self = toml::from_str(content).map_err(ConfigError::Parse)?;
         recipe.syscalls.validate()?;
+        recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Recipe-level validation that spans sections.
+    fn validate(&self) -> Result<(), ConfigError> {
+        // `egress = "direct"` deserializes (the runtime needs the variant)
+        // but is not a thing a recipe may *ask* for — it disables DLP and
+        // contract gates. Point the author at the quarantined knob.
+        if self.network.egress == Some(EgressMode::Direct) {
+            return Err(ConfigError::Validation(
+                "[network] egress = \"direct\" is not allowed; unfiltered egress disables DLP \
+                 and contract gates — declare [unsafe] unfiltered_egress = true instead."
+                    .to_string(),
+            ));
+        }
+
+        // Contradiction: credential scope / DLP / fakes do nothing without
+        // the proxy. Reject rather than silently no-op.
+        if self.unsafe_block.unfiltered_egress {
+            let dlp_configured = self
+                .network
+                .dlp
+                .as_ref()
+                .is_some_and(|d| d.is_enabled() || !d.fake_secrets.is_empty());
+            let creds = self.hosts.iter().any(|h| !h.allow_credentials.is_empty());
+            if dlp_configured || creds {
+                return Err(ConfigError::Validation(
+                    "[unsafe] unfiltered_egress bypasses the proxy, so [network.dlp], \
+                     fake_secrets, and [[host]] allow_credentials would have no effect. \
+                     Remove unfiltered_egress or drop those settings."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Resolve into a `SandboxConfig`.
@@ -181,20 +240,44 @@ impl RecipeFile {
         Ok(SandboxConfig {
             strict: self.strict.unwrap_or(false),
             filesystem: FilesystemConfig {
-                allow: expand_paths(self.filesystem.allow),
-                allow_write: expand_paths(self.filesystem.allow_write),
+                read: expand_paths(self.filesystem.read),
+                write: expand_paths(self.filesystem.write),
                 deny: expand_paths(self.filesystem.deny),
                 mask: self.filesystem.mask,
             },
-            network: self.network,
+            // Fold the [unsafe] block back into the runtime network config:
+            // these knobs live in [unsafe] for authoring visibility but the
+            // runtime reads them from their original locations.
+            network: {
+                let mut network = self.network;
+                network.allow_ips = self.unsafe_block.reachable_ips;
+                network.ports = self.unsafe_block.expose_ports;
+                network.allow_host_loopback = self.unsafe_block.host_loopback;
+                if self.unsafe_block.unfiltered_egress {
+                    network.egress = Some(EgressMode::Direct);
+                }
+                network
+            },
             process: ProcessConfig {
                 max_pids: self.process.max_pids,
-                allow_execve: expand_paths(self.process.allow_execve),
+                exec: Some(expand_exec(self.process.exec())),
                 env_passthrough: self.process.env_passthrough,
                 env: self.process.env,
             },
             resources: self.resources,
-            syscalls: self.syscalls,
+            syscalls: {
+                let mut syscalls = self.syscalls;
+                if self.unsafe_block.seccomp_default_allow {
+                    syscalls.seccomp_mode = Some(SeccompMode::DenyList);
+                }
+                // [unsafe] extra_syscalls are the high-risk allow-list
+                // additions; merge them into the resolved allow_extra so
+                // seccomp applies them uniformly.
+                syscalls
+                    .allow_extra
+                    .extend(self.unsafe_block.extra_syscalls);
+                syscalls
+            },
             proxy: self.proxy,
             hosts: self.hosts,
         })
@@ -230,4 +313,13 @@ fn expand_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .into_iter()
         .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
         .collect()
+}
+
+/// Env-expand the paths inside an explicit-allow exec policy; modes pass
+/// through unchanged.
+fn expand_exec(exec: ExecPolicy) -> ExecPolicy {
+    match exec {
+        ExecPolicy::Allow(paths) => ExecPolicy::Allow(expand_paths(paths)),
+        mode @ ExecPolicy::Mode(_) => mode,
+    }
 }

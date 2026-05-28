@@ -140,10 +140,10 @@ pub fn explain(recipe_args: &[String]) -> Result<i32> {
 
         // Filesystem
         let fs = &recipe.filesystem;
-        if !fs.allow.is_empty() || !fs.allow_write.is_empty() || !fs.deny.is_empty() {
+        if !fs.read.is_empty() || !fs.write.is_empty() || !fs.deny.is_empty() {
             println!("  Filesystem:");
-            print_path_section("  read-only", &fs.allow);
-            print_path_section("  writable ", &fs.allow_write);
+            print_path_section("  read-only", &fs.read);
+            print_path_section("  writable ", &fs.write);
             print_path_section("  denied   ", &fs.deny);
             println!();
         }

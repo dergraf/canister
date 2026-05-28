@@ -4,10 +4,10 @@ description = "helm: config + cache + data dirs; repository credentials via env"
 version = "1"
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/helm",
 ]
-allow_write = [
+write = [
     "$HOME/.cache/helm",
     "$HOME/.local/share/helm",
 ]

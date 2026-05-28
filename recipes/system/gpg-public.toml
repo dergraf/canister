@@ -6,10 +6,10 @@ version = "2"
 #
 #   recipes = ["gpg-public", "gpg-keyservers"]
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest.
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.gnupg/pubring.kbx",
     "$HOME/.gnupg/pubring.gpg",
     "$HOME/.gnupg/trustdb.gpg",

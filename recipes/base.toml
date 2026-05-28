@@ -28,7 +28,7 @@ version = "2"
 # - Alternatives system (/etc/alternatives)
 # - User/group databases (/etc/passwd, /etc/group) — needed by Go, Python, etc.
 # - Temporary file directory (/tmp) — isolated per sandbox via overlay
-allow = [
+read = [
     "/bin",
     "/sbin",
     "/lib",

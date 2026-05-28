@@ -4,7 +4,7 @@ description = "podman: CLI config + containers dir; registry auth denied"
 version = "1"
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/containers/containers.conf",
     "$HOME/.config/containers/registries.conf",
     "$HOME/.config/containers/policy.json",

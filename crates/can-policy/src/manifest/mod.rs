@@ -103,6 +103,12 @@ pub struct SandboxDef {
     /// shipped contract is the same shape as adding a new one.
     #[serde(default, rename = "host")]
     pub hosts: Vec<super::config::HostBlock>,
+
+    /// Isolation-weakening overrides. The manifest is a trusted,
+    /// project-owned file, so `[sandbox.<name>.unsafe]` is the right place
+    /// for a project to opt into host loopback, extra IPs, etc.
+    #[serde(default, rename = "unsafe")]
+    pub unsafe_block: super::config::UnsafeConfig,
 }
 
 /// The manifest filename searched for by `can up`.
@@ -201,6 +207,7 @@ impl From<&SandboxDef> for RecipeFile {
             syscalls: def.syscalls.clone(),
             proxy: def.proxy.clone(),
             hosts: def.hosts.clone(),
+            unsafe_block: def.unsafe_block.clone(),
         }
     }
 }

@@ -17,12 +17,12 @@ version = "1"
 suggests = ["nix"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.nix-profile",
     "$HOME/.config/home-manager",
     "$HOME/.config/nixpkgs",
 ]
-allow_write = [
+write = [
     "$HOME/.local/state/nix",
     "$HOME/.local/state/home-manager",
     "$HOME/.cache/nix",

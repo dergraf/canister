@@ -15,10 +15,10 @@ version = "1"
 suggests = []
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/mise",
 ]
-allow_write = [
+write = [
     "$HOME/.local/share/mise",
     "$HOME/.local/state/mise",
     "$HOME/.cache/mise",

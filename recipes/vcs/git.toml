@@ -21,7 +21,7 @@ description = "git: read user identity + aliases from ~/.gitconfig; credential h
 version = "1"
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.gitconfig",
     "$HOME/.config/git",
 ]

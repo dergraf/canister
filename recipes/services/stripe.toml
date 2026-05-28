@@ -8,6 +8,15 @@
 name = "stripe"
 description = "Stripe API contracts"
 
+# Fake-secret swap: the sandbox gets a fake STRIPE_API_KEY / STRIPE_SECRET_KEY
+# (a pattern-valid `sk_live_…`); the proxy swaps in the real value only on
+# egress to the stripe_key-scoped hosts below. See docs/refusals.md.
+[network.dlp]
+fake_secrets = [
+    { env = "STRIPE_API_KEY", credential = "stripe_key" },
+    { env = "STRIPE_SECRET_KEY", credential = "stripe_key" },
+]
+
 [[host]]
 domain            = "api.stripe.com"
 methods           = ["GET", "POST", "DELETE"]

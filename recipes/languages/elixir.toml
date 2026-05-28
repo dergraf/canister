@@ -7,7 +7,7 @@
 #   recipes = ["elixir", "hex"]                # mix deps.get from Hex
 #   recipes = ["elixir", "hex", "github"]      # plus GitHub-sourced deps
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest
 # to enforce the allow list.
 
 [recipe]
@@ -17,10 +17,14 @@ version = "3"
 suggests = ["hex", "git", "gh"]
 
 [syscalls]
-# BEAM needs ptrace for tracing/debugging tools (:observer, :dbg).
 # BEAM uses memfd_create for JIT code loading (moved to deny list in
 # default baseline, allowed back here).
-allow_extra = ["ptrace", "memfd_create"]
+allow_extra = ["memfd_create"]
+
+# BEAM uses ptrace for tracing/debugging tools (:observer, :dbg). ptrace is
+# process-inspection/injection capable, so it is declared explicitly.
+[unsafe]
+extra_syscalls = ["ptrace"]
 
 [process]
 # BEAM spawns many lightweight processes via OS threads; the default

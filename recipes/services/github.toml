@@ -13,6 +13,17 @@ name = "github"
 description = "GitHub REST + GraphQL API contracts"
 suggests = ["git", "gh"]
 
+# Fake-secret swap: the sandbox is given a fake GITHUB_TOKEN / GH_TOKEN
+# (a pattern-valid `ghp_…`); the proxy swaps in the real host value only
+# on egress to a github_pat-scoped host below. The real token never enters
+# the sandbox, so an exfil attempt — even an encrypted one — leaks only the
+# useless fake. See docs/refusals.md.
+[network.dlp]
+fake_secrets = [
+    { env = "GITHUB_TOKEN", credential = "github_pat" },
+    { env = "GH_TOKEN", credential = "github_pat" },
+]
+
 [[host]]
 domain            = "api.github.com"
 methods           = ["GET", "POST", "PATCH", "PUT", "DELETE", "HEAD"]

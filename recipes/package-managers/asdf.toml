@@ -16,12 +16,12 @@ version = "1"
 suggests = []
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.asdf",
     "$HOME/.tool-versions",
     "$HOME/.asdfrc",
 ]
-allow_write = [
+write = [
     "$HOME/.asdf/downloads",
     "$HOME/.asdf/tmp",
 ]

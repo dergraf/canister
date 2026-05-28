@@ -392,13 +392,13 @@ mod tests {
         assert_eq!(base.display_name("base"), "base");
         // base.toml should have essential paths in filesystem.allow
         assert!(
-            !base.filesystem.allow.is_empty(),
-            "base.toml should have filesystem.allow entries"
+            !base.filesystem.read.is_empty(),
+            "base.toml should have filesystem.read entries"
         );
         // Verify key paths are present
         let paths: Vec<String> = base
             .filesystem
-            .allow
+            .read
             .iter()
             .map(|p| p.display().to_string())
             .collect();

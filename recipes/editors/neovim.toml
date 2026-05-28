@@ -13,7 +13,7 @@
 #   recipes = ["neovim", "github", "luarocks"]               # plus rocks
 #   recipes = ["neovim", "github", "npm-registry", "pypi"]   # plus Mason LSPs
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest.
 
 [recipe]
 name = "neovim"
@@ -22,7 +22,7 @@ version = "3"
 suggests = ["lazy-nvim", "git", "github", "luarocks"]
 
 [filesystem]
-allow = [
+read = [
     # Neovim XDG directories
     "$HOME/.config/nvim",
     "$HOME/.local/share/nvim",
@@ -32,7 +32,6 @@ allow = [
 
 [process]
 max_pids = 256
-allow_execve = []
 env_passthrough = [
     "PATH",
     "HOME",
@@ -66,6 +65,10 @@ env_passthrough = [
 ]
 
 [syscalls]
-# Neovim + LSP servers need ptrace (for debugging) and
-# memfd_create (used by various runtimes)
-allow_extra = ["ptrace", "memfd_create"]
+# memfd_create is used by various LSP runtimes.
+allow_extra = ["memfd_create"]
+
+# ptrace (LSP/debugger support) is process-inspection/injection capable,
+# so it is declared explicitly rather than hidden in allow_extra.
+[unsafe]
+extra_syscalls = ["ptrace"]

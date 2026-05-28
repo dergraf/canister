@@ -8,7 +8,7 @@
 #
 #   recipes = ["neovim", "lazy-nvim", "git", "github"]
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest.
 #
 # Add `luarocks` to the recipe list if any of your plugins declare
 # rocks dependencies (e.g. via `:Lazy build`).
@@ -24,7 +24,7 @@ suggests = ["neovim", "git", "github", "luarocks"]
 # by the neovim recipe). The lockfile lives in the project working dir.
 # Nothing additional to mount here; this recipe is primarily a discovery
 # hint for the builder's suggests graph.
-allow = []
+read = []
 
 [process]
 env_passthrough = [

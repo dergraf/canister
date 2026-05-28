@@ -9,5 +9,5 @@ description = "Flatpak applications"
 version = "1"
 
 [filesystem]
-allow = ["/var/lib/flatpak", "$HOME/.local/share/flatpak"]
+read = ["/var/lib/flatpak", "$HOME/.local/share/flatpak"]
 

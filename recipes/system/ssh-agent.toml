@@ -12,8 +12,8 @@
 # in their canister.toml and accept the exposure.
 #
 # No `[[host]]` blocks: SSH is not HTTP and does not flow through the
-# canister proxy. SSH egress is controlled by `[network] allow_ips`
-# (or `egress = "direct"`) on the containing sandbox.
+# canister proxy. SSH egress is controlled by `[unsafe] reachable_ips`
+# (or `[unsafe] unfiltered_egress`) on the containing sandbox.
 #
 # Note: the agent socket itself lives at a path the parent ssh-agent
 # chose. The default canister filesystem isolation mounts /tmp, so if
@@ -28,7 +28,7 @@ version = "1"
 [filesystem]
 # Allow the known-hosts file so SSH host-key prompts don't recur. The
 # host pubkey collection is not credential material.
-allow = [
+read = [
     "$HOME/.ssh/known_hosts",
     "$HOME/.ssh/known_hosts.d",
     "$HOME/.ssh/config",

@@ -14,10 +14,10 @@ version = "2"
 suggests = ["go-proxy", "git", "github"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/go/env",
 ]
-allow_write = [
+write = [
     "$HOME/go",
     "$HOME/.cache/go-build",
 ]

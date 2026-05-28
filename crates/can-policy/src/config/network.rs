@@ -10,9 +10,12 @@ use super::merge::union_vecs;
 pub struct NetworkConfig {
     /// Egress mode controls outbound networking behavior.
     ///
-    /// - `proxy-only` (default): outbound traffic must go through local proxy
+    /// - `proxy` (default): outbound traffic must go through the local proxy
     /// - `none`: no outbound networking
-    /// - `direct`: direct outbound allowed, still policy-checked
+    ///
+    /// The third runtime mode, `Direct` (unfiltered), is **not** settable
+    /// here — it bypasses DLP and contract gates, so it is authored as
+    /// `[unsafe] unfiltered_egress` and folded in at resolve time.
     #[serde(default)]
     pub egress: Option<EgressMode>,
 
@@ -23,32 +26,23 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub contract_mode: Option<super::host::ContractMode>,
 
-    /// Allowed IP addresses or CIDR ranges. IP-literal egress is a
-    /// separate concept from FQDN egress (no service identity, no
-    /// per-route shape gates apply), so it stays here rather than
-    /// folding into the `[[host]]` table.
-    #[serde(default)]
+    /// Allowed IP addresses / CIDRs (runtime-resolved). IP-literal egress
+    /// carries no service identity and bypasses the per-host contract and
+    /// DLP gates, so it is authored under `[unsafe] reachable_ips`.
+    /// `#[serde(skip)]` makes `[network] allow_ips` a hard (unknown-field)
+    /// error.
+    #[serde(skip)]
     pub allow_ips: Vec<String>,
 
-    /// Port forwarding rules: map host ports to sandbox ports.
-    ///
-    /// Uses Docker/Podman syntax: `[ip:]hostPort:containerPort[/protocol]`.
-    /// Supported when `egress != direct` (filtered networking).
-    /// Forwarded ports are accessible from the host to the sandbox.
-    #[serde(default)]
+    /// Port forwarding rules (runtime-resolved). Authored under
+    /// `[unsafe] expose_ports`; `#[serde(skip)]` rejects `[network] ports`.
+    #[serde(skip)]
     pub ports: Vec<PortMapping>,
 
-    /// Allow the sandbox to reach host loopback services through the
-    /// egress proxy via the magic alias `host.canister.local`.
-    ///
-    /// When `true`, pasta keeps its default mapping of host loopback to
-    /// the namespace gateway, and the proxy rewrites the dial target of
-    /// requests whose `Host` header is `host.canister.local` to that
-    /// gateway IP. Only HTTP/HTTPS are supported (raw TCP still goes
-    /// through the proxy's network gate).
-    ///
-    /// Disabled by default — opt in per-recipe.
-    #[serde(default)]
+    /// Reach host loopback services via `host.canister.local`
+    /// (runtime-resolved). Authored under `[unsafe] host_loopback`;
+    /// `#[serde(skip)]` rejects `[network] allow_host_loopback`.
+    #[serde(skip)]
     pub allow_host_loopback: bool,
 
     /// Data Loss Prevention configuration for the egress proxy.
@@ -57,7 +51,7 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-    /// Return the effective egress mode (defaults to proxy-only).
+    /// Return the effective egress mode (defaults to proxy).
     pub fn egress(&self) -> EgressMode {
         self.egress.unwrap_or(EgressMode::ProxyOnly)
     }
@@ -80,9 +74,14 @@ impl NetworkConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
 pub enum EgressMode {
+    #[serde(rename = "none")]
     None,
+    #[serde(rename = "proxy")]
     ProxyOnly,
+    /// Unfiltered/direct egress. Not deserializable from `[network] egress`
+    /// (recipes use `[unsafe] unfiltered_egress`); constructed at resolve
+    /// time. Serializes as `direct` for diagnostics.
+    #[serde(rename = "direct")]
     Direct,
 }
