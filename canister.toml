@@ -1,0 +1,3 @@
+[sandbox.dev]
+recipes = ["nix", "elixir"]
+command = "bash"
