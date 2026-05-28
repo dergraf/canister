@@ -1,6 +1,24 @@
 # Notifier removal — enforcement-mapping audit (Phase 1 GATE)
 
-Status: **GATE — awaiting decision before any enforcement is mutated.**
+Status: **Decisions made (§0.5); execution proceeding.**
+
+## 0.5 Decisions (locked 2026-05-28)
+
+1. **Egress backstop → separate-netns proxy (re-architecture).** In `proxy`
+   mode the worker's netns gets *no* uplink (only `lo`); pasta moves to a
+   dedicated proxy netns. The worker reaches the proxy via a loopback/unix
+   bridge only, so it is *physically* unable to reach the internet. No
+   `nft`/`iptables` dependency. This is the largest change and reworks the
+   fork/ns sequence in `namespace.rs` — to be done in its own carefully
+   sequenced phase, behind the existing tests.
+2. **`clone3` → `ENOSYS`.** Forces glibc/musl to fall back to `clone`, which is
+   register-filtered in static BPF. (Hard-deny rejected as less compatible.)
+3. **`direct` + allow-list → reject at config-resolve time.** `unfiltered_egress`
+   combined with `reachable_ips`/`[[host]]` becomes a hard config error, removing
+   the structurally weak mode entirely.
+
+---
+
 
 This document maps every job the seccomp `SECCOMP_RET_USER_NOTIF` supervisor
 does today onto a sound, race-free replacement, and surfaces the config modes
