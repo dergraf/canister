@@ -89,7 +89,17 @@ allow canister_sandboxed_t exec_type:file entrypoint;
 role unconfined_r types canister_t;
 role unconfined_r types canister_sandboxed_t;
 
-# Allow unconfined_t to transition to canister_t.
+# Automatically enter canister_t when an unconfined login shell executes the
+# labeled `can` binary. Without this type_transition the permissive canister_t
+# domain below is declared but never *entered*: the supervisor — and the pasta
+# it spawns via execute_no_trans — keep running in the caller's domain, where
+# Fedora denies pasta's netns-dir open ("netns dir open: Permission denied").
+# domain_auto_trans supplies the execute/transition/entrypoint allows plus the
+# type_transition rule that actually triggers the switch.
+domain_auto_trans(unconfined_t, canister_exec_t, canister_t)
+
+# Extra transition permissions beyond what domain_auto_trans grants: dynamic
+# transition (setcon) and the NNP/nosuid transition for no-new-privs execs.
 allow unconfined_t canister_t:process { transition dyntransition };
 allow unconfined_t canister_t:process2 { nnp_transition nosuid_transition };
 
@@ -640,6 +650,19 @@ mod tests {
             "canister_t canister_sandboxed_t:process2 { nnp_transition nosuid_transition }"
         ));
         assert!(te.contains("canister_sandboxed_t exec_type:file entrypoint"));
+    }
+
+    #[test]
+    fn generate_te_enters_canister_t_via_auto_trans() {
+        // The permissive canister_t domain is useless unless executing the
+        // labeled binary actually transitions into it. Without this the
+        // supervisor/pasta run in the caller's domain and Fedora denies
+        // pasta's netns-dir open. Guard the transition explicitly.
+        let te = generate_te("/usr/bin/can");
+        assert!(
+            te.contains("domain_auto_trans(unconfined_t, canister_exec_t, canister_t)"),
+            "policy must auto-transition unconfined_t -> canister_t on exec of the can binary"
+        );
     }
 
     #[test]
