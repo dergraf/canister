@@ -579,18 +579,26 @@ fn install_module(bin_path: &str) -> Result<(), SetupError> {
 /// Remove the SELinux policy module.
 ///
 /// `semodule -r canister` deletes the `canister_t` type that *this* process is
-/// running as (the binary transitions into it), after which the kernel denies
-/// any further operation from our now-undefined context. So every side effect
-/// we own — reference-file cleanup, logging — happens *before* the removal, we
-/// inherit stdio with `.status()` rather than capturing pipes (which we'd have
-/// to read back after the context is gone), and `semodule -r` is the last
-/// fallible step with no I/O after it.
+/// running as (the binary transitions into it). The instant semodule reloads
+/// the policy, our context is undefined and the kernel denies every subsequent
+/// syscall we make — including the `waitpid`/writes a normal spawn-and-wait
+/// would perform — which previously surfaced as an exit-101 panic even though
+/// the module was removed correctly.
+///
+/// To avoid running anything in the doomed domain, we **replace our image**
+/// with `semodule` via `execve()`. The transition into semodule's own domain
+/// happens while `canister_t` still exists; semodule performs the removal in a
+/// valid domain and its exit status becomes ours. On success this function does
+/// not return (the process has become semodule); it only returns `Err` if the
+/// exec itself fails.
 fn remove_module() -> Result<(), SetupError> {
+    use std::os::unix::process::CommandExt;
+
     if !is_module_loaded() {
         return Err(SetupError::NotInstalled);
     }
 
-    // Clean up the reference copy and log *before* the destructive step.
+    // Side effects we own happen *before* the point of no return.
     let _ = std::fs::remove_file(POLICY_REF_PATH);
     // SAFETY-UNWRAP: POLICY_REF_PATH is a const absolute path; parent()
     // is always Some.
@@ -598,24 +606,14 @@ fn remove_module() -> Result<(), SetupError> {
     let _ = std::fs::remove_dir(ref_dir);
     tracing::info!("removing SELinux policy module");
 
-    let status = std::process::Command::new("semodule")
+    // exec() only returns on failure.
+    let err = std::process::Command::new("semodule")
         .args(["-r", MODULE_NAME])
-        .status()
-        .map_err(|e| SetupError::Command {
-            cmd: "semodule -r".to_string(),
-            source: e,
-        })?;
-
-    // If removal failed the module (and canister_t) are still present, so the
-    // context is intact and the caller can safely report this error.
-    if !status.success() {
-        return Err(SetupError::ToolFailed {
-            tool: "semodule -r".to_string(),
-            stderr: format!("semodule -r exited with status {status}"),
-        });
-    }
-
-    Ok(())
+        .exec();
+    Err(SetupError::Command {
+        cmd: "semodule -r".to_string(),
+        source: err,
+    })
 }
 
 #[cfg(test)]
