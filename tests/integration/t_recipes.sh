@@ -65,7 +65,7 @@ read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 egress = "proxy"
 
 [syscalls]
-allow_extra = ["sched_yield", "membarrier"]
+allow_extra = ["sched_yield", "getrandom"]
 EOF
 )
 _TMPFILES+=("$TMPRECIPE2")
