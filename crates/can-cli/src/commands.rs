@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -775,12 +775,19 @@ fn setup_remove() -> Result<i32> {
         }
     }
 
+    // Announce the outcome *before* removing the module. On SELinux this
+    // process is currently running as `canister_t` (the domain the binary
+    // transitions into); `semodule -r` deletes that type, after which the
+    // kernel denies further writes from this now-undefined context — and a
+    // post-removal `println!` would panic on the failed write (exit 101).
+    // Flush while the context is still valid, then do the destructive step
+    // last and touch no I/O afterwards.
+    println!("Removing Canister {mac_name} policy...");
+    println!("Filesystem isolation will be disabled until the policy is reinstalled.");
+    let _ = std::io::stdout().flush();
+
     match backend.remove_policy() {
-        Ok(()) => {
-            println!("Canister {mac_name} policy removed.");
-            println!("Filesystem isolation will be disabled until the policy is reinstalled.");
-            Ok(0)
-        }
+        Ok(()) => Ok(0),
         Err(e) => {
             eprintln!("{e}");
             Ok(1)
