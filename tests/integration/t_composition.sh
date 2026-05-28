@@ -57,7 +57,7 @@ assert_contains "$RUN_STDERR" "elixir-dev"
 begin_test "mixed name and path recipe arguments"
 RECIPE_EXTRA=$(tmpconfig <<'EOF'
 [syscalls]
-allow_extra = ["membarrier"]
+allow_extra = ["sched_yield"]
 EOF
 )
 _TMPFILES+=("$RECIPE_EXTRA")
