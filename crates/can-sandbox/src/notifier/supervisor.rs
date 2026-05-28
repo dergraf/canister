@@ -11,9 +11,8 @@ use super::abi::{
     SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND,
     SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SeccompNotifResp,
 };
-use super::eval_clone::{evaluate_clone, evaluate_clone3};
 use super::eval_net::{evaluate_connect, evaluate_sendmsg, evaluate_sendto};
-use super::eval_proc::{evaluate_execve, evaluate_execveat, evaluate_socket};
+use super::eval_proc::{evaluate_execve, evaluate_execveat};
 use super::policy::NotifierPolicy;
 
 /// Verdict from evaluating a syscall notification. `pub(super)` so each
@@ -221,21 +220,16 @@ fn process_one_notification(fd: RawFd, policy: &NotifierPolicy) {
 /// Dispatch a notification to the appropriate per-syscall evaluator.
 fn evaluate_syscall(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: RawFd) -> Verdict {
     let nr = notif.data.nr as i64;
-    let args = &notif.data.args;
     let pid = notif.pid;
 
+    // `socket`/`clone`/`clone3` are decided in the static BPF prelude
+    // (see `filter.rs`) and never reach the supervisor.
     if nr == libc::SYS_connect {
         evaluate_connect(notif, policy, notifier_fd)
     } else if nr == libc::SYS_sendto {
         evaluate_sendto(notif, policy, notifier_fd)
     } else if nr == libc::SYS_sendmsg {
         evaluate_sendmsg(notif, policy, notifier_fd)
-    } else if nr == libc::SYS_clone {
-        evaluate_clone(args, pid)
-    } else if nr == libc::SYS_clone3 {
-        evaluate_clone3(notif, notifier_fd)
-    } else if nr == libc::SYS_socket {
-        evaluate_socket(args, pid, policy)
     } else if nr == libc::SYS_execve {
         evaluate_execve(notif, policy, notifier_fd)
     } else if nr == libc::SYS_execveat {

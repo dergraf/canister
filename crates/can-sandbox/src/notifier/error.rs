@@ -29,4 +29,7 @@ pub enum NotifierError {
 
     #[error("seccomp filter error: {0}")]
     Filter(#[from] SeccompError),
+
+    #[error("invalid notifier BPF filter: {0}")]
+    InvalidFilter(String),
 }
