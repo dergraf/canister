@@ -82,7 +82,11 @@ assert_contains "$RUN_STDOUT" "Name:"
 # ---- Test 6: can setup --remove removes the module ----
 begin_test "can setup --remove removes SELinux module"
 run_sudo_can setup --remove
-assert_exit_code 0 "$RUN_EXIT"
+if [ "$RUN_EXIT" -ne 0 ]; then
+    fail "exit ${RUN_EXIT}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+else
+    pass
+fi
 
 # Verify module is gone.
 if sudo semodule -lfull 2>/dev/null | grep -q canister; then
