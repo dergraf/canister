@@ -2,11 +2,11 @@
 # Used by: t_monitor.sh
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 deny  = ["/etc/shadow"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 max_pids = 32

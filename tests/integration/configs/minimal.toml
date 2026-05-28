@@ -1,10 +1,10 @@
-# Minimal config — proxy-only egress, default seccomp baseline.
+# Minimal config — proxy egress, default seccomp baseline.
 # Used by: t_basic.sh
 
 [filesystem]
-allow = []
+read = []
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [syscalls]

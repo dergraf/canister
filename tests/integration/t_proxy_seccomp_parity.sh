@@ -2,7 +2,7 @@
 # ============================================================================
 # t_proxy_seccomp_parity.sh — Proxy + seccomp enforcement parity
 #
-# Given a single recipe with `egress = "proxy-only"` and a domain allow
+# Given a single recipe with `egress = "proxy"` and a domain allow
 # list, both enforcement layers must agree on what is and isn't allowed:
 #
 #   - The L7 proxy must return 502 ("domain not allowed by policy") when
@@ -26,10 +26,10 @@ header "Proxy + seccomp enforcement parity"
 
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [[host]]
 domain = "example.com"
 [process]
@@ -155,16 +155,18 @@ esac
 # proxy's allows_ip check must respect the CIDR.
 CIDR_CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "proxy-only"
-allow_ips = ["10.0.0.0/24"]
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
 
 [syscalls]
+
+[unsafe]
+reachable_ips = ["10.0.0.0/24"]
 EOF
 )
 _TMPFILES+=("$CIDR_CONFIG")
@@ -219,7 +221,7 @@ esac
 # ---- Test 5: egress = "none" — both layers deny everything ----
 NONE_CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
 egress = "none"
@@ -279,11 +281,10 @@ esac
 # without re-enabling arbitrary literals.
 COMBO_CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "proxy-only"
-allow_ips = ["192.0.2.1"]
+egress = "proxy"
 
 [[host]]
 domain = "example.com"
@@ -292,6 +293,9 @@ domain = "example.com"
 env_passthrough = ["PATH", "HOME"]
 
 [syscalls]
+
+[unsafe]
+reachable_ips = ["192.0.2.1"]
 EOF
 )
 _TMPFILES+=("$COMBO_CONFIG")

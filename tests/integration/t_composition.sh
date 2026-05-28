@@ -22,7 +22,7 @@ RECIPE_A=$(tmpconfig <<'EOF'
 name = "layer-a"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["HOME"]
@@ -36,11 +36,11 @@ name = "layer-b"
 env_passthrough = ["PATH"]
 
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["sched_yield"]
 EOF
 )
 _TMPFILES+=("$RECIPE_A" "$RECIPE_B")
-# Both recipes should merge: env_passthrough = [HOME, PATH], allow_extra = [ptrace]
+# Both recipes should merge: env_passthrough = [HOME, PATH], allow_extra = [sched_yield]
 run_can run --recipe "$RECIPE_A" --recipe "$RECIPE_B" -- echo "merged"
 assert_exit_code 0 "$RUN_EXIT"
 assert_eq "merged" "$RUN_STDOUT"
@@ -57,7 +57,7 @@ assert_contains "$RUN_STDERR" "elixir-dev"
 begin_test "mixed name and path recipe arguments"
 RECIPE_EXTRA=$(tmpconfig <<'EOF'
 [syscalls]
-allow_extra = ["personality"]
+allow_extra = ["membarrier"]
 EOF
 )
 _TMPFILES+=("$RECIPE_EXTRA")
@@ -87,7 +87,7 @@ else
 name = "relaxed"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 EOF
 )
     RECIPE_STRICT=$(tmpconfig <<'EOF'
@@ -97,7 +97,7 @@ strict = true
 name = "strict-layer"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 EOF
 )
     _TMPFILES+=("$RECIPE_RELAXED" "$RECIPE_STRICT")
@@ -113,7 +113,7 @@ R1=$(tmpconfig <<'EOF'
 name = "base-layer"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["HOME"]
@@ -127,7 +127,7 @@ name = "middle-layer"
 env_passthrough = ["LANG"]
 
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["sched_yield"]
 EOF
 )
 R3=$(tmpconfig <<'EOF'

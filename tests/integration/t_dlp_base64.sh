@@ -30,10 +30,10 @@ header "DLP catches encoded tokens via fragment-aware decoding"
 
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [[host]]
 domain = "example.com"
 [process]

@@ -2,13 +2,13 @@
 # Used by: t_seccomp.sh to compare allow-list vs deny-list behavior.
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
-[syscalls]
-seccomp_mode = "deny-list"
+[unsafe]
+seccomp_default_allow = true

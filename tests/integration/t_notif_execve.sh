@@ -38,14 +38,14 @@ echo "  sh:      raw=${SH_RAW} canonical=${SH_CANON}"
 
 CONFIG=$(tmpconfig <<EOF
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/bin", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/bin", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME"]
-allow_execve = ["${PYTHON3_RAW}", "${PYTHON3_CANON}", "${SH_RAW}", "${SH_CANON}"]
+exec = ["${PYTHON3_RAW}", "${PYTHON3_CANON}", "${SH_RAW}", "${SH_CANON}"]
 
 [syscalls]
 EOF

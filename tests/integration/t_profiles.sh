@@ -24,11 +24,11 @@ assert_eq "baseline works" "$RUN_STDOUT"
 begin_test "[syscalls] allow_extra permits additional syscalls"
 TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["sched_yield"]
 EOF
 )
 _TMPFILES+=("$TMPCONF")
@@ -40,9 +40,9 @@ assert_eq "allow_extra works" "$RUN_STDOUT"
 begin_test "[syscalls] deny_extra is accepted"
 TMPCONF2=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [syscalls]
 deny_extra = ["personality"]
 EOF
@@ -56,7 +56,7 @@ assert_eq "deny_extra works" "$RUN_STDOUT"
 begin_test "old [profile] section is rejected"
 TMPOLD=$(tmpconfig <<'EOF'
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [profile]
 name = "python"
 EOF

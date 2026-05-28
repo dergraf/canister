@@ -43,7 +43,7 @@ name = "test-recipe"
 description = "Integration test recipe"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 EOF
 )
 _TMPFILES+=("$TMPRECIPE")
@@ -59,13 +59,13 @@ name = "syscall-test"
 description = "Tests allow_extra override"
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [syscalls]
-allow_extra = ["ptrace", "personality"]
+allow_extra = ["sched_yield", "membarrier"]
 EOF
 )
 _TMPFILES+=("$TMPRECIPE2")
@@ -89,7 +89,7 @@ assert_neq 0 "$RUN_EXIT" "unknown field 'baseline' should be rejected"
 begin_test "plain policy (no [recipe] section) works via --recipe"
 TMPPLAIN=$(tmpconfig <<'EOF'
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [syscalls]
 EOF
 )
@@ -116,7 +116,7 @@ description = "Test fixture for recursive name resolution"
 version = "1"
 
 [filesystem]
-allow = ["/tmp/example-marker-path"]
+read = ["/tmp/example-marker-path"]
 
 [process]
 env_passthrough = ["EXAMPLE_TEST_VAR"]
