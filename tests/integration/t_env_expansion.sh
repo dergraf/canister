@@ -29,7 +29,7 @@ RECIPE=$(tmpconfig <<'EOF'
 name = "env-execve-test"
 
 [process]
-allow_execve = ["$_CANISTER_BINDIR/echo"]
+exec = ["$_CANISTER_BINDIR/echo"]
 EOF
 )
 _TMPFILES+=("$RECIPE")
@@ -47,7 +47,7 @@ RECIPE2=$(tmpconfig <<'EOF'
 name = "env-execve-unset"
 
 [process]
-allow_execve = ["$_CANISTER_BINDIR/echo"]
+exec = ["$_CANISTER_BINDIR/echo"]
 EOF
 )
 _TMPFILES+=("$RECIPE2")
@@ -63,7 +63,7 @@ RECIPE3=$(tmpconfig <<'EOF'
 name = "env-braced-test"
 
 [process]
-allow_execve = ["${_CANISTER_BINDIR2}/echo"]
+exec = ["${_CANISTER_BINDIR2}/echo"]
 EOF
 )
 _TMPFILES+=("$RECIPE3")
@@ -84,7 +84,7 @@ RECIPE4=$(tmpconfig <<'EOF'
 name = "dollar-escape-test"
 
 [filesystem]
-allow = ["/tmp/$$literal-path"]
+read = ["/tmp/$$literal-path"]
 EOF
 )
 _TMPFILES+=("$RECIPE4")
@@ -102,7 +102,7 @@ RECIPE5=$(tmpconfig <<'EOF'
 name = "home-fs-test"
 
 [filesystem]
-allow = ["$HOME/.config/canister"]
+read = ["$HOME/.config/canister"]
 deny = ["$HOME/.ssh"]
 EOF
 )

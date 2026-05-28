@@ -1,17 +1,17 @@
 # DNS-filtered network mode — pasta with domain-based allowlist.
 # Used by: t_dns_filtering.sh
 #
-# Uses `egress = "direct"` (not `proxy-only`) because this test exercises
-# the supervisor's *direct* connect filter against the dynamic allow
-# list populated from the `[[host]]` table. In `proxy-only` mode the
+# Uses `[unsafe] unfiltered_egress` (not `proxy`) because this test
+# exercises the supervisor's *direct* connect filter against the dynamic
+# allow list populated from the `[[host]]` table. In `proxy` mode the
 # supervisor unconditionally denies any non-proxy egress (see
 # ADR-0006), so the dynamic allow list is never consulted.
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
-[network]
-egress = "direct"
+[unsafe]
+unfiltered_egress = true
 
 [[host]]
 domain = "example.com"

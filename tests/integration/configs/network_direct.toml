@@ -2,10 +2,10 @@
 # Used by: t_network.sh
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
-[network]
-egress = "direct"
+[unsafe]
+unfiltered_egress = true
 
 [process]
 env_passthrough = ["PATH", "HOME"]

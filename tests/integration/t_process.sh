@@ -59,9 +59,9 @@ unset EDITOR
 begin_test "PATH is always available"
 TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [process]
 env_passthrough = ["HOME"]
 [syscalls]

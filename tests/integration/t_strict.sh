@@ -39,9 +39,9 @@ fi
 begin_test "strict mode via --strict CLI flag"
 TMPCONF=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 [network]
-egress = "proxy-only"
+egress = "proxy"
 [process]
 env_passthrough = ["PATH", "HOME"]
 [syscalls]
@@ -110,16 +110,15 @@ NONSTRICT_BPF=$(tmpconfig <<'EOF'
 strict = false
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [syscalls]
-seccomp_mode = "allow-list"
 EOF
 )
 _TMPFILES+=("$NONSTRICT_BPF")
@@ -155,17 +154,18 @@ NONSTRICT_NOTIF=$(tmpconfig <<'EOF'
 strict = false
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "direct"
-allow_ips = ["10.0.0.1"]
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [syscalls]
-seccomp_mode = "allow-list"
+
+[unsafe]
+unfiltered_egress = true
+reachable_ips = ["10.0.0.1"]
 EOF
 )
 _TMPFILES+=("$NONSTRICT_NOTIF")
@@ -210,17 +210,18 @@ STRICT_NOTIF=$(tmpconfig <<'EOF'
 strict = true
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "direct"
-allow_ips = ["10.0.0.1"]
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [syscalls]
-seccomp_mode = "allow-list"
+
+[unsafe]
+unfiltered_egress = true
+reachable_ips = ["10.0.0.1"]
 EOF
 )
 _TMPFILES+=("$STRICT_NOTIF")

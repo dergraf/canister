@@ -60,7 +60,7 @@ version = "1"
 match_prefix = ["/usr/bin"]
 
 [syscalls]
-allow_extra = ["personality"]
+allow_extra = ["membarrier"]
 EOF
 # echo resolves to /usr/bin/echo (canonicalized), which matches match_prefix.
 # XDG_CONFIG_HOME puts our recipe into the search path.
@@ -88,7 +88,7 @@ version = "1"
 match_prefix = ["/usr/bin"]
 
 [filesystem]
-allow = ["/etc/hostname"]
+read = ["/etc/hostname"]
 EOF
 RUN_EXIT=0
 output=$( XDG_CONFIG_HOME="${MOUNT_RECIPE_DIR}" \

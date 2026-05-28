@@ -26,10 +26,10 @@ header "DLP catches chunked-DNS exfil even with short labels"
 
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 # `example.com` matches the apex AND any subdomain per the documented
 # bare-domain semantics (CONFIGURATION.md). That lets us send a chunked
 # subdomain through both policy gates so DLP gets a chance to see the

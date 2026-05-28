@@ -4,13 +4,12 @@
 strict = true
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [syscalls]
-seccomp_mode = "allow-list"

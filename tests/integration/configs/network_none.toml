@@ -2,7 +2,7 @@
 # Used by: t_network.sh
 
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/lib", "/tmp"]
 
 [network]
 egress = "none"

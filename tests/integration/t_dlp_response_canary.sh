@@ -8,7 +8,7 @@
 # could otherwise reflect a canary back to the worker as part of a JSON
 # field or a redirect header, leaving no signal on the request side.
 #
-# Setup: the proxy runs with DLP enabled (`egress = "proxy-only"`); the
+# Setup: the proxy runs with DLP enabled (`egress = "proxy"`); the
 # worker's env carries `CANISTER_CANARY_*`. We have no way to make
 # `example.com` return our canary on demand, so this test spins up a
 # small Python HTTP echo server *inside the sandbox* on loopback and
@@ -27,16 +27,18 @@ header "DLP catches canary tokens reflected by upstream responses"
 
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp", "/etc/ssl"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp", "/etc/ssl"]
 
 [network]
-egress = "proxy-only"
-allow_ips = ["127.0.0.1/32"]
+egress = "proxy"
 
 [process]
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
 [syscalls]
+
+[unsafe]
+reachable_ips = ["127.0.0.1/32"]
 EOF
 )
 _TMPFILES+=("$CONFIG")

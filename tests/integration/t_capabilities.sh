@@ -19,7 +19,7 @@ header "Capability dropping"
 
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/proc", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/proc", "/tmp"]
 
 [process]
 env_passthrough = ["PATH", "HOME"]

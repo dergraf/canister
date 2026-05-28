@@ -25,16 +25,18 @@ header "USER_NOTIF supervisor: connect() IP allow list"
 # can do anything.
 CONFIG=$(tmpconfig <<'EOF'
 [filesystem]
-allow = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
+read = ["/usr/lib", "/usr/bin", "/usr/local", "/lib", "/lib64", "/tmp"]
 
 [network]
-egress = "direct"
-allow_ips = ["127.0.0.1"]
 
 [process]
 env_passthrough = ["PATH", "HOME"]
 
 [syscalls]
+
+[unsafe]
+unfiltered_egress = true
+reachable_ips = ["127.0.0.1"]
 EOF
 )
 _TMPFILES+=("$CONFIG")
