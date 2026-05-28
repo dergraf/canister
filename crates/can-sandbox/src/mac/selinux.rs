@@ -309,8 +309,15 @@ pub fn selinux_restricts_userns() -> bool {
 }
 
 /// Detect the current status of the canister SELinux module.
+///
+/// The policy is needed whenever SELinux is **enforcing**, not only when it
+/// restricts user namespaces. Even on kernels where unprivileged userns is
+/// allowed (e.g. Fedora 42), an unconfined `can` still gets denied during
+/// sandbox setup — most visibly pasta's open of `/var/run/netns`
+/// ("netns dir open: Permission denied"). The canister module supplies the
+/// (currently permissive) `canister_t` domain those operations need.
 fn detect_module_status() -> PolicyStatus {
-    if !selinux_restricts_userns() {
+    if !is_enforcing() {
         return PolicyStatus::NotNeeded;
     }
 

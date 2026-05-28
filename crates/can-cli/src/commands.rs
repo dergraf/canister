@@ -543,7 +543,7 @@ pub fn check() -> Result<i32> {
             let mac_name = b.name();
             match &status {
                 PolicyStatus::NotNeeded => {
-                    println!("  {mac_name} policy: not needed (userns unrestricted)");
+                    println!("  {mac_name} policy: not needed (not enforcing)");
                 }
                 PolicyStatus::NotInstalled => {
                     println!("  {mac_name} policy: NOT INSTALLED");
@@ -658,7 +658,7 @@ pub fn setup(remove: bool, force: bool, pasta_path: Option<&str>) -> Result<i32>
     let status = backend.policy_status();
     match &status {
         PolicyStatus::NotNeeded => {
-            println!("{mac_name} does not restrict unprivileged user namespaces on this system.");
+            println!("{mac_name} is not enforcing on this system.");
             println!("No policy installation needed — filesystem isolation works natively.");
             return Ok(0);
         }
@@ -686,7 +686,7 @@ pub fn setup(remove: bool, force: bool, pasta_path: Option<&str>) -> Result<i32>
             println!("Updating policy...");
         }
         PolicyStatus::NotInstalled => {
-            println!("{mac_name} restricts unprivileged user namespaces on this system.");
+            println!("{mac_name} is active on this system.");
             println!("Installing Canister {mac_name} policy to enable filesystem isolation...");
         }
     }
