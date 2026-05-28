@@ -859,7 +859,12 @@ fn child_entry(
             .take()
             .expect("NOTIFIER_SEND_FD must be set when notifier is enabled");
 
-        match notifier::install_notifier_filter() {
+        // AF gating is compiled into the static prelude. The baseline
+        // permits AF_UNIX/AF_INET creation (egress is constrained at the
+        // connect/structural layer, not at socket()), matching the
+        // long-standing policy default.
+        let filter_policy = notifier::FilterPolicy::default();
+        match notifier::install_notifier_filter(&filter_policy) {
             Ok(notifier_fd) => {
                 tracing::debug!("installed USER_NOTIF seccomp filter in worker");
                 if let Err(e) = notifier::send_fd(&send_fd, &notifier_fd) {

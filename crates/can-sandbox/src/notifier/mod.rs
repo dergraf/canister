@@ -53,7 +53,9 @@
 //! - `policy_config` — `policy_from_config`: builds a `NotifierPolicy`
 //!   from a `SandboxConfig`.
 //! - `kernel` — kernel-version detection (`is_notifier_supported`).
-//! - `filter` — BPF filter construction + installation.
+//! - `bpf` — label-based BPF assembler for the prelude.
+//! - `filter` — prelude construction (register-decidable gates + the
+//!   USER_NOTIF routing for the remaining memory-dependent syscalls).
 //! - `fd_channel` — pipe + `pidfd_getfd()` fd passing.
 //! - `supervisor` — main loop, signal handler, notification dispatch,
 //!   TOCTOU validity check.
@@ -61,13 +63,12 @@
 //! - `outbound` — shared IP classification + CIDR matching.
 //! - `eval_net` — `connect` / `sendto` / `sendmsg` evaluators + their
 //!   pure `classify_*` helpers + DNS allowlist refresh.
-//! - `eval_clone` — `clone` / `clone3` evaluators.
-//! - `eval_proc` — `socket` / `execve` / `execveat` evaluators.
+//! - `eval_proc` — `execve` / `execveat` path evaluators.
 //! - `tests` — the test suite.
 
 mod abi;
+mod bpf;
 mod error;
-mod eval_clone;
 mod eval_net;
 mod eval_proc;
 mod fd_channel;
@@ -81,7 +82,7 @@ mod supervisor;
 
 pub use error::NotifierError;
 pub use fd_channel::{create_fd_channel, recv_fd, send_fd};
-pub use filter::{NOTIFIED_SYSCALLS, build_notifier_filter, install_notifier_filter};
+pub use filter::{FilterPolicy, NOTIFIED_SYSCALLS, build_notifier_filter, install_notifier_filter};
 pub use kernel::is_notifier_supported;
 pub use policy::NotifierPolicy;
 pub use policy_config::policy_from_config;
