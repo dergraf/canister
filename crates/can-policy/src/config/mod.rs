@@ -23,19 +23,22 @@ mod resources;
 mod sandbox;
 mod syscalls;
 mod trust;
+#[path = "unsafe_config.rs"]
+mod unsafe_config;
 
-pub use dlp::DlpConfig;
+pub use dlp::{DlpConfig, FakeSecret};
 pub use env::expand_env_vars;
 pub use error::ConfigError;
 pub use filesystem::{FilesystemConfig, PortMapping, PortProtocol};
 pub use host::{ContractMode, HostBlock, merge_host_blocks};
 pub use network::{EgressMode, NetworkConfig};
-pub use process::ProcessConfig;
+pub use process::{ExecMode, ExecPolicy, ProcessConfig};
 pub use proxy::ProxyConfig;
 pub use recipe::{RecipeFile, RecipeMeta};
 pub use resources::ResourceConfig;
 pub use sandbox::SandboxConfig;
-pub use syscalls::{SeccompMode, SyscallConfig};
+pub use syscalls::{DANGEROUS_SYSCALLS, SeccompMode, SyscallConfig};
+pub use unsafe_config::UnsafeConfig;
 
 #[cfg(test)]
 mod tests;

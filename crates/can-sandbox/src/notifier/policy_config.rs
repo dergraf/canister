@@ -68,7 +68,13 @@ pub fn policy_from_config(
     let mut allowed_exec_paths: HashSet<PathBuf> = HashSet::new();
     let mut allowed_exec_prefixes: Vec<PathBuf> = Vec::new();
 
-    for p in &config.process.allow_execve {
+    // Only an explicit `exec = [paths]` policy seeds the notifier's exec
+    // allow list; `any` / `entrypoint-only` carry no path list here.
+    let exec_allow = match config.process.exec() {
+        can_policy::config::ExecPolicy::Allow(paths) => paths,
+        can_policy::config::ExecPolicy::Mode(_) => Vec::new(),
+    };
+    for p in &exec_allow {
         let s = p.as_os_str().to_string_lossy();
         if let Some(prefix_str) = s.strip_suffix("/*") {
             let prefix_path = PathBuf::from(prefix_str);

@@ -5,10 +5,10 @@ version = "1"
 suggests = ["python", "pypi"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/uv",
 ]
-allow_write = [
+write = [
     "$HOME/.cache/uv",
     "$HOME/.local/share/uv",
 ]

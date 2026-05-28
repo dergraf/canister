@@ -15,18 +15,6 @@ name = "generic-strict"
 description = "Strict no-network policy for untrusted binaries (CI/production)"
 version = "2"
 
-[syscalls]
-# For compiled binaries that may use ptrace (debuggers), io_uring
-# (modern async I/O), personality (multilib), or seccomp (self-sandboxing).
-allow_extra = [
-    "ptrace",
-    "personality",
-    "seccomp",
-    "io_uring_setup",
-    "io_uring_enter",
-    "io_uring_register",
-]
-
 [filesystem]
 deny = ["/etc/shadow", "/root", "/home"]
 
@@ -36,3 +24,17 @@ egress = "none"
 [process]
 max_pids = 64
 env_passthrough = ["PATH", "LANG", "TERM"]
+
+# These widen the kernel attack surface (debuggers, async I/O, multilib,
+# self-sandboxing) for compiled-binary compatibility, so they are declared
+# explicitly here rather than hidden in [syscalls] allow_extra — "strict"
+# isolation must never silently grow the syscall surface.
+[unsafe]
+extra_syscalls = [
+    "ptrace",
+    "personality",
+    "seccomp",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+]

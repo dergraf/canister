@@ -17,7 +17,7 @@
 #   # OpenAI
 #   recipes = ["opencode", "openai", "opencode-ai"]
 #
-# and set `[sandbox.X.network] egress = "proxy-only"` in the manifest.
+# and set `[sandbox.X.network] egress = "proxy"` in the manifest.
 #
 # Note: Run from the project directory you want OpenCode to work on.
 # The $PWD will be bind-mounted into the sandbox.
@@ -45,12 +45,12 @@ suggests = ["git", "github", "anthropic", "openai", "opencode-ai"]
 # - $HOME/.gnupg      — GPG private keys.
 # - $HOME/.aws        — AWS credentials.
 # - $HOME/.kube       — Kubernetes config with tokens.
-allow = [
+read = [
     "$HOME/.opencode",
     "$HOME/.config/opencode",
 ]
 # OpenCode writes to its state dir (SQLite DB, logs, tool output).
-allow_write = [
+write = [
     "$HOME/.local/share/opencode",
 ]
 deny = [

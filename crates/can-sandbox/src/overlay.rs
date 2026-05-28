@@ -242,7 +242,7 @@ fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
 ///
 /// All are merged into a single list via recipe composition.
 fn bind_mount_allowed(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
-    for source in &config.allow {
+    for source in &config.read {
         if !source.exists() {
             tracing::warn!(path = %source.display(), "allowed path not found, skipping");
             continue;
@@ -280,7 +280,7 @@ fn bind_mount_allowed(root: &Path, config: &FilesystemConfig) -> Result<(), Over
 /// persist changes (e.g., databases, caches, state directories).
 /// Denied paths are still checked and skipped.
 fn bind_mount_writable_paths(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
-    for source in &config.allow_write {
+    for source in &config.write {
         if !source.exists() {
             tracing::warn!(path = %source.display(), "writable path not found, skipping");
             continue;

@@ -17,19 +17,17 @@ version = "2"
 [filesystem]
 # Paths the sandboxed process can read (mounted read-only).
 # System paths are already provided by base.toml — only add app-specific paths here.
-allow = []
+read = []
 # Paths the sandboxed process can write to (changes persist on host).
 # The working directory ($PWD) is always writable. Uncomment for additional paths:
-# allow_write = ["/var/data/myapp"]
+# write = ["/var/data/myapp"]
 # Paths explicitly denied (checked before allow and allow_write).
 deny = ["/etc/shadow", "/root"]
 
 [network]
-egress = "proxy-only"
-# Allowed IPs or CIDRs for direct connections. Empty = no IP-literal
-# egress; everything must go through the DNS-resolved `[[host]]` list
-# below.
-allow_ips = []
+# egress: "proxy" (default — inspected via the local proxy) or "none".
+# Unfiltered/direct egress lives in [unsafe] (see bottom).
+egress = "proxy"
 
 # Allowed upstream destinations. The proxy refuses any other host.
 [[host]]
@@ -41,10 +39,9 @@ domain = "files.pythonhosted.org"
 [process]
 # Max child PIDs.
 max_pids = 64
-# Restrict which executables the sandbox may run (optional, opt-in).
-# By default, all executables are allowed — the real security boundaries
-# are network, filesystem, and seccomp. Uncomment to lock down:
-# allow_execve = ["/usr/bin/python3"]
+# Which binaries may exec: "any" (default), "entrypoint-only", or an
+# explicit allow list. Uncomment to lock down:
+# exec = ["/usr/bin/python3"]
 # Environment variables passed through from host.
 env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 
@@ -55,8 +52,18 @@ env_passthrough = ["PATH", "HOME", "LANG", "TERM"]
 # cpu_percent = 50
 
 # [syscalls] section — customize the default seccomp baseline.
-# Uncomment to add or remove specific syscalls:
+# Ordinary (non-dangerous) syscalls only; default-deny allow-list mode.
 # [syscalls]
-# seccomp_mode = "allow-list"
-# allow_extra = ["ptrace"]        # add ptrace to the allow list
+# allow_extra = ["statx"]         # add a benign syscall to the allow list
 # deny_extra = ["personality"]    # remove personality from allow, add to deny
+
+# [unsafe] section — settings that LOWER isolation. A recipe with no
+# [unsafe] block provably cannot weaken the baseline. Uncomment knobs as
+# needed (each is greppable and surfaced at runtime):
+# [unsafe]
+# unfiltered_egress = true              # direct egress — DLP & contracts OFF
+# reachable_ips     = ["10.0.0.5/32"]   # un-scanned IP-literal egress
+# host_loopback     = true              # reach host 127.0.0.1 services
+# expose_ports      = ["8080:80"]       # forward host ports into the sandbox
+# seccomp_default_allow = true          # flip seccomp to default-ALLOW
+# extra_syscalls    = ["ptrace"]        # high-risk syscalls (ptrace, bpf, …)

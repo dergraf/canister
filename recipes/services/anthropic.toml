@@ -4,6 +4,12 @@
 name = "anthropic"
 description = "Anthropic API contracts"
 
+# Fake-secret swap: the sandbox gets a fake ANTHROPIC_API_KEY; the proxy
+# swaps in the real value only on egress to the anthropic_key-scoped host
+# below. See docs/refusals.md.
+[network.dlp]
+fake_secrets = [{ env = "ANTHROPIC_API_KEY", credential = "anthropic_key" }]
+
 [[host]]
 domain            = "api.anthropic.com"
 methods           = ["GET", "POST"]

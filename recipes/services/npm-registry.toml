@@ -8,6 +8,12 @@ name = "npm-registry"
 description = "npm registry contracts"
 suggests = ["npm", "node"]
 
+# Fake-secret swap: the sandbox gets a fake NPM_TOKEN; the proxy swaps in
+# the real value only on egress to the npm_token-scoped registry below.
+# See docs/refusals.md.
+[network.dlp]
+fake_secrets = [{ env = "NPM_TOKEN", credential = "npm_token" }]
+
 [[host]]
 domain            = "registry.npmjs.org"
 methods           = ["GET", "HEAD", "PUT", "DELETE"]

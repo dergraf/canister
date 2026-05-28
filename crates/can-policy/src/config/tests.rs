@@ -6,14 +6,14 @@ use super::*;
 fn parse_minimal_config() {
     let toml = r#"
 [filesystem]
-allow = ["/usr/lib", "/tmp/workspace"]
+read = ["/usr/lib", "/tmp/workspace"]
 
 [[host]]
 domain = "pypi.org"
 "#;
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
     let config = recipe.into_sandbox_config().unwrap();
-    assert_eq!(config.filesystem.allow.len(), 2);
+    assert_eq!(config.filesystem.read.len(), 2);
     assert_eq!(config.hosts.len(), 1);
     assert_eq!(config.hosts[0].domain, "pypi.org");
     assert_eq!(config.network.egress(), EgressMode::ProxyOnly); // default
@@ -24,13 +24,12 @@ domain = "pypi.org"
 fn parse_full_config() {
     let toml = r#"
 [filesystem]
-allow = ["/usr/lib"]
-allow_write = ["/var/data"]
+read = ["/usr/lib"]
+write = ["/var/data"]
 deny = ["/etc/shadow"]
 
 [network]
-allow_ips = ["10.0.0.0/8"]
-egress = "proxy-only"
+egress = "proxy"
 
 [[host]]
 domain = "pypi.org"
@@ -40,7 +39,7 @@ domain = "registry.npmjs.org"
 
 [process]
 max_pids = 64
-allow_execve = ["/usr/bin/python3"]
+exec = ["/usr/bin/python3"]
 env_passthrough = ["PATH", "HOME", "LANG"]
 
 [resources]
@@ -48,26 +47,27 @@ memory_mb = 512
 cpu_percent = 50
 
 [syscalls]
-seccomp_mode = "allow-list"
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
+
+[unsafe]
+reachable_ips = ["10.0.0.0/8"]
 "#;
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
     let config = recipe.into_sandbox_config().unwrap();
     assert_eq!(config.resources.memory_mb, Some(512));
     assert_eq!(config.process.max_pids, Some(64));
-    assert_eq!(config.syscalls.allow_extra, vec!["ptrace"]);
+    assert_eq!(config.syscalls.allow_extra, vec!["statx"]);
     assert_eq!(config.syscalls.seccomp_mode(), SeccompMode::AllowList);
-    assert_eq!(
-        config.filesystem.allow_write,
-        vec![PathBuf::from("/var/data")]
-    );
+    // [unsafe] reachable_ips folds into the resolved network config.
+    assert_eq!(config.network.allow_ips, vec!["10.0.0.0/8"]);
+    assert_eq!(config.filesystem.write, vec![PathBuf::from("/var/data")]);
 }
 
 #[test]
 fn default_deny_config() {
     let config = SandboxConfig::default_deny();
     assert_eq!(config.network.egress(), EgressMode::ProxyOnly);
-    assert!(config.filesystem.allow.is_empty());
+    assert!(config.filesystem.read.is_empty());
     assert!(config.hosts.is_empty());
     assert!(config.syscalls.allow_extra.is_empty());
     assert!(config.syscalls.deny_extra.is_empty());
@@ -83,7 +83,7 @@ fn egress_default_is_proxy_only() {
 fn reject_unknown_fields() {
     let toml = r#"
 [filesystem]
-allow = ["/tmp"]
+read = ["/tmp"]
 bogus_field = true
 "#;
     let result: Result<RecipeFile, _> = toml::from_str(toml);
@@ -101,10 +101,10 @@ description = "Install Python packages with pip"
 version = "1"
 
 [filesystem]
-allow = ["/usr/lib", "/tmp"]
+read = ["/usr/lib", "/tmp"]
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [[host]]
 domain = "pypi.org"
@@ -120,24 +120,24 @@ env_passthrough = ["PATH", "HOME"]
     assert_eq!(recipe.description(), "Install Python packages with pip");
 
     let config = recipe.into_sandbox_config().unwrap();
-    assert_eq!(config.filesystem.allow.len(), 2);
+    assert_eq!(config.filesystem.read.len(), 2);
 }
 
 #[test]
 fn parse_recipe_without_metadata() {
     let toml = r#"
 [filesystem]
-allow = ["/usr/lib"]
+read = ["/usr/lib"]
 
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#;
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
     assert!(recipe.recipe.is_none());
     assert_eq!(recipe.display_name("fallback"), "fallback");
 
     let config = recipe.into_sandbox_config().unwrap();
-    assert_eq!(config.syscalls.allow_extra, vec!["ptrace"]);
+    assert_eq!(config.syscalls.allow_extra, vec!["statx"]);
 }
 
 #[test]
@@ -147,13 +147,16 @@ fn parse_recipe_with_syscall_overrides() {
 name = "elixir-dev"
 
 [syscalls]
-allow_extra = ["ptrace"]
-deny_extra = ["personality", "seccomp"]
+allow_extra = ["statx"]
+deny_extra = ["close_range", "sched_yield"]
 "#;
     let recipe: RecipeFile = toml::from_str(toml).unwrap();
     let config = recipe.into_sandbox_config().unwrap();
-    assert_eq!(config.syscalls.allow_extra, vec!["ptrace"]);
-    assert_eq!(config.syscalls.deny_extra, vec!["personality", "seccomp"]);
+    assert_eq!(config.syscalls.allow_extra, vec!["statx"]);
+    assert_eq!(
+        config.syscalls.deny_extra,
+        vec!["close_range", "sched_yield"]
+    );
 }
 
 #[test]
@@ -270,7 +273,7 @@ fn reject_mixed_absolute_and_relative() {
     let toml = r#"
 [syscalls]
 allow = ["read", "write"]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#;
     let result = RecipeFile::parse(toml);
     assert!(result.is_err(), "mixing allow and allow_extra should fail");
@@ -286,7 +289,7 @@ fn reject_mixed_deny_and_deny_extra() {
     let toml = r#"
 [syscalls]
 deny = ["reboot"]
-deny_extra = ["ptrace"]
+deny_extra = ["statx"]
 "#;
     let result = RecipeFile::parse(toml);
     assert!(result.is_err(), "mixing deny and deny_extra should fail");
@@ -297,7 +300,7 @@ fn reject_mixed_allow_and_deny_extra() {
     let toml = r#"
 [syscalls]
 allow = ["read", "write"]
-deny_extra = ["ptrace"]
+deny_extra = ["statx"]
 "#;
     let result = RecipeFile::parse(toml);
     assert!(result.is_err(), "mixing allow and deny_extra should fail");
@@ -342,22 +345,22 @@ fn merge_filesystem_union() {
     let base = parse_recipe(
         r#"
 [filesystem]
-allow = ["/usr/lib", "/usr/bin"]
-allow_write = ["/tmp/state"]
+read = ["/usr/lib", "/usr/bin"]
+write = ["/tmp/state"]
 deny = ["/etc/shadow"]
 "#,
     );
     let overlay = parse_recipe(
         r#"
 [filesystem]
-allow = ["/usr/bin", "/tmp/workspace"]
-allow_write = ["/tmp/state", "/var/cache/app"]
+read = ["/usr/bin", "/tmp/workspace"]
+write = ["/tmp/state", "/var/cache/app"]
 deny = ["/root"]
 "#,
     );
     let merged = base.merge(overlay);
     assert_eq!(
-        merged.filesystem.allow,
+        merged.filesystem.read,
         vec![
             PathBuf::from("/usr/lib"),
             PathBuf::from("/usr/bin"),
@@ -365,7 +368,7 @@ deny = ["/root"]
         ]
     );
     assert_eq!(
-        merged.filesystem.allow_write,
+        merged.filesystem.write,
         vec![PathBuf::from("/tmp/state"), PathBuf::from("/var/cache/app"),]
     );
     assert_eq!(
@@ -404,16 +407,16 @@ fn merge_egress_last_wins() {
     assert_eq!(a.merge(b).network.egress, None);
 
     let a = parse_recipe("");
-    let b = parse_recipe("[network]\negress = \"direct\"");
-    assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
+    let b = parse_recipe("[network]\negress = \"none\"");
+    assert_eq!(a.merge(b).network.egress, Some(EgressMode::None));
 
-    let a = parse_recipe("[network]\negress = \"proxy-only\"");
-    let b = parse_recipe("[network]\negress = \"direct\"");
-    assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
+    let a = parse_recipe("[network]\negress = \"none\"");
+    let b = parse_recipe("[network]\negress = \"proxy\"");
+    assert_eq!(a.merge(b).network.egress, Some(EgressMode::ProxyOnly));
 
-    let a = parse_recipe("[network]\negress = \"direct\"");
+    let a = parse_recipe("[network]\negress = \"proxy\"");
     let b = parse_recipe("");
-    assert_eq!(a.merge(b).network.egress, Some(EgressMode::Direct));
+    assert_eq!(a.merge(b).network.egress, Some(EgressMode::ProxyOnly));
 }
 
 #[test]
@@ -444,35 +447,49 @@ domain = "hex.pm"
 }
 
 #[test]
-fn merge_seccomp_mode_last_wins() {
-    let a = parse_recipe(
+fn seccomp_default_allow_resolves_to_deny_list() {
+    // The recipe surface no longer exposes seccomp_mode; deny-list
+    // (default-ALLOW) is requested via [unsafe] seccomp_default_allow and
+    // folded into the resolved syscalls config.
+    let recipe = parse_recipe(
         r#"
-[syscalls]
-seccomp_mode = "allow-list"
+[unsafe]
+seccomp_default_allow = true
 "#,
     );
+    let config = recipe.into_sandbox_config().unwrap();
+    assert_eq!(config.syscalls.seccomp_mode(), SeccompMode::DenyList);
+
+    // Without it, the secure default-deny allow-list stands.
+    let plain = parse_recipe("").into_sandbox_config().unwrap();
+    assert_eq!(plain.syscalls.seccomp_mode(), SeccompMode::AllowList);
+}
+
+#[test]
+fn seccomp_mode_field_rejected_in_syscalls() {
+    // It must not be settable directly — that's the inversion [unsafe] guards.
+    let result: Result<RecipeFile, _> = toml::from_str(
+        r#"
+[syscalls]
+seccomp_mode = "deny-list"
+"#,
+    );
+    assert!(result.is_err(), "[syscalls] seccomp_mode must be rejected");
+}
+
+#[test]
+fn unsafe_block_merge_is_monotonic() {
+    let a = parse_recipe("");
     let b = parse_recipe(
         r#"
-[syscalls]
-seccomp_mode = "deny-list"
+[unsafe]
+host_loopback = true
+reachable_ips = ["10.0.0.5/32"]
 "#,
     );
-    assert_eq!(
-        a.merge(b).syscalls.seccomp_mode,
-        Some(SeccompMode::DenyList)
-    );
-
-    let a = parse_recipe(
-        r#"
-[syscalls]
-seccomp_mode = "deny-list"
-"#,
-    );
-    let b = parse_recipe("");
-    assert_eq!(
-        a.merge(b).syscalls.seccomp_mode,
-        Some(SeccompMode::DenyList)
-    );
+    let merged = a.merge(b).into_sandbox_config().unwrap();
+    assert!(merged.network.allow_host_loopback);
+    assert_eq!(merged.network.allow_ips, vec!["10.0.0.5/32"]);
 }
 
 #[test]
@@ -480,21 +497,21 @@ fn merge_syscall_extras_union() {
     let a = parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["ptrace", "personality"]
+allow_extra = ["statx", "close_range"]
 deny_extra = ["reboot"]
 "#,
     );
     let b = parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["personality", "seccomp"]
+allow_extra = ["close_range", "sched_yield"]
 deny_extra = ["mount"]
 "#,
     );
     let merged = a.merge(b);
     assert_eq!(
         merged.syscalls.allow_extra,
-        vec!["ptrace", "personality", "seccomp"]
+        vec!["statx", "close_range", "sched_yield"]
     );
     assert_eq!(merged.syscalls.deny_extra, vec!["reboot", "mount"]);
 }
@@ -525,7 +542,7 @@ fn merge_process_union_and_last_wins() {
         r#"
 [process]
 max_pids = 64
-allow_execve = ["/usr/bin/python3"]
+exec = ["/usr/bin/python3"]
 env_passthrough = ["PATH", "HOME"]
 "#,
     );
@@ -540,8 +557,8 @@ env_passthrough = ["HOME", "LANG"]
     assert_eq!(merged.process.max_pids, Some(256));
     assert_eq!(merged.process.env_passthrough, vec!["PATH", "HOME", "LANG"]);
     assert_eq!(
-        merged.process.allow_execve,
-        vec![PathBuf::from("/usr/bin/python3")]
+        merged.process.exec(),
+        ExecPolicy::Allow(vec![PathBuf::from("/usr/bin/python3")])
     );
 }
 
@@ -571,16 +588,16 @@ fn merge_three_recipes() {
     let a = parse_recipe(
         r#"
 [filesystem]
-allow = ["/usr/lib"]
+read = ["/usr/lib"]
 "#,
     );
     let b = parse_recipe(
         r#"
 [filesystem]
-allow = ["/usr/bin"]
+read = ["/usr/bin"]
 
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#,
     );
     let c = parse_recipe(
@@ -588,13 +605,13 @@ allow_extra = ["ptrace"]
 strict = true
 
 [filesystem]
-allow = ["/tmp"]
+read = ["/tmp"]
 deny = ["/root"]
 "#,
     );
     let merged = a.merge(b).merge(c);
     assert_eq!(
-        merged.filesystem.allow,
+        merged.filesystem.read,
         vec![
             PathBuf::from("/usr/lib"),
             PathBuf::from("/usr/bin"),
@@ -602,7 +619,7 @@ deny = ["/root"]
         ]
     );
     assert_eq!(merged.filesystem.deny, vec![PathBuf::from("/root")]);
-    assert_eq!(merged.syscalls.allow_extra, vec!["ptrace"]);
+    assert_eq!(merged.syscalls.allow_extra, vec!["statx"]);
     assert_eq!(merged.strict, Some(true));
 }
 
@@ -625,36 +642,73 @@ fn merge_three_recipes_any_strict_true_wins() {
 }
 
 #[test]
-fn merge_three_recipes_egress_chain_last_wins() {
+fn merge_egress_chain_last_some_wins() {
+    // egress is last-Some-wins across layers (recipes may only set
+    // none|proxy; unfiltered/direct comes from [unsafe]).
     let merged = parse_recipe("")
-        .merge(parse_recipe(
-            r#"
-[network]
-egress = "direct"
-"#,
-        ))
-        .merge(parse_recipe(
-            r#"
-[network]
-egress = "proxy-only"
-"#,
-        ));
+        .merge(parse_recipe("[network]\negress = \"none\"\n"))
+        .merge(parse_recipe("[network]\negress = \"proxy\"\n"));
     assert_eq!(merged.network.egress, Some(EgressMode::ProxyOnly));
 
-    let merged = parse_recipe(
+    let merged = parse_recipe("[network]\negress = \"proxy\"\n")
+        .merge(parse_recipe(""))
+        .merge(parse_recipe("[network]\negress = \"none\"\n"));
+    assert_eq!(merged.network.egress, Some(EgressMode::None));
+}
+
+#[test]
+fn egress_direct_rejected_in_network() {
+    // The unfiltered/direct mode must not be settable via [network] — it
+    // disables DLP + contract gates and belongs in [unsafe].
+    let err = RecipeFile::parse("[network]\negress = \"direct\"\n").unwrap_err();
+    assert!(
+        err.to_string().contains("unfiltered") || err.to_string().contains("direct"),
+        "expected a direct-egress rejection, got: {err}"
+    );
+}
+
+#[test]
+fn unfiltered_egress_resolves_to_direct() {
+    let config = parse_recipe("[unsafe]\nunfiltered_egress = true\n")
+        .into_sandbox_config()
+        .unwrap();
+    assert_eq!(config.network.egress(), EgressMode::Direct);
+}
+
+#[test]
+fn dangerous_syscall_in_allow_extra_rejected() {
+    // ptrace widens the kernel attack surface; it must go in
+    // [unsafe] extra_syscalls, not [syscalls] allow_extra.
+    let err = RecipeFile::parse("[syscalls]\nallow_extra = [\"ptrace\"]\n").unwrap_err();
+    assert!(
+        err.to_string().contains("unsafe") || err.to_string().contains("isolation-weakening"),
+        "expected dangerous-syscall rejection, got: {err}"
+    );
+    // …and works when declared in [unsafe].
+    let config = parse_recipe("[unsafe]\nextra_syscalls = [\"ptrace\"]\n")
+        .into_sandbox_config()
+        .unwrap();
+    assert!(config.syscalls.allow_extra.contains(&"ptrace".to_string()));
+}
+
+#[test]
+fn unfiltered_egress_contradicting_credentials_rejected() {
+    // fake_secrets / allow_credentials / DLP do nothing without the proxy.
+    let err = RecipeFile::parse(
         r#"
-[network]
-egress = "proxy-only"
+[[host]]
+domain = "api.github.com"
+allow_credentials = ["github_pat"]
+
+[unsafe]
+unfiltered_egress = true
 "#,
     )
-    .merge(parse_recipe(""))
-    .merge(parse_recipe(
-        r#"
-[network]
-egress = "direct"
-"#,
-    ));
-    assert_eq!(merged.network.egress, Some(EgressMode::Direct));
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("unfiltered_egress"),
+        "expected contradiction rejection, got: {err}"
+    );
 }
 
 #[test]
@@ -662,23 +716,23 @@ fn merge_three_recipes_allow_extra_union_dedupes() {
     let merged = parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["ptrace"]
+allow_extra = ["statx"]
 "#,
     )
     .merge(parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["ptrace", "io_uring_setup"]
+allow_extra = ["statx", "getrandom"]
 "#,
     ))
     .merge(parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["io_uring_setup", "io_uring_enter"]
+allow_extra = ["getrandom", "membarrier"]
 "#,
     ));
     assert_eq!(merged.syscalls.allow_extra.len(), 3);
-    for s in ["ptrace", "io_uring_setup", "io_uring_enter"] {
+    for s in ["statx", "getrandom", "membarrier"] {
         assert!(
             merged.syscalls.allow_extra.contains(&s.to_string()),
             "{s} missing from merged allow_extra",
@@ -691,12 +745,12 @@ fn merge_recipe_with_allow_and_deny_extra_keeps_both() {
     let merged = parse_recipe(
         r#"
 [syscalls]
-allow_extra = ["ptrace"]
-deny_extra = ["ptrace"]
+allow_extra = ["statx"]
+deny_extra = ["statx"]
 "#,
     );
-    assert!(merged.syscalls.allow_extra.contains(&"ptrace".to_string()));
-    assert!(merged.syscalls.deny_extra.contains(&"ptrace".to_string()));
+    assert!(merged.syscalls.allow_extra.contains(&"statx".to_string()));
+    assert!(merged.syscalls.deny_extra.contains(&"statx".to_string()));
 }
 
 #[test]
@@ -706,7 +760,7 @@ fn merge_three_recipes_strict_invariant_with_egress_change() {
 strict = true
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 "#,
     );
     let auto_detected = parse_recipe(
@@ -856,21 +910,21 @@ fn expand_env_vars_in_sandbox_config() {
     let recipe = parse_recipe(
         r#"
 [filesystem]
-allow = ["$_CANISTER_TEST_HOME2/.cargo"]
-allow_write = ["$_CANISTER_TEST_HOME2/.local/share/app"]
+read = ["$_CANISTER_TEST_HOME2/.cargo"]
+write = ["$_CANISTER_TEST_HOME2/.local/share/app"]
 deny = ["$_CANISTER_TEST_HOME2/.ssh"]
 
 [process]
-allow_execve = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
+exec = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
 "#,
     );
     let config = recipe.into_sandbox_config().unwrap();
     assert_eq!(
-        config.filesystem.allow,
+        config.filesystem.read,
         vec![PathBuf::from("/home/bob/.cargo")]
     );
     assert_eq!(
-        config.filesystem.allow_write,
+        config.filesystem.write,
         vec![PathBuf::from("/home/bob/.local/share/app")]
     );
     assert_eq!(
@@ -878,8 +932,8 @@ allow_execve = ["$_CANISTER_TEST_HOME2/.cargo/bin/rustc"]
         vec![PathBuf::from("/home/bob/.ssh")]
     );
     assert_eq!(
-        config.process.allow_execve,
-        vec![PathBuf::from("/home/bob/.cargo/bin/rustc")]
+        config.process.exec(),
+        ExecPolicy::Allow(vec![PathBuf::from("/home/bob/.cargo/bin/rustc")])
     );
     unsafe { std::env::remove_var("_CANISTER_TEST_HOME2") };
 }
@@ -894,7 +948,7 @@ fn r16_untrusted_recipe_credentials_dropped() {
 name = "evil"
 
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [network.dlp]
 enabled = true
@@ -934,13 +988,128 @@ domain = "api.example.com"
 }
 
 #[test]
+fn fake_secrets_parse_and_resolve() {
+    let content = r#"
+[network]
+egress = "proxy"
+
+[network.dlp]
+enabled = true
+fake_secrets = [
+  { env = "GITHUB_TOKEN", credential = "github_pat" },
+  { env = "NPM_TOKEN", credential = "npm_token" },
+]
+"#;
+    let recipe = RecipeFile::parse(content).unwrap();
+    let fakes = &recipe.network.dlp.as_ref().unwrap().fake_secrets;
+    assert_eq!(fakes.len(), 2);
+    assert_eq!(fakes[0].env, "GITHUB_TOKEN");
+    assert_eq!(fakes[0].credential, "github_pat");
+    // Survives resolution into the runtime SandboxConfig.
+    let sandbox = recipe.into_sandbox_config().unwrap();
+    let resolved = &sandbox.network.dlp.as_ref().unwrap().fake_secrets;
+    assert_eq!(resolved.len(), 2);
+}
+
+#[test]
+fn fake_secrets_merge_unions_by_env() {
+    // Base declares GITHUB_TOKEN; overlay re-declares it (credential
+    // wins) and adds NPM_TOKEN. Result: one entry per env.
+    let base = RecipeFile::parse(
+        r#"
+[network.dlp]
+fake_secrets = [{ env = "GITHUB_TOKEN", credential = "github_pat" }]
+"#,
+    )
+    .unwrap();
+    let overlay = RecipeFile::parse(
+        r#"
+[network.dlp]
+fake_secrets = [
+  { env = "GITHUB_TOKEN", credential = "github_pat" },
+  { env = "NPM_TOKEN", credential = "npm_token" },
+]
+"#,
+    )
+    .unwrap();
+    let merged = base.merge(overlay);
+    let fakes = &merged.network.dlp.as_ref().unwrap().fake_secrets;
+    assert_eq!(fakes.len(), 2, "duplicate env must not produce two entries");
+    let envs: Vec<&str> = fakes.iter().map(|f| f.env.as_str()).collect();
+    assert!(envs.contains(&"GITHUB_TOKEN"));
+    assert!(envs.contains(&"NPM_TOKEN"));
+}
+
+#[test]
+fn trusted_nested_recipe_keeps_credentials_and_fake_secrets() {
+    // Regression: the load-time trust gate sees only `path.file_name()`
+    // (e.g. "github.toml"), which never matches the relative-path keys in
+    // checksums.toml ("services/github.toml"). Trust must therefore be
+    // content-based — an official recipe stays trusted even when its file
+    // name doesn't match a checksum key. We write the *real* pinned
+    // github recipe under a bare filename and assert nothing is dropped.
+    let content = include_str!("../../../../recipes/services/github.toml");
+    let dir = std::env::temp_dir().join("can-trust-content-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("github.toml");
+    std::fs::write(&path, content).unwrap();
+
+    let recipe = RecipeFile::from_file(&path).unwrap();
+    let dlp = recipe.network.dlp.as_ref().unwrap();
+    assert!(
+        !dlp.fake_secrets.is_empty(),
+        "pinned recipe content must keep fake_secrets (trusted)"
+    );
+    assert!(
+        recipe.hosts.iter().any(|h| !h.allow_credentials.is_empty()),
+        "pinned recipe content must keep allow_credentials (trusted)"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn untrusted_recipe_fake_secrets_dropped() {
+    // fake_secrets routes a real credential to authorized hosts, so an
+    // unpinned recipe must not be able to declare it — same trust gate
+    // as [[host]] allow_credentials.
+    let content = r#"
+[recipe]
+name = "evil-fake"
+
+[network]
+egress = "proxy"
+
+[network.dlp]
+enabled = true
+fake_secrets = [{ env = "GITHUB_TOKEN", credential = "github_pat" }]
+"#;
+    let dir = std::env::temp_dir().join("can-fake-secrets-trust-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fake-evil-fakesecrets.toml");
+    std::fs::write(&path, content).unwrap();
+
+    let recipe = RecipeFile::from_file(&path).unwrap();
+    let dlp = recipe.network.dlp.as_ref().unwrap();
+    assert!(
+        dlp.fake_secrets.is_empty(),
+        "untrusted recipe's fake_secrets should be cleared, got: {:?}",
+        dlp.fake_secrets
+    );
+    // The DLP section itself is preserved.
+    assert_eq!(dlp.enabled, Some(true));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn r16_parse_path_skipped_for_string_parse() {
     // `RecipeFile::parse` (no path) bypasses the R16 trust filter —
     // the filter only triggers for `from_file`, which can know the
     // filename to look up in the embedded checksums table.
     let content = r#"
 [network]
-egress = "proxy-only"
+egress = "proxy"
 
 [[host]]
 domain = "github.corp.example.com"

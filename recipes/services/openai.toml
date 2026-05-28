@@ -7,6 +7,12 @@
 name = "openai"
 description = "OpenAI API contracts"
 
+# Fake-secret swap: the sandbox gets a fake OPENAI_API_KEY; the proxy swaps
+# in the real value only on egress to the openai_key-scoped host below.
+# See docs/refusals.md.
+[network.dlp]
+fake_secrets = [{ env = "OPENAI_API_KEY", credential = "openai_key" }]
+
 [[host]]
 domain            = "api.openai.com"
 methods           = ["GET", "POST", "DELETE"]

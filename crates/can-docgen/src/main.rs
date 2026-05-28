@@ -693,12 +693,9 @@ fn generate_recipes_data_json() -> Result<()> {
             .collect();
         let fs = &recipe.filesystem;
         let filesystem_allow: Vec<String> =
-            fs.allow.iter().map(|p| p.display().to_string()).collect();
-        let filesystem_allow_write: Vec<String> = fs
-            .allow_write
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
+            fs.read.iter().map(|p| p.display().to_string()).collect();
+        let filesystem_allow_write: Vec<String> =
+            fs.write.iter().map(|p| p.display().to_string()).collect();
         let filesystem_deny: Vec<String> =
             fs.deny.iter().map(|p| p.display().to_string()).collect();
         let env_passthrough = recipe.process.env_passthrough.clone();

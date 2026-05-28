@@ -4,7 +4,7 @@ description = "kubectl: config + cache; token files via KUBECONFIG env only"
 version = "1"
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.kube/config",
     "$HOME/.kube/cache",
 ]

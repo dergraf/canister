@@ -13,12 +13,12 @@ suggests = ["rustup", "crates-io"]
 #   recipes = ["cargo", "crates-io"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.cargo/config.toml",
     "$HOME/.cargo/config",
     "$HOME/.rustup",
 ]
-allow_write = [
+write = [
     "$HOME/.cargo/registry",
     "$HOME/.cargo/git",
     "$HOME/.cargo/advisory-db",

@@ -5,11 +5,11 @@ version = "1"
 suggests = ["node", "yarn-registry"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.yarnrc",
     "$HOME/.yarnrc.yml",
 ]
-allow_write = [
+write = [
     "$HOME/.yarn",
     "$HOME/.cache/yarn",
 ]

@@ -5,7 +5,7 @@ version = "1"
 suggests = ["node", "npm-registry"]
 
 [filesystem]
-allow_write = [
+write = [
     "$HOME/.local/share/pnpm",
     "$HOME/.local/share/pnpm/store",
     "$HOME/.config/pnpm",

@@ -18,6 +18,7 @@ leak to unauthorised destinations.
 - [DNS Entropy Check](#dns-entropy-check)
 - [Session Entropy Budget](#session-entropy-budget)
 - [Canary Tokens](#canary-tokens)
+- [Fake-Secret Swap](#fake-secret-swap)
 - [Enforcement Modes (`--strict` and `--monitor`)](#enforcement-modes)
 - [Response Headers and Status Codes](#response-headers-and-status-codes)
 - [Configuration](#configuration)
@@ -43,6 +44,14 @@ potentially:
 DLP's goal: even when a credential is *readable*, it cannot leave the
 sandbox via HTTP(S) unless flowing to an explicitly authorised
 destination for that credential's service.
+
+Pattern-based detection has one structural blind spot: a process can
+**encrypt** a secret before exfiltrating it, and the ciphertext matches
+no detector. The [fake-secret swap](#fake-secret-swap) closes this for
+env-var secrets by ensuring the sandbox never holds the real value in
+the first place — it carries a fake, and the proxy substitutes the real
+value only on egress to an authorised host. Encrypt-then-exfiltrate then
+leaks only the useless fake.
 
 **In scope:**
 
@@ -272,14 +281,23 @@ session — it resets when the sandbox exits.
 ## Canary Tokens
 
 When `canary_tokens = true` (default when DLP is enabled), the sandbox
-generates three fake credentials at startup and exports them as
-environment variables into the sandboxed process:
+generates one fake credential per detector that has a `CanarySpec` in the
+registry and exports them as environment variables into the sandboxed
+process:
 
 | Env var | Shape |
 |---|---|
 | `CANISTER_CANARY_GITHUB_PAT` | `ghp_` + 36 random alphanumeric |
 | `CANISTER_CANARY_NPM_TOKEN` | `npm_` + 36 random alphanumeric |
 | `CANISTER_CANARY_AWS_ACCESS_KEY` | `AKIA` + 16 random uppercase |
+| `CANISTER_CANARY_OPENAI_KEY` | `sk-` + 48 random alphanumeric |
+| `CANISTER_CANARY_ANTHROPIC_KEY` | `sk-ant-api03-` + 32 random alphanumeric |
+| `CANISTER_CANARY_SLACK_TOKEN` | `xoxb-…-…-` + 24 random alphanumeric |
+| `CANISTER_CANARY_STRIPE_KEY` | `sk_live_` + 32 random alphanumeric |
+
+Adding a canary is a single registry edit (`canary: Some(CanarySpec { … })`
+in `registry.rs`); the generator, the scanner's substring set, and the
+registry-driven tests all read from that one slice.
 
 The same exact strings are registered as the highest-priority pattern in
 the `DlpScanner`. Any outbound appearance of one of these strings is
@@ -290,7 +308,67 @@ because they don't authenticate to anything. The detection is always
 Canary tokens are an active honeypot: they create traffic that a
 malicious process is incentivised to scoop up (env vars are the first
 thing credential thieves enumerate) and which the proxy treats as a
-high-confidence trip wire.
+high-confidence trip wire. They are injected under synthetic
+`CANISTER_CANARY_*` names and are **never** swapped for a real value —
+that is the job of the fake-secret swap, which is a distinct mechanism.
+
+---
+
+## Fake-Secret Swap
+
+Canary tokens are pure tripwires — they don't authenticate to anything,
+so a tool that actually *needs* `GITHUB_TOKEN` would break if handed one.
+The **fake-secret swap** makes a fake *functional*: the sandbox runs with
+a fake under the real env-var name, and the proxy substitutes the real
+value back in on authorised egress.
+
+```
+[network.dlp]
+fake_secrets = [{ env = "GITHUB_TOKEN", credential = "github_pat" }]
+```
+
+Lifecycle:
+
+1. **Capture & generate (parent).** Before the sandbox fork, the parent
+   reads the real value from the host env, generates a fake matching the
+   named credential's pattern (the same generator the canaries use), and
+   records a `fake → real` map. The real value is never placed in the
+   child environment — only the fake, under the real name (any
+   `env_passthrough` copy is stripped first).
+2. **Detect (proxy).** The sandbox carries only the fake. Because the
+   fake matches the credential's regex (`ghp_…`), the existing scanner
+   blocks it on egress to any host **not** authorised for that credential
+   — exactly as it would the real one.
+3. **Swap (proxy).** Just before forwarding to a host that *is*
+   authorised for the credential (its home domain or a `[[host]]`
+   `allow_credentials` entry), the proxy replaces the fake with the real
+   value in request headers and the buffered body, fixing `Content-Length`
+   if the length changed.
+
+The authorisation gate is the **same** `allow_credentials` / home-domain
+scope the scanner uses, and it is checked **independently of enforcement
+mode** — so `--monitor` (which downgrades blocks to warnings) never
+causes a real secret to be swapped toward an unauthorised host.
+
+Why this defeats encrypt-then-exfiltrate: the real secret materialises
+only inside the proxy, only for authorised destinations, in plaintext the
+proxy itself constructs. A tool that base64s, gzips, or encrypts its
+`GITHUB_TOKEN` and POSTs it to `evil.com` is shipping the *fake* — the
+proxy finds no matching substring to swap, and the blob is worthless.
+
+**Trust.** `fake_secrets` routes a real credential to authorised hosts, so
+it is a credential-trust escalation: an unpinned (untrusted) recipe has
+its `fake_secrets` dropped at load, exactly like `allow_credentials`. The
+shipped service recipes are pinned by checksum, so their `fake_secrets`
+take effect; user-authored scope belongs in the project `canister.toml`.
+
+**Scope (v1).** Only env-var secrets whose credential has a generatable
+pattern (`github_pat`, `npm_token`, `openai_key`, `anthropic_key`,
+`slack_token`, `stripe_key`). Opaque/patternless secrets and secrets
+delivered by other means (files, args) are out of scope, as is swapping
+inside a streamed body above the proxy's buffered-body cap (headers are
+always covered). AWS is deferred — its secret-access-key has no pattern,
+so faking only the `AKIA…` access-key-id would be misleading.
 
 ---
 
@@ -303,7 +381,7 @@ introducing a separate kill switch.
 |---|---|---|---|
 | Default | Per recipe `enabled = true` | warn | 451 |
 | `--monitor` | As configured | warn (logged) | **Not blocked** — request forwarded with `x-canister-dlp-warning` header |
-| `--strict` | **Implicitly enabled** when `egress = "proxy-only"` | **promoted to block** | 451 |
+| `--strict` | **Implicitly enabled** when `egress = "proxy"` | **promoted to block** | 451 |
 
 - **Default**: DLP runs if the recipe enables it; violations are 451.
 - **`--monitor`**: DLP findings are logged at `warn!` level with full
@@ -311,7 +389,7 @@ introducing a separate kill switch.
   Mirrors how monitor mode handles seccomp and filesystem checks. Use
   this to dry-run a new policy before flipping it on.
 - **`--strict`**: DLP is implicitly enabled even without
-  `dlp.enabled = true`, provided the recipe uses `egress = "proxy-only"`
+  `dlp.enabled = true`, provided the recipe uses `egress = "proxy"`
   (strict mode requires DLP-grade enforcement). `generic_high_entropy`
   is promoted from warn to block.
 
@@ -341,16 +419,20 @@ Full schema (all fields optional; defaults shown):
 
 ```toml
 [network.dlp]
-enabled = false                   # implicit true under --strict + proxy-only
+enabled = false                   # implicit true under --strict + proxy
 canary_tokens = true              # default when DLP is enabled
 max_decode_depth = 32             # encoding chain recursion cap
 decompress = true                 # gzip/deflate/brotli before scan
 dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
 session_entropy_budget = 8192     # cumulative high-entropy bytes/session
 
-[network.dlp.extra_scopes]
-github_pat = ["github.corp.example.com"]
-npm_token = ["npm.internal.example.com"]
+# Env-var secrets to fake-and-swap (see Fake-Secret Swap above). Each
+# entry names the env var the real secret arrives in and the credential
+# detector that classifies it (governs both fake generation and swap
+# authorisation).
+fake_secrets = [
+  { env = "GITHUB_TOKEN", credential = "github_pat" },
+]
 ```
 
 ### Merge semantics
@@ -362,6 +444,7 @@ auto-detected → explicit `-r` → manifest overrides), each field uses:
 |---|---|---|
 | `enabled` | OR (any `Some(true)` wins) | Security escalation, never reversed |
 | `canary_tokens` | OR | Same |
+| `fake_secrets` | union by `env` (overlay `credential` wins) | One fake per var; layers add, never conflict |
 | `extra_scopes` | per-detector domain union | Never narrows |
 | `max_decode_depth` | last-Some-wins | Numeric tuning |
 | `decompress` | last-Some-wins | |
@@ -377,9 +460,13 @@ upstream recipe enabled, and can never *shrink* the scope set.
   every sandbox in the project.
 - **Per-sandbox**: same key under `[sandbox.<name>.network.dlp]`.
 - **Recipe-level**: drop a `[network.dlp]` block into a custom recipe.
-  The shipped per-tool recipes (`gh`, `npm`, etc.) deliberately do
-  **not** ship `[network.dlp]` — they declare the right `[[host]]`
-  blocks with `allow_credentials`, and the scope check does the rest.
+  The shipped **service** recipes (`github`, `npm-registry`, `openai`,
+  `anthropic`, `slack`, `stripe`) ship `[network.dlp] fake_secrets` so
+  their tokens are faked-and-swapped by default; they are pinned by
+  checksum, so the credential scope survives the untrusted-recipe gate.
+  A user-authored (unpinned) recipe's `fake_secrets` and
+  `allow_credentials` are dropped at load — put project-specific scope in
+  `canister.toml` instead.
 
 ---
 

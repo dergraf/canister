@@ -9,6 +9,12 @@
 name = "slack"
 description = "Slack API contracts"
 
+# Fake-secret swap: the sandbox gets a fake SLACK_BOT_TOKEN; the proxy
+# swaps in the real value only on egress to the slack_token-scoped host
+# below. See docs/refusals.md.
+[network.dlp]
+fake_secrets = [{ env = "SLACK_BOT_TOKEN", credential = "slack_token" }]
+
 [[host]]
 domain            = "slack.com"
 methods           = ["GET", "POST"]

@@ -291,18 +291,15 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
 
     // Filesystem.
     println!("[filesystem]");
-    if !config.filesystem.allow.is_empty() {
-        println!("  allow ({} paths):", config.filesystem.allow.len());
-        for p in &config.filesystem.allow {
+    if !config.filesystem.read.is_empty() {
+        println!("  read ({} paths):", config.filesystem.read.len());
+        for p in &config.filesystem.read {
             println!("    {}", p.display());
         }
     }
-    if !config.filesystem.allow_write.is_empty() {
-        println!(
-            "  allow_write ({} paths):",
-            config.filesystem.allow_write.len()
-        );
-        for p in &config.filesystem.allow_write {
+    if !config.filesystem.write.is_empty() {
+        println!("  write ({} paths):", config.filesystem.write.len());
+        for p in &config.filesystem.write {
             println!("    {}", p.display());
         }
     }
@@ -324,37 +321,72 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
     println!("[network]");
     let egress = match config.network.egress() {
         EgressMode::None => "none",
-        EgressMode::ProxyOnly => "proxy-only",
-        EgressMode::Direct => "direct",
+        EgressMode::ProxyOnly => "proxy",
+        EgressMode::Direct => "direct (UNSAFE: unfiltered — DLP & contracts OFF)",
     };
     println!("  egress: {egress}");
     if !config.hosts.is_empty() {
         let domains: Vec<&str> = config.hosts.iter().map(|h| h.domain.as_str()).collect();
         println!("  hosts: {domains:?}");
     }
-    if !config.network.allow_ips.is_empty() {
-        println!("  allow_ips: {:?}", config.network.allow_ips);
-    }
-    if !config.network.ports.is_empty() {
-        println!("  ports:");
-        for p in &config.network.ports {
-            println!("    {p}");
-        }
-    }
     println!();
+
+    // Unsafe (resolved from [unsafe]; these lower isolation).
+    if !config.network.allow_ips.is_empty()
+        || !config.network.ports.is_empty()
+        || config.network.allow_host_loopback
+        || matches!(config.network.egress(), EgressMode::Direct)
+        || matches!(
+            config.syscalls.seccomp_mode(),
+            can_policy::config::SeccompMode::DenyList
+        )
+    {
+        println!("[unsafe] ⚠ isolation-weakening settings active");
+        if matches!(config.network.egress(), EgressMode::Direct) {
+            println!("  unfiltered_egress: true (DLP + contract gates OFF)");
+        }
+        if config.network.allow_host_loopback {
+            println!("  host_loopback: true (host 127.0.0.1 services reachable)");
+        }
+        if !config.network.allow_ips.is_empty() {
+            println!(
+                "  reachable_ips: {:?} (un-scanned egress)",
+                config.network.allow_ips
+            );
+        }
+        if !config.network.ports.is_empty() {
+            println!("  expose_ports:");
+            for p in &config.network.ports {
+                println!("    {p}");
+            }
+        }
+        if matches!(
+            config.syscalls.seccomp_mode(),
+            can_policy::config::SeccompMode::DenyList
+        ) {
+            println!("  seccomp_default_allow: true (default-ALLOW syscalls)");
+        }
+        println!();
+    }
 
     // Process.
     println!("[process]");
     if let Some(max) = config.process.max_pids {
         println!("  max_pids: {max}");
     }
-    if !config.process.allow_execve.is_empty() {
-        println!(
-            "  allow_execve ({} entries):",
-            config.process.allow_execve.len()
-        );
-        for p in &config.process.allow_execve {
-            println!("    {}", p.display());
+    match config.process.exec() {
+        can_policy::config::ExecPolicy::Mode(m) => {
+            let label = match m {
+                can_policy::config::ExecMode::Any => "any (any binary may exec)",
+                can_policy::config::ExecMode::EntrypointOnly => "entrypoint-only",
+            };
+            println!("  exec: {label}");
+        }
+        can_policy::config::ExecPolicy::Allow(paths) => {
+            println!("  exec ({} allowed paths):", paths.len());
+            for p in &paths {
+                println!("    {}", p.display());
+            }
         }
     }
     if !config.process.env_passthrough.is_empty() {
@@ -841,14 +873,17 @@ fn print_monitor_policy_preview(config: &SandboxConfig) {
         eprintln!("  deny_extra:      {:?}", config.syscalls.deny_extra);
     }
 
-    // allow_execve.
-    if config.process.allow_execve.is_empty() {
-        eprintln!("  allow_execve:    unrestricted (any command allowed)");
-    } else {
-        eprintln!(
-            "  allow_execve:    {} allowed commands",
-            config.process.allow_execve.len()
-        );
+    // exec policy.
+    match config.process.exec() {
+        can_policy::config::ExecPolicy::Mode(can_policy::config::ExecMode::Any) => {
+            eprintln!("  exec:            any (any binary may exec)");
+        }
+        can_policy::config::ExecPolicy::Mode(can_policy::config::ExecMode::EntrypointOnly) => {
+            eprintln!("  exec:            entrypoint-only");
+        }
+        can_policy::config::ExecPolicy::Allow(paths) => {
+            eprintln!("  exec:            {} allowed paths", paths.len());
+        }
     }
 
     // env_passthrough.
@@ -872,10 +907,10 @@ fn print_monitor_policy_preview(config: &SandboxConfig) {
     eprintln!("  network:         {net_mode:?}");
 
     // Writable paths.
-    if !config.filesystem.allow_write.is_empty() {
+    if !config.filesystem.write.is_empty() {
         eprintln!(
-            "  allow_write:     {} writable paths",
-            config.filesystem.allow_write.len()
+            "  write:           {} writable paths",
+            config.filesystem.write.len()
         );
     }
 
@@ -894,8 +929,10 @@ fn print_monitor_exit_summary(exit_code: i32, config: &SandboxConfig) {
     eprintln!("  Seccomp LOG events (if any) appear in: journalctl -k | grep seccomp");
 
     // Suggest a minimal config based on what we know.
-    let has_restrictions = !config.process.allow_execve.is_empty()
-        || !config.process.env_passthrough.is_empty()
+    let has_restrictions = !matches!(
+        config.process.exec(),
+        can_policy::config::ExecPolicy::Mode(can_policy::config::ExecMode::Any)
+    ) || !config.process.env_passthrough.is_empty()
         || config.process.max_pids.is_some();
 
     if has_restrictions {

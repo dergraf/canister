@@ -10,5 +10,5 @@ description = "Homebrew/Linuxbrew package manager"
 version = "1"
 
 [filesystem]
-allow = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]
+read = ["/opt/homebrew", "/home/linuxbrew/.linuxbrew"]
 

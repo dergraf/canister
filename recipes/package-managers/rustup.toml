@@ -5,11 +5,11 @@ version = "1"
 suggests = ["cargo", "rust-lang", "crates-io"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.rustup/settings.toml",
     "$HOME/.rustup/toolchains",
 ]
-allow_write = [
+write = [
     "$HOME/.rustup/downloads",
     "$HOME/.rustup/tmp",
     "$HOME/.rustup/update-hashes",

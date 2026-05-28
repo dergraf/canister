@@ -6,6 +6,47 @@ use serde::{Deserialize, Serialize};
 use super::error::ConfigError;
 use super::merge::union_vecs;
 
+/// Syscalls that materially widen the kernel attack surface or enable
+/// sandbox-escape primitives. They are rejected from `[syscalls] allow_extra`
+/// and must be declared in `[unsafe] extra_syscalls` so the cost is explicit.
+///
+/// Curated, not exhaustive — the audit question is "could allowing this let
+/// sandboxed code inspect/inject other processes, load kernel code, remount
+/// the filesystem, manipulate namespaces, or open a known exploit surface?"
+pub const DANGEROUS_SYSCALLS: &[&str] = &[
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "bpf",
+    "mount",
+    "umount2",
+    "move_mount",
+    "open_tree",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "pivot_root",
+    "chroot",
+    "kexec_load",
+    "kexec_file_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "personality",
+    "seccomp",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "perf_event_open",
+    "userfaultfd",
+    "add_key",
+    "keyctl",
+    "request_key",
+    "swapon",
+    "swapoff",
+    "reboot",
+];
+
 /// Seccomp enforcement mode.
 ///
 /// Controls how the seccomp BPF filter is constructed:
@@ -47,11 +88,12 @@ impl fmt::Display for SeccompMode {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SyscallConfig {
-    /// Seccomp enforcement mode: "allow-list" (default) or "deny-list".
-    ///
-    /// `None` means "not specified" — merge preserves earlier value,
-    /// `into_sandbox_config()` resolves to `AllowList`.
-    #[serde(default)]
+    /// Seccomp enforcement mode (runtime-resolved). `AllowList`
+    /// (default-deny) is the only mode a recipe can ask for implicitly;
+    /// flipping to `DenyList` (default-**allow**) inverts the security
+    /// posture, so it is authored as `[unsafe] seccomp_default_allow`.
+    /// `#[serde(skip)]` makes `[syscalls] seccomp_mode` a hard error.
+    #[serde(skip)]
     pub seccomp_mode: Option<SeccompMode>,
 
     /// Enable the SECCOMP_RET_USER_NOTIF supervisor for argument-level
@@ -111,7 +153,9 @@ impl SyscallConfig {
         !self.allow_extra.is_empty() || !self.deny_extra.is_empty()
     }
 
-    /// Validate that absolute and relative fields are not mixed.
+    /// Validate that absolute and relative fields are not mixed, and that
+    /// no dangerous syscall is smuggled in via `allow_extra` (those belong
+    /// in `[unsafe] extra_syscalls`).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.is_baseline() && self.is_override() {
             return Err(ConfigError::Validation(
@@ -119,6 +163,18 @@ impl SyscallConfig {
                  Use allow/deny only in default.toml; use allow_extra/deny_extra in regular recipes."
                     .to_string(),
             ));
+        }
+        let dangerous: Vec<&str> = self
+            .allow_extra
+            .iter()
+            .filter(|s| DANGEROUS_SYSCALLS.contains(&s.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !dangerous.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "[syscalls] allow_extra contains isolation-weakening syscalls {dangerous:?}; \
+                 declare these under [unsafe] extra_syscalls instead."
+            )));
         }
         Ok(())
     }

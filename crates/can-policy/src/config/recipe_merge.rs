@@ -30,6 +30,7 @@ impl RecipeFile {
             syscalls: self.syscalls.merge(overlay.syscalls),
             proxy: self.proxy.merge(overlay.proxy),
             hosts: merge_host_blocks(self.hosts, overlay.hosts),
+            unsafe_block: self.unsafe_block.merge(overlay.unsafe_block),
         }
     }
 }

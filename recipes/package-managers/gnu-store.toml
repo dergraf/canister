@@ -10,5 +10,5 @@ description = "GNU Guix package manager (/gnu/store)"
 version = "1"
 
 [filesystem]
-allow = ["/gnu/store"]
+read = ["/gnu/store"]
 

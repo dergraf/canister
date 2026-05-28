@@ -96,13 +96,20 @@ When proxy is enabled with enforcement, outbound networking follows a three-laye
 2. **Proxy second-line (user space):** proxy validates destination against allow policy
    and forwards via L7 HTTP interception path or L4 CONNECT passthrough path.
 3. **DLP third-line (content scanning):** when `[network.dlp]` is enabled (implicit
-   under `--strict` + `proxy-only`), the L7 path scans request headers, URI, and body
+   under `--strict` + `proxy`), the L7 path scans request headers, URI, and body
    for credential patterns (GitHub PATs, npm tokens, AWS keys, SSH keys, etc.) and
    enforces per-detector domain scoping. A GitHub PAT bound for `registry.npmjs.org`
    is blocked even though `registry.npmjs.org` has a `[[host]]` block. Bodies are decompressed
    (gzip/deflate/brotli) and decoded (base64/hex/percent, up to 32 layers) before
    pattern matching. See [DLP.md](DLP.md) for the threat model, detector list, and
    canary-token / session-entropy-budget mechanisms.
+4. **Fake-secret swap (input substitution):** for env-var secrets named in
+   `[network.dlp] fake_secrets`, the sandbox is given a fake value under the real
+   variable name while the parent hands the proxy the `fake → real` map. The proxy
+   swaps the real value back in only on egress to a host authorised for that
+   credential. The real secret never enters the sandbox, so even an encrypted
+   exfiltration attempt leaks only the useless fake. See
+   [DLP.md § Fake-Secret Swap](DLP.md#fake-secret-swap).
 
 This prevents bypass by unsetting proxy environment variables, and prevents
 exfiltration of credentials that the sandbox legitimately needs read access to.
@@ -156,7 +163,7 @@ The complete lifecycle of `can run -r nix -r elixir -- mix test`:
 │    d. Load explicit --recipe args (name-based lookup or file path)  │
 │    e. Merge recipe chain: base → auto-detected → explicit (L-to-R) │
 │    f. Expand env vars ($HOME, $USER, etc.) in merged config         │
-│    g. Validate allow_execve, determine network mode                 │
+│    g. Validate exec, determine network mode                 │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────────────────┐
@@ -448,7 +455,7 @@ This design means adding support for a new package manager is "write a
 function was removed entirely.
 
 **Security model:** Filesystem visibility does not equal execution permission.
-Mounted paths are visible inside the sandbox, but `allow_execve` and the
+Mounted paths are visible inside the sandbox, but `exec` and the
 USER_NOTIF supervisor's `execve()`/`execveat()` filtering control what can
 actually be *executed*.
 
@@ -601,7 +608,7 @@ Instruction  What it does
 [N+2]        Return ERRNO(EPERM) (match → denied)
 ```
 
-The mode is selected via `[syscalls] seccomp_mode` in the config file
+The mode is selected via `[unsafe] seccomp_default_allow` in the config file
 (default: `"allow-list"`).
 
 **Architecture validation:** The first check rejects any syscall from a
@@ -672,13 +679,13 @@ terminates.
 
 | Syscall | What is inspected | Policy enforcement |
 |---------|------------------|--------------------|
-| `connect()` | `sockaddr` struct (IP + port) | Must match IPs resolved from each `[[host]]`'s `domain`, `allow_ips` CIDRs, or loopback |
+| `connect()` | `sockaddr` struct (IP + port) | Must match IPs resolved from each `[[host]]`'s `domain`, `reachable_ips` CIDRs, or loopback |
 | `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution; connected sockets (NULL addr) allowed |
 | `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing |
 | `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`) denied |
 | `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/<pid>/mem` |
 | `socket()` | `domain` + `type` + `protocol` registers | `SOCK_RAW` denied; `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only |
-| `execve()` | Pathname string in userspace memory | Must match `allow_execve` paths (empty = allow all) |
+| `execve()` | Pathname string in userspace memory | Must match `exec` paths (empty = allow all) |
 | `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
 
 **TOCTOU mitigation:** Between reading the worker's memory and sending the verdict,
@@ -709,12 +716,12 @@ via `[syscalls] notifier` in recipe config.
 subject to argument-level inspection. A sandboxed process cannot connect to
 unauthorized IPs, pass file descriptors via SCM_RIGHTS, create new namespaces
 via clone flags, open raw sockets, open AF_NETLINK sockets beyond NETLINK_ROUTE,
-or exec binaries outside the `allow_execve` list.
+or exec binaries outside the `exec` list.
 
 ### 5. Process Control
 
 **Modules:** `process.rs` (environment filtering, PID namespace, RLIMIT_NPROC,
-allow_execve validation)
+exec validation)
 
 Process control enforces the `[process]` config section:
 
@@ -792,6 +799,14 @@ explicitly.
 credentials in `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, etc.) are never
 leaked to the sandbox unless explicitly listed in `env_passthrough`.
 
+**Fake-secret injection** (`[network.dlp] fake_secrets`): for a marked
+secret, the child environment receives a generated *fake* under the real
+variable name and any host copy of that variable is stripped first, so
+the real value never reaches the sandbox. The real value is captured by
+the parent and handed to the egress proxy, which swaps it back in on
+authorised egress (see Outbound Defense Model above and
+[DLP.md § Fake-Secret Swap](DLP.md#fake-secret-swap)).
+
 **`max_pids`** (`RLIMIT_NPROC`):
 
 Sets `RLIMIT_NPROC` via `setrlimit()` to cap the number of processes the
@@ -801,9 +816,9 @@ runs as UID 0 in its own user namespace, mapped to the host user.
 **Security property:** Prevents fork bombs. A process that exceeds the limit
 gets `EAGAIN` from `fork()`.
 
-**`allow_execve`** (pre-exec validation):
+**`exec`** (pre-exec validation):
 
-The resolved command path is checked against the `allow_execve` list
+The resolved command path is checked against the `exec` list
 before forking. If the command is not in the list (and the list is non-empty),
 execution is rejected immediately.
 
@@ -814,12 +829,12 @@ to prevent false positives (e.g., `/nix/store-extra/foo` does NOT match
 `/nix/store/*`). This is essential for content-addressed stores like Nix
 where binary paths contain unpredictable hashes.
 
-**Limitation:** `allow_execve` validates the *initial* command at the CLI
+**Limitation:** `exec` validates the *initial* command at the CLI
 level. Ongoing enforcement of every `execve()` call inside the sandbox is
 provided by the USER_NOTIF supervisor (see
 [Seccomp USER_NOTIF Supervisor](#4b-seccomp-user_notif-supervisor)), which
 intercepts `execve()` and `execveat()` syscalls and validates the pathname
-against the `allow_execve` list. When the notifier is disabled (kernel
+against the `exec` list. When the notifier is disabled (kernel
 < 5.9 or `notifier = false`), only the initial command is validated.
 
 ### 6. Cgroups v2
@@ -974,7 +989,7 @@ observation) but relaxes policy enforcement. Each enforcement point logs what
 
 | Enforcement point | Normal mode | Monitor mode |
 |-------------------|-------------|--------------|
-| `allow_execve` | Rejects unlisted commands | Logs warning, allows through |
+| `exec` | Rejects unlisted commands | Logs warning, allows through |
 | `env_passthrough` | Strips unlisted env vars | Logs what would be stripped, passes full env |
 | `max_pids` | Sets `RLIMIT_NPROC` | Logs the limit, skips `setrlimit()` |
 | Seccomp BPF | `SECCOMP_RET_ERRNO` (EPERM) | `SECCOMP_RET_LOG` (allowed but kernel-logged) |

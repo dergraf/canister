@@ -9,5 +9,5 @@ description = "Snap package manager (/snap)"
 version = "1"
 
 [filesystem]
-allow = ["/snap"]
+read = ["/snap"]
 

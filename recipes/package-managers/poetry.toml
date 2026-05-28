@@ -5,10 +5,10 @@ version = "1"
 suggests = ["python", "pypi"]
 
 [filesystem]
-allow = [
+read = [
     "$HOME/.config/pypoetry/config.toml",
 ]
-allow_write = [
+write = [
     "$HOME/.cache/pypoetry",
     "$HOME/.local/share/pypoetry",
 ]
