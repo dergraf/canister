@@ -17,6 +17,29 @@ Status: **Decisions made (§0.5); execution proceeding.**
    combined with `reachable_ips`/`[[host]]` becomes a hard config error, removing
    the structurally weak mode entirely.
 
+### Sequencing notes (execution)
+
+- **Phase 2 landed and validated** (register gates → static BPF, `clone3`→ENOSYS):
+  `./ci/verify.sh` green; full integration suite 30/32 (2 skips: selinux needs
+  passwordless sudo). Runtime-verified: SOCK_RAW denied, forking works via the
+  `clone3`→ENOSYS fallback, `unshare(CLONE_NEWUSER)` denied.
+- **Decision 3 lands inside Phase 3, not before.** `t_notif_connect`,
+  `t_dns_filtering`, and the `t_strict` connect arms use `unfiltered_egress` +
+  an allow-list as a *scaffold* to exercise the supervisor's domain/IP connect
+  path **without** a proxy. Rejecting that combo makes the supervisor's
+  `allowed_ips`/`allowed_domains` branch unreachable, so those tests can't be
+  migrated in isolation — they are exactly the supervisor-egress tests Phase 3
+  replaces with structural-egress tests. So decision 3 ships together with the
+  Phase 3 egress re-architecture.
+- **Chosen Phase 3 mechanism:** the proxy process binds its
+  `127.0.0.1:proxy_port` listener while in the *worker's* netns, then
+  `unshare(CLONE_NEWNET)` into its own proxy netns and runs the accept loop
+  there; pasta attaches to the proxy netns. The worker netns keeps only `lo`
+  (no pasta uplink), so the worker cannot reach the internet; outbound dials
+  happen in the proxy netns. This removes the worker's own DNS path, so name
+  resolution becomes the proxy's job — the egress tests must be rewritten to
+  reflect that.
+
 ---
 
 
