@@ -1,416 +1,20 @@
-//! Tests for the notifier subsystem. The original 947-line test
-//! module was moved here wholesale during the notifier.rs split; the
-//! only changes are explicit `use super::...` imports replacing the
-//! `use super::*` glob (the new module structure means tests need to
-//! reach into per-submodule items).
-//!
-//! The `field_reassign_with_default` lint is allowed throughout because
-//! the original test setup convention is `mut x = NotifierPolicy::default();
-//! x.field = ...;`, which makes the diff against the pre-split file
-//! easy to audit.
+//! Tests for the notifier subsystem: the static BPF prelude (verified by
+//! running the real emitted program through a BPF interpreter) and the exec
+//! path allow-list. The egress (connect/sendto/sendmsg) and socket/clone
+//! tests were removed when those checks left the supervisor — egress is now
+//! enforced by the network topology and the register gates by static BPF.
 
 #![allow(clippy::field_reassign_with_default)]
-#![allow(unused_imports, dead_code)]
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use super::abi::SeccompData;
 use super::abi::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET,
-    CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, SOCK_RAW,
-};
-use super::eval_net::{
-    classify_connect_addr, classify_proxy_only_connect, classify_sendmsg, classify_sendto_addr,
-    maybe_refresh_dynamic_allowlist_on_deny,
+    CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, SOCK_RAW, SeccompData,
 };
 use super::eval_proc::is_exec_path_allowed;
 use super::filter::{FilterPolicy, build_notifier_filter};
-use super::kernel::parse_kernel_version;
-use super::outbound::ip_in_cidr;
-use super::policy_config::parse_cidr;
-use super::supervisor::Verdict;
-use super::*;
-
-/// Build a fresh policy with a small allow_ips set so restrict_outbound
-/// kicks in. Used as the default starting point for sendto/connect tests.
-fn policy_restricting_to(allowed_ips: &[&str]) -> NotifierPolicy {
-    let mut p = NotifierPolicy::default();
-    p.restrict_outbound = true;
-    for ip in allowed_ips {
-        p.allowed_ips.insert(ip.parse().expect("test IP"));
-    }
-    p
-}
-
-/// Build an AF_INET sockaddr_in: 16 bytes of `{family, port_be, ip[4], zero[8]}`.
-fn sockaddr_in(ip: [u8; 4], port: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 16];
-    buf[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&port.to_be_bytes());
-    buf[4..8].copy_from_slice(&ip);
-    buf
-}
-
-/// Build an AF_INET6 sockaddr_in6: 28 bytes.
-fn sockaddr_in6(ip: [u8; 16], port: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; 28];
-    buf[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
-    buf[2..4].copy_from_slice(&port.to_be_bytes());
-    // flowinfo (offset 4, 4 bytes) left zero.
-    buf[8..24].copy_from_slice(&ip);
-    // scope_id (offset 24, 4 bytes) left zero.
-    buf
-}
-
-fn sockaddr_family_only(family: libc::sa_family_t) -> Vec<u8> {
-    family.to_ne_bytes().to_vec()
-}
-
-// -----------------------------------------------------------------
-// classify_sendto_addr — happy paths
-// -----------------------------------------------------------------
-
-#[test]
-fn sendto_af_unspec_always_allowed() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = sockaddr_family_only(libc::AF_UNSPEC as u16);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 2, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_af_unix_always_allowed() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = sockaddr_family_only(libc::AF_UNIX as u16);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 2, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_af_netlink_always_allowed() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = sockaddr_family_only(libc::AF_NETLINK as u16);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 2, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_allowed_inet_passes_through_classify_outbound() {
-    let policy = policy_restricting_to(&["1.2.3.4"]);
-    let bytes = sockaddr_in([1, 2, 3, 4], 443);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_disallowed_inet_denied() {
-    let policy = policy_restricting_to(&["1.2.3.4"]);
-    let bytes = sockaddr_in([5, 6, 7, 8], 443);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_unrestricted_allows_arbitrary_inet() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = false;
-    let bytes = sockaddr_in([1, 1, 1, 1], 80);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Allow
-    ));
-}
-
-// -----------------------------------------------------------------
-// classify_sendto_addr — malformed / hostile input
-// -----------------------------------------------------------------
-
-#[test]
-fn sendto_rejects_addr_shorter_than_family_field() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = vec![0x02]; // only one byte; can't even read sa_family
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 1, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_rejects_truncated_sockaddr_in() {
-    let policy = policy_restricting_to(&["1.2.3.4"]);
-    // Family set to AF_INET but only 4 bytes — port read would
-    // succeed but the ip read needs offsets 4..8.
-    let mut bytes = vec![0u8; 4];
-    bytes[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-    bytes[2..4].copy_from_slice(&80u16.to_be_bytes());
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 4, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_rejects_truncated_sockaddr_in6() {
-    let policy = policy_restricting_to(&[]);
-    // Family AF_INET6 but length < 24 → ip can't be parsed.
-    let mut bytes = vec![0u8; 16];
-    bytes[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_unknown_family_denied() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = sockaddr_family_only(0xbeef);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 2, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-// -----------------------------------------------------------------
-// Proxy-only / egress=none mode
-// -----------------------------------------------------------------
-
-#[test]
-fn sendto_proxy_only_allows_dns_server() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.enforce_proxy_egress = true;
-    policy.dns_server_addr = "169.254.0.53".to_string();
-    let bytes = sockaddr_in([169, 254, 0, 53], 53);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_proxy_only_allows_loopback_to_proxy_port() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.enforce_proxy_egress = true;
-    policy.proxy_port = Some(8080);
-    let bytes = sockaddr_in([127, 0, 0, 1], 8080);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendto_proxy_only_denies_loopback_to_other_port() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.enforce_proxy_egress = true;
-    policy.proxy_port = Some(8080);
-    let bytes = sockaddr_in([127, 0, 0, 1], 12345);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_egress_none_denies_loopback_when_no_proxy_port() {
-    // egress=none policy: enforce_proxy_egress true, proxy_port None.
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.enforce_proxy_egress = true;
-    policy.proxy_port = None;
-    let bytes = sockaddr_in([127, 0, 0, 1], 8080);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_proxy_only_denies_arbitrary_inet() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.enforce_proxy_egress = true;
-    policy.proxy_port = Some(8080);
-    let bytes = sockaddr_in([1, 2, 3, 4], 443);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 16, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-// -----------------------------------------------------------------
-// IPv6
-// -----------------------------------------------------------------
-
-#[test]
-fn sendto_inet6_allowed_when_in_policy() {
-    let policy = policy_restricting_to(&["::1"]);
-    let mut ip = [0u8; 16];
-    ip[15] = 1; // ::1
-    let bytes = sockaddr_in6(ip, 443);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 28, &policy),
-        Verdict::Allow
-    ));
-}
-
-// -----------------------------------------------------------------
-// classify_sendmsg — ancillary data (SCM_RIGHTS) defense-in-depth
-// -----------------------------------------------------------------
-
-#[test]
-fn sendmsg_ancillary_on_af_unix_allowed() {
-    let policy = NotifierPolicy::default();
-    let unix_name = sockaddr_family_only(libc::AF_UNIX as u16);
-    assert!(matches!(
-        classify_sendmsg(
-            42,
-            0xdead_beef, // msg_name_ptr non-NULL
-            unix_name.len(),
-            32, // msg_controllen > 0
-            Some(&unix_name),
-            &policy,
-        ),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendmsg_ancillary_on_af_inet_denied() {
-    let policy = NotifierPolicy::default();
-    let inet_name = sockaddr_in([1, 2, 3, 4], 80);
-    assert!(matches!(
-        classify_sendmsg(
-            42,
-            0xdead_beef,
-            inet_name.len(),
-            32,
-            Some(&inet_name),
-            &policy,
-        ),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendmsg_ancillary_on_af_inet6_denied() {
-    let policy = NotifierPolicy::default();
-    let inet6_name = sockaddr_in6([0u8; 16], 80);
-    assert!(matches!(
-        classify_sendmsg(
-            42,
-            0xdead_beef,
-            inet6_name.len(),
-            32,
-            Some(&inet6_name),
-            &policy,
-        ),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendmsg_ancillary_with_null_msg_name_allowed() {
-    // Connected socket: msg_name_ptr == 0, ancillary data permitted
-    // because the destination was already vetted at connect() time
-    // (most likely an AF_UNIX socket between internal processes).
-    let policy = NotifierPolicy::default();
-    assert!(matches!(
-        classify_sendmsg(42, 0, 0, 32, None, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendmsg_ancillary_with_unreadable_msg_name_denied() {
-    // Caller said msg_name_ptr != 0 + msg_namelen >= 2 but failed to
-    // read the bytes. We must defensively deny rather than risk
-    // letting an SCM_RIGHTS payload through.
-    let policy = NotifierPolicy::default();
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 16, 32, None, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendmsg_ancillary_with_truncated_msg_name_denied() {
-    // Caller managed to read only 1 byte; we can't determine family.
-    let policy = NotifierPolicy::default();
-    let truncated = vec![0x01];
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 16, 32, Some(&truncated), &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-// -----------------------------------------------------------------
-// classify_sendmsg — non-ancillary path
-// -----------------------------------------------------------------
-
-#[test]
-fn sendmsg_no_ancillary_unrestricted_allows() {
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = false;
-    let bytes = sockaddr_in([1, 1, 1, 1], 80);
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendmsg_no_ancillary_null_msg_name_allowed() {
-    let policy = policy_restricting_to(&[]);
-    assert!(matches!(
-        classify_sendmsg(42, 0, 0, 0, None, &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendmsg_no_ancillary_inet_to_allowed_ip_passes() {
-    let policy = policy_restricting_to(&["1.2.3.4"]);
-    let bytes = sockaddr_in([1, 2, 3, 4], 443);
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
-        Verdict::Allow
-    ));
-}
-
-#[test]
-fn sendmsg_no_ancillary_inet_to_disallowed_ip_denied() {
-    let policy = policy_restricting_to(&["1.2.3.4"]);
-    let bytes = sockaddr_in([5, 6, 7, 8], 443);
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 16, 0, Some(&bytes), &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendmsg_no_ancillary_oversized_namelen_denied() {
-    let policy = policy_restricting_to(&[]);
-    let bytes = sockaddr_in([1, 2, 3, 4], 80);
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 1024, 0, Some(&bytes), &policy),
-        Verdict::Deny(_)
-    ));
-}
+use super::policy::NotifierPolicy;
 
 // -----------------------------------------------------------------
 // is_exec_path_allowed — exec policy checks
@@ -500,10 +104,17 @@ fn exec_multiple_prefixes_short_circuit_correctly() {
     assert!(!is_exec_path_allowed(Path::new("/c/x"), &p));
 }
 
-/// A minimal classic-BPF interpreter for the opcode subset the prelude
-/// uses. Test-only: lets unit tests run the *real* emitted program
-/// against synthetic `seccomp_data` and assert the returned action,
-/// rather than eyeballing jump offsets.
+#[test]
+fn exec_root_prefix_allows_everything_under_root() {
+    // Edge case: a prefix of "/" matches everything because every
+    // absolute path starts with "/" and has a '/' as the next char.
+    // This is intentional — a recipe authoring "/*" essentially
+    // disables exec filtering. Documented behaviour; pin it here.
+    let p = exec_policy(&[], &[""]);
+    assert!(is_exec_path_allowed(Path::new("/anything"), &p));
+    assert!(is_exec_path_allowed(Path::new("/etc/shadow"), &p));
+}
+
 /// Test-local classic-BPF interpreter (see `notifier::bpf`).
 fn interpret(prog: &[libc::sock_filter], data: &SeccompData) -> u32 {
     // Serialise seccomp_data to the byte layout BPF_ABS loads index into.
@@ -834,17 +445,22 @@ fn prelude_execveat_without_empty_path_supervised() {
 // --- routing of the remaining memory-dependent syscalls ---
 
 #[test]
-fn prelude_memory_syscalls_routed_to_supervisor() {
-    for nr in [
-        libc::SYS_connect,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_execve,
-    ] {
+fn prelude_execve_routed_to_supervisor() {
+    // execve is the only memory-dependent syscall still supervised (the
+    // path allow-list). execveat-without-AT_EMPTY_PATH is covered above.
+    assert_eq!(run(libc::SYS_execve, [0; 6]), RET_USER_NOTIF);
+}
+
+#[test]
+fn prelude_egress_syscalls_not_notified() {
+    // connect/sendto/sendmsg are no longer supervised — egress is enforced
+    // by the network topology, so the prelude defers them to the main
+    // filter (ALLOW here).
+    for nr in [libc::SYS_connect, libc::SYS_sendto, libc::SYS_sendmsg] {
         assert_eq!(
             run(nr, [0; 6]),
-            RET_USER_NOTIF,
-            "syscall {nr} must be notified"
+            RET_ALLOW,
+            "syscall {nr} must not be notified"
         );
     }
 }
@@ -878,175 +494,4 @@ fn prelude_builds_within_jump_range() {
             assert!(build_notifier_filter(&policy).is_ok());
         }
     }
-}
-
-// -----------------------------------------------------------------
-// Dynamic-allowlist refresh — closes-the-loop integration
-// -----------------------------------------------------------------
-
-/// First call to classify_connect_addr is denied. The
-/// maybe_refresh_dynamic_allowlist_on_deny side effect populates
-/// dynamic_ips from cache. The retry then allows.
-///
-/// This is the core "domain → dynamic IP → connect allowed" path
-/// — broken in this flow, the supervisor never honours a recipe's
-/// `[[host]]` allow-set for direct connects.
-#[test]
-fn dynamic_allowlist_refresh_closes_the_loop() {
-    use can_net::dns_cache::DnsCache;
-    use std::collections::HashSet;
-    use std::time::Duration;
-
-    // Recipe-equivalent state: a supervisor restricting outbound,
-    // with one allowed domain and no static IP entries. The cache
-    // is pre-seeded as if a prior DNS query had resolved
-    // "example.test" → 203.0.113.42.
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.allowed_domains = vec!["example.test".to_string()];
-    let cache = DnsCache::new(Duration::from_secs(60));
-    let mut seeded = HashSet::new();
-    seeded.insert("203.0.113.42".parse().unwrap());
-    cache.insert_for_testing("example.test", seeded, Duration::from_secs(60));
-    policy.dns_cache = Some(cache);
-
-    let addr = sockaddr_in([203, 0, 113, 42], 443);
-
-    // Step 1: dynamic_ips is empty → first verdict must be Deny.
-    let v1 = classify_connect_addr(42, &addr, 16, &policy);
-    assert!(
-        matches!(v1, Verdict::Deny(_)),
-        "expected initial deny when dynamic_ips empty, got {v1:?}",
-    );
-
-    // Step 2: refresh fires on the deny. dynamic_ips now contains
-    // the cached IP.
-    maybe_refresh_dynamic_allowlist_on_deny(&policy, &v1);
-    let dynamic_now: HashSet<IpAddr> = policy.dynamic_ips.read().unwrap().clone();
-    assert!(
-        dynamic_now.contains(&"203.0.113.42".parse().unwrap()),
-        "dynamic_ips not populated after refresh: {dynamic_now:?}",
-    );
-
-    // Step 3: re-classify the same address. Now allowed.
-    let v2 = classify_connect_addr(42, &addr, 16, &policy);
-    assert!(
-        matches!(v2, Verdict::Allow),
-        "expected allow after refresh, got {v2:?}",
-    );
-}
-
-#[test]
-fn dynamic_allowlist_refresh_skips_when_verdict_is_allow() {
-    // Sanity: refresh must be a no-op on Allow. Otherwise we'd be
-    // hitting DNS on every successful connect.
-    use can_net::dns_cache::DnsCache;
-    use std::time::Duration;
-
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.allowed_domains = vec!["something.test".to_string()];
-    policy.dns_cache = Some(DnsCache::new(Duration::from_secs(60)));
-
-    maybe_refresh_dynamic_allowlist_on_deny(&policy, &Verdict::Allow);
-    assert!(
-        policy.dynamic_ips.read().unwrap().is_empty(),
-        "dynamic_ips should not be touched on Allow",
-    );
-}
-
-#[test]
-fn dynamic_allowlist_refresh_noop_without_cache() {
-    // Edge case: policy with allowed_domains but no dns_cache
-    // (recipe layer hasn't populated one). Refresh must not panic.
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.allowed_domains = vec!["x.test".to_string()];
-    policy.dns_cache = None;
-
-    let denied = Verdict::Deny(libc::EACCES as u32);
-    maybe_refresh_dynamic_allowlist_on_deny(&policy, &denied);
-    assert!(policy.dynamic_ips.read().unwrap().is_empty());
-}
-
-#[test]
-fn dynamic_allowlist_replaced_atomically_on_each_refresh() {
-    // Each refresh REPLACES dynamic_ips with the current union of
-    // all allowed domains' cache entries — not appends. This pins
-    // the semantics: a domain that fell out of the cache (TTL
-    // expired) stops being in dynamic_ips.
-    use can_net::dns_cache::DnsCache;
-    use std::collections::HashSet;
-    use std::time::Duration;
-
-    let mut policy = NotifierPolicy::default();
-    policy.restrict_outbound = true;
-    policy.allowed_domains = vec!["a.test".to_string(), "b.test".to_string()];
-    let cache = DnsCache::new(Duration::from_secs(60));
-    let mut a_ips = HashSet::new();
-    a_ips.insert("1.1.1.1".parse().unwrap());
-    let mut b_ips = HashSet::new();
-    b_ips.insert("2.2.2.2".parse().unwrap());
-    cache.insert_for_testing("a.test", a_ips, Duration::from_secs(60));
-    cache.insert_for_testing("b.test", b_ips, Duration::from_secs(60));
-    policy.dns_cache = Some(cache);
-
-    // Pre-populate dynamic_ips with a stale entry. Refresh must
-    // overwrite it.
-    policy
-        .dynamic_ips
-        .write()
-        .unwrap()
-        .insert("9.9.9.9".parse().unwrap());
-
-    maybe_refresh_dynamic_allowlist_on_deny(&policy, &Verdict::Deny(libc::EACCES as u32));
-
-    let after: HashSet<IpAddr> = policy.dynamic_ips.read().unwrap().clone();
-    assert!(after.contains(&"1.1.1.1".parse().unwrap()));
-    assert!(after.contains(&"2.2.2.2".parse().unwrap()));
-    assert!(
-        !after.contains(&"9.9.9.9".parse().unwrap()),
-        "stale entry should have been replaced, not unioned",
-    );
-    assert_eq!(after.len(), 2);
-}
-
-#[test]
-fn exec_root_prefix_allows_everything_under_root() {
-    // Edge case: a prefix of "/" matches everything because every
-    // absolute path starts with "/" and has a '/' as the next char.
-    // This is intentional — a recipe authoring "/*" essentially
-    // disables exec filtering. Documented behaviour; pin it here.
-    let p = exec_policy(&[], &[""]);
-    assert!(is_exec_path_allowed(Path::new("/anything"), &p));
-    assert!(is_exec_path_allowed(Path::new("/etc/shadow"), &p));
-}
-
-#[test]
-fn sendmsg_no_ancillary_zero_namelen_denied() {
-    let policy = policy_restricting_to(&[]);
-    // msg_name_ptr != 0 but namelen == 0; caller passed None.
-    // restrict_outbound branch checks (2..=128).contains(0) == false
-    // and denies.
-    assert!(matches!(
-        classify_sendmsg(42, 0xdead_beef, 0, 0, None, &policy),
-        Verdict::Deny(_)
-    ));
-}
-
-#[test]
-fn sendto_inet6_denied_when_not_in_policy() {
-    let policy = policy_restricting_to(&["2001:db8::1"]);
-    // 2001:db8::2 — different IP
-    let mut ip = [0u8; 16];
-    ip[0] = 0x20;
-    ip[1] = 0x01;
-    ip[2] = 0x0d;
-    ip[3] = 0xb8;
-    ip[15] = 2;
-    let bytes = sockaddr_in6(ip, 443);
-    assert!(matches!(
-        classify_sendto_addr(42, &bytes, 28, &policy),
-        Verdict::Deny(_)
-    ));
 }

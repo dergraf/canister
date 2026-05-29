@@ -22,10 +22,12 @@
 //!    - `execveat(…, flags)`: deny `AT_EMPTY_PATH` (fileless exec).
 //!
 //! 2. **Memory-dependent syscalls** — still routed to the USER_NOTIF
-//!    supervisor (`connect`/`sendto`/`sendmsg` for egress, `execve` and
-//!    the path arm of `execveat` for the exec allow-list). These are the
-//!    TOCTOU-raceable checks being migrated to structural layers in later
-//!    phases; until then the supervisor remains their enforcement point.
+//!    supervisor: `execve` and the path arm of `execveat` for the exec
+//!    allow-list. (The egress syscalls `connect`/`sendto`/`sendmsg` were
+//!    removed once egress became structural — the worker netns has no
+//!    uplink in proxy mode, so there is nothing for a raced sockaddr to
+//!    reach.) The remaining exec path check is the last TOCTOU-raceable
+//!    `CONTINUE` path, slated for replacement by rootfs composition.
 
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
@@ -37,14 +39,12 @@ use super::bpf::Asm;
 use super::error::NotifierError;
 
 /// Syscalls still routed to the USER_NOTIF supervisor for memory-based
-/// argument inspection. `socket`/`clone`/`clone3` are intentionally
-/// absent — they are decided in static BPF and never reach the
-/// supervisor. `execveat` appears because its *path* arm is still
-/// supervised even though its `AT_EMPTY_PATH` flag is BPF-denied.
+/// argument inspection. `socket`/`clone`/`clone3` are decided in static
+/// BPF; `connect`/`sendto`/`sendmsg` are gone (egress is enforced by the
+/// network topology, not by inspecting sockaddrs). Only the exec path
+/// allow-list remains supervised: `execve`, and the path arm of
+/// `execveat` (whose `AT_EMPTY_PATH` flag is BPF-denied).
 pub const NOTIFIED_SYSCALLS: &[(&str, i64)] = &[
-    ("connect", libc::SYS_connect),
-    ("sendto", libc::SYS_sendto),
-    ("sendmsg", libc::SYS_sendmsg),
     ("execve", libc::SYS_execve),
     ("execveat", libc::SYS_execveat),
 ];
@@ -127,9 +127,6 @@ pub fn build_notifier_filter(
     dispatch(&mut a, libc::SYS_clone, clone_clause);
     dispatch(&mut a, libc::SYS_clone3, enosys);
     dispatch(&mut a, libc::SYS_execveat, execveat_clause);
-    dispatch(&mut a, libc::SYS_connect, user_notif);
-    dispatch(&mut a, libc::SYS_sendto, user_notif);
-    dispatch(&mut a, libc::SYS_sendmsg, user_notif);
     dispatch(&mut a, libc::SYS_execve, user_notif);
     // Not one of ours — let the main filter decide.
     a.ja(allow);
