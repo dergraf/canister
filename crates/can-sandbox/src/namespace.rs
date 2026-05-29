@@ -12,7 +12,6 @@ use nix::unistd::{ForkResult, Pid, fork, pipe};
 /// Set to -1 when no child exists.
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1);
 
-use can_net::dns_cache::DnsCache;
 use can_net::{NetworkMode, NetworkState};
 use can_policy::SandboxConfig;
 use can_policy::config::EgressMode;
@@ -130,39 +129,6 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
 
     // Determine whether to enable the seccomp notifier.
     let notifier_enabled = resolve_notifier_enabled(&opts.config.syscalls, opts.monitor);
-
-    // Pre-resolve allowed domains to IPs BEFORE forking.
-    // Both parent and child need the resolved IPs: the parent for reference,
-    // the child to build the NotifierPolicy for the supervisor.
-    // Done here (before fork) so the child inherits the results.
-    let host_domains: Vec<String> = opts.config.hosts.iter().map(|h| h.domain.clone()).collect();
-    let resolved_ips = if net_mode == NetworkMode::Filtered && !host_domains.is_empty() {
-        let resolved = can_net::resolve_allowed_domains(&host_domains);
-        if resolved.is_empty() {
-            tracing::warn!("could not resolve any allowed domains to IPs");
-        } else {
-            tracing::info!(
-                count = resolved.len(),
-                "pre-resolved allowed domains to IPs"
-            );
-            for (domain, ips) in &resolved {
-                tracing::debug!(domain, ips = ?ips, "resolved");
-            }
-        }
-        resolved
-    } else {
-        Vec::new()
-    };
-
-    let dns_cache = if net_mode == NetworkMode::Filtered && !host_domains.is_empty() {
-        let cache = DnsCache::new(std::time::Duration::from_secs(15));
-        for domain in &host_domains {
-            let _ = cache.resolve_cached_or_lookup(domain);
-        }
-        Some(cache)
-    } else {
-        None
-    };
 
     let dlp_config = opts.config.network.dlp.as_ref();
     let dlp_enabled = dlp_config.map(|d| d.is_enabled()).unwrap_or(false)
@@ -284,7 +250,6 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                     &opts.config,
                     &mut net_state,
                     proxy_ca.clone(),
-                    dns_cache.clone(),
                     opts.monitor,
                     canary_values.clone(),
                     secret_swaps,
@@ -349,9 +314,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                 opts.monitor,
                 opts.strict,
                 notifier_enabled,
-                &resolved_ips,
                 proxy_ca,
-                dns_cache,
                 canary_set.as_ref(),
                 &fake_env,
             );
@@ -380,7 +343,6 @@ fn setup_parent_network(
     config: &SandboxConfig,
     state: &mut NetworkState,
     proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
-    _dns_cache: Option<DnsCache>,
     monitor: bool,
     canary_values: Vec<String>,
     secret_swaps: Vec<can_proxy::server::SecretSwap>,
@@ -625,9 +587,7 @@ fn child_entry(
     monitor: bool,
     strict: bool,
     notifier_enabled: bool,
-    resolved_ips: &[(String, Vec<std::net::IpAddr>)],
     proxy_ca: Option<std::sync::Arc<can_proxy::ca::DynamicCa>>,
-    dns_cache: Option<DnsCache>,
     canary_set: Option<&can_dlp::CanarySet>,
     fake_env: &[(String, String)],
 ) -> Result<(), NamespaceError> {
@@ -716,23 +676,11 @@ fn child_entry(
     // The supervisor runs as PID 1 inside the same user + PID namespace
     // as the sandboxed processes, so /proc/<pid>/mem access works.
     let supervisor_context = if notifier_enabled {
-        let policy = notifier::policy_from_config(
-            config,
-            resolved_ips,
-            &dns_addr,
-            dns_cache,
-            if proxy_port > 0 {
-                Some(proxy_port)
-            } else {
-                None
-            },
-        );
+        let policy = notifier::policy_from_config(config);
         tracing::info!(
-            allowed_ips = policy.allowed_ips.len(),
-            allowed_cidrs = policy.allowed_cidrs.len(),
             allowed_exec_paths = policy.allowed_exec_paths.len(),
             allowed_exec_prefixes = policy.allowed_exec_prefixes.len(),
-            "notifier policy built for supervisor"
+            "notifier policy built for supervisor (exec allow-list)"
         );
         match notifier::create_fd_channel() {
             Ok((recv_fd, send_fd)) => {

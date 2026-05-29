@@ -60,21 +60,16 @@
 //! - `supervisor` — main loop, signal handler, notification dispatch,
 //!   TOCTOU validity check.
 //! - `proc_mem` — `/proc/<pid>/mem` and `process_vm_readv(2)` helpers.
-//! - `outbound` — shared IP classification + CIDR matching.
-//! - `eval_net` — `connect` / `sendto` / `sendmsg` evaluators + their
-//!   pure `classify_*` helpers + DNS allowlist refresh.
 //! - `eval_proc` — `execve` / `execveat` path evaluators.
 //! - `tests` — the test suite.
 
 mod abi;
 mod bpf;
 mod error;
-mod eval_net;
 mod eval_proc;
 mod fd_channel;
 mod filter;
 mod kernel;
-mod outbound;
 mod policy;
 mod policy_config;
 mod proc_mem;

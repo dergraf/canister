@@ -11,7 +11,6 @@ use super::abi::{
     SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND,
     SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompNotif, SeccompNotifResp,
 };
-use super::eval_net::{evaluate_connect, evaluate_sendmsg, evaluate_sendto};
 use super::eval_proc::{evaluate_execve, evaluate_execveat};
 use super::policy::NotifierPolicy;
 
@@ -223,14 +222,10 @@ fn evaluate_syscall(notif: &SeccompNotif, policy: &NotifierPolicy, notifier_fd: 
     let pid = notif.pid;
 
     // `socket`/`clone`/`clone3` are decided in the static BPF prelude
-    // (see `filter.rs`) and never reach the supervisor.
-    if nr == libc::SYS_connect {
-        evaluate_connect(notif, policy, notifier_fd)
-    } else if nr == libc::SYS_sendto {
-        evaluate_sendto(notif, policy, notifier_fd)
-    } else if nr == libc::SYS_sendmsg {
-        evaluate_sendmsg(notif, policy, notifier_fd)
-    } else if nr == libc::SYS_execve {
+    // (see `filter.rs`); `connect`/`sendto`/`sendmsg` are no longer
+    // notified (egress is enforced by the network topology). Only the
+    // exec path allow-list reaches the supervisor.
+    if nr == libc::SYS_execve {
         evaluate_execve(notif, policy, notifier_fd)
     } else if nr == libc::SYS_execveat {
         evaluate_execveat(notif, policy, notifier_fd)

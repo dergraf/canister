@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================================
-# t_proxy_seccomp_parity.sh — Proxy + seccomp enforcement parity
+# t_proxy_seccomp_parity.sh — Proxy policy + structural egress parity
 #
 # Given a single recipe with `egress = "proxy"` and a domain allow
-# list, both enforcement layers must agree on what is and isn't allowed:
+# list, two independent layers must both refuse a bypass:
 #
 #   - The L7 proxy must return 502 ("domain not allowed by policy") when
-#     the sandboxed worker requests a disallowed domain through it.
-#   - The seccomp USER_NOTIF supervisor must return EACCES when the
-#     worker bypasses the proxy and tries to dial any non-proxy address
-#     directly.
+#     the sandboxed worker requests a disallowed domain/IP through it.
+#   - The worker must be unable to dial any non-proxy address *directly*:
+#     in proxy mode its netns has no uplink, so a direct connect fails at
+#     the routing layer (ENETUNREACH/EHOSTUNREACH) — not via the (removed)
+#     seccomp connect() supervisor.
 #
 # Any drift between these two layers is a policy bypass — fix it.
 #
 # Allowed-domain success path stays out of scope here (covered by
-# t_dns_filtering.sh and the proxy unit tests); this file only asserts
-# the deny-path parity.
+# t_proxy_domain_filtering.sh and the proxy unit tests); this file only
+# asserts the deny-path parity.
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -81,32 +82,29 @@ case "$RUN_STDOUT" in
         ;;
 esac
 
-# ---- Test 2: seccomp denies direct connect bypassing the proxy ----
-# The same recipe must also make the supervisor deny any direct TCP
-# connect to a non-proxy address. We pick a routable but unlikely-to-be-
-# listening RFC1918 IP — we only need the supervisor's verdict (EACCES),
-# not a successful TCP handshake.
-begin_test "seccomp denies direct connect (proxy bypass)"
+# ---- Test 2: direct connect bypassing the proxy is blocked structurally ----
+# The worker's netns has no uplink, so a direct TCP connect to any public
+# address fails at the routing layer (ENETUNREACH/EHOSTUNREACH) — no
+# supervisor required. (EPERM/EACCES also accepted for forward-compat.)
+begin_test "direct connect (proxy bypass) is blocked structurally"
 run_can run --recipe "$CONFIG" -- python3 -c '
 import errno, socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(2)
 try:
-    s.connect(("10.255.255.1", 443))
+    s.connect(("1.1.1.1", 443))
     print("DIRECT_ALLOWED_UNEXPECTED")
-except PermissionError:
-    print("DIRECT_DENIED")
 except OSError as e:
-    if e.errno in (errno.EPERM, errno.EACCES):
-        print("DIRECT_DENIED")
+    if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES):
+        print("DIRECT_BLOCKED")
     else:
         print(f"DIRECT_ERRNO_{e.errno}")
 finally:
     s.close()
 '
 case "$RUN_STDOUT" in
-    *DIRECT_DENIED*) pass ;;
-    *) fail "expected DIRECT_DENIED, got: $RUN_STDOUT" ;;
+    *DIRECT_BLOCKED*) pass ;;
+    *) fail "expected DIRECT_BLOCKED (no uplink), got: $RUN_STDOUT" ;;
 esac
 
 # ---- Test 3: same recipe still lets the proxy talk to the allowed
@@ -193,10 +191,10 @@ case "$RUN_STDOUT" in
     *) fail "expected 502 policy block for 11.0.0.5 outside 10.0.0.0/24, got: $RUN_STDOUT" ;;
 esac
 
-begin_test "seccomp denies direct connect even to IP inside CIDR (proxy-only)"
-# In proxy-only mode the seccomp filter unconditionally denies non-proxy
-# direct egress — allow_ips is for the proxy's outbound policy, not for
-# the worker's syscall budget. This pins ADR-0006 semantics.
+begin_test "direct connect blocked structurally even to IP inside CIDR (proxy mode)"
+# `reachable_ips` is the proxy's outbound policy, not the worker's. In
+# proxy mode the worker has no uplink, so even an in-CIDR IP is
+# unreachable directly — it must go through the proxy.
 run_can run --recipe "$CIDR_CONFIG" -- python3 -c '
 import errno, socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -204,18 +202,17 @@ s.settimeout(2)
 try:
     s.connect(("10.0.0.5", 80))     # inside the CIDR
     print("DIRECT_ALLOWED_UNEXPECTED")
-except (PermissionError, OSError) as e:
-    code = getattr(e, "errno", None)
-    if isinstance(e, PermissionError) or code in (errno.EPERM, errno.EACCES):
-        print("DIRECT_DENIED")
+except OSError as e:
+    if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES):
+        print("DIRECT_BLOCKED")
     else:
-        print(f"DIRECT_ERRNO_{code}")
+        print(f"DIRECT_ERRNO_{e.errno}")
 finally:
     s.close()
 '
 case "$RUN_STDOUT" in
-    *DIRECT_DENIED*) pass ;;
-    *) fail "expected DIRECT_DENIED even for in-CIDR IP under proxy-only; got: $RUN_STDOUT" ;;
+    *DIRECT_BLOCKED*) pass ;;
+    *) fail "expected DIRECT_BLOCKED even for in-CIDR IP in proxy mode; got: $RUN_STDOUT" ;;
 esac
 
 # ---- Test 5: egress = "none" — both layers deny everything ----
@@ -244,33 +241,30 @@ case "$RUN_STDOUT" in
     *) fail "expected PROXY=unset under egress=none; got: $RUN_STDOUT" ;;
 esac
 
-begin_test "egress=none: even loopback non-proxy connect denied"
+begin_test "egress=none: no external egress (empty netns, no route out)"
+# egress=none gives the worker an empty network namespace (loopback only,
+# no pasta). A direct connect to any public address must fail at the
+# routing layer — there is simply no way out. (Loopback itself stays
+# usable for in-sandbox IPC and is harmlessly isolated, so we probe an
+# external address, which is what "no egress" actually means.)
 run_can run --recipe "$NONE_CONFIG" -- python3 -c '
 import errno, socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(2)
 try:
-    # Any port on 127.0.0.1 — there is no proxy, so this should be denied
-    # by the supervisor (no proxy_port to allow).
-    s.connect(("127.0.0.1", 12345))
+    s.connect(("1.1.1.1", 80))
     print("UNEXPECTED_ALLOWED")
-except PermissionError:
-    print("DENIED")
 except OSError as e:
-    if e.errno in (errno.EPERM, errno.EACCES):
-        print("DENIED")
-    elif e.errno == errno.ECONNREFUSED:
-        # The connect itself was allowed at the supervisor; just nothing
-        # listening. That would be a contract violation under egress=none.
-        print("UNEXPECTED_ALLOWED_REFUSED")
+    if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES):
+        print("NO_EGRESS")
     else:
         print(f"OTHER_ERRNO_{e.errno}")
 finally:
     s.close()
 '
 case "$RUN_STDOUT" in
-    *DENIED*) pass ;;
-    *) fail "expected DENIED under egress=none; got: $RUN_STDOUT" ;;
+    *NO_EGRESS*) pass ;;
+    *) fail "expected NO_EGRESS under egress=none; got: $RUN_STDOUT" ;;
 esac
 
 # ---- Test 6: [[host]] + allow_ips combo ----
