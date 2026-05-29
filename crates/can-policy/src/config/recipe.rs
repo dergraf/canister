@@ -222,6 +222,26 @@ impl RecipeFile {
                         .to_string(),
                 ));
             }
+
+            // Contradiction: an egress allow-list (reachable_ips or [[host]]
+            // blocks) declares "only these destinations," but unfiltered
+            // egress enforces no destination policy at all. With the
+            // USER_NOTIF connect() supervisor removed, egress is enforced by
+            // the network topology: proxy mode gives the worker no uplink,
+            // direct mode gives it a full one. There is no longer any layer
+            // that could honor an allow-list under unfiltered egress, so
+            // reject the combination rather than ship one silently
+            // unenforced.
+            if !self.unsafe_block.reachable_ips.is_empty() || !self.hosts.is_empty() {
+                return Err(ConfigError::Validation(
+                    "[unsafe] unfiltered_egress is incompatible with an egress allow-list \
+                     (reachable_ips or [[host]] blocks): unfiltered egress enforces no \
+                     destination policy, so the allow-list could not be enforced \
+                     structurally. Use egress = \"proxy\" to enforce the allow-list, or \
+                     drop the allow-list."
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
