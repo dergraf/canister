@@ -712,6 +712,53 @@ unfiltered_egress = true
 }
 
 #[test]
+fn unfiltered_egress_with_reachable_ips_rejected() {
+    // An IP allow-list under unfiltered egress has no enforcement layer once
+    // the supervisor connect() check is gone — reject it.
+    let err = RecipeFile::parse(
+        r#"
+[unsafe]
+unfiltered_egress = true
+reachable_ips = ["10.0.0.0/8"]
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("allow-list"),
+        "expected allow-list incompatibility rejection, got: {err}"
+    );
+}
+
+#[test]
+fn unfiltered_egress_with_host_allowlist_rejected() {
+    // A plain domain allow-list (no credentials) is still an allow-list and
+    // is equally unenforceable under unfiltered egress.
+    let err = RecipeFile::parse(
+        r#"
+[[host]]
+domain = "api.github.com"
+
+[unsafe]
+unfiltered_egress = true
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("allow-list"),
+        "expected allow-list incompatibility rejection, got: {err}"
+    );
+}
+
+#[test]
+fn unfiltered_egress_without_allowlist_still_allowed() {
+    // The legitimate port-forwarding / fully-open case must still resolve.
+    let config = parse_recipe("[unsafe]\nunfiltered_egress = true\n")
+        .into_sandbox_config()
+        .unwrap();
+    assert_eq!(config.network.egress(), EgressMode::Direct);
+}
+
+#[test]
 fn merge_three_recipes_allow_extra_union_dedupes() {
     let merged = parse_recipe(
         r#"
