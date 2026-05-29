@@ -114,4 +114,30 @@ case "$RUN_STDOUT" in
     *) fail "unexpected clone3 outcome: $RUN_STDOUT" ;;
 esac
 
+# ---- Confinement persists across execve (why the exec-path TOCTOU is harmless) ----
+# The residual exec-path race (eval_proc.rs) can at most run a *different*
+# already-present binary. This proves that buys nothing: after an exec CHAIN
+# (sh -> exec python3), the re-exec'd process is STILL denied namespace
+# creation and STILL has no network uplink. No privilege/reach is gained by
+# exec, so substituting the binary is a policy bypass, not an escape.
+require_python3
+begin_test "confinement (no namespaces, no uplink) survives a child execve"
+run_can run --recipe "$CONFIG" -- /bin/sh -c 'exec python3 -c "
+import ctypes, ctypes.util, errno, socket
+libc = ctypes.CDLL(ctypes.util.find_library(\"c\"), use_errno=True)
+ns = libc.unshare(0x10000000)  # CLONE_NEWUSER
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)
+try:
+    s.connect((\"1.1.1.1\", 80)); net = \"REACHED\"
+except OSError as e:
+    net = \"BLOCKED\" if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES) else \"ERRNO_%d\" % e.errno
+finally:
+    s.close()
+print(\"NS=%s NET=%s\" % (\"DENIED\" if ns != 0 else \"CREATED\", net))
+"'
+case "$RUN_STDOUT" in
+    *"NS=DENIED NET=BLOCKED"*) pass ;;
+    *) fail "confinement did not survive execve: $RUN_STDOUT" ;;
+esac
+
 summary

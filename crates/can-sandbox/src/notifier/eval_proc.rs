@@ -1,7 +1,50 @@
 //! `execve()` / `execveat()` path evaluators — the per-exec path
-//! allow-list check. Distinct from eval_net (per-call destinations). The
-//! `socket()` resource gate and `clone`/`clone3` namespace-flag gates now
-//! live in the static BPF prelude (`filter.rs`) and never reach here.
+//! allow-list check, and the **only** remaining USER_NOTIF check that
+//! reads the worker's memory. The `socket()` resource gate and
+//! `clone`/`clone3` namespace-flag gates now live in the static BPF
+//! prelude (`filter.rs`); egress is enforced by the network topology.
+//!
+//! # The residual TOCTOU here is intentional, and bounded
+//!
+//! These evaluators read the pathname from `/proc/<pid>/mem` and then
+//! answer `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (see `supervisor.rs`). The
+//! kernel *re-reads* the pathname pointer when it actually runs the
+//! `execve`, so a sibling `CLONE_VM` thread can swap the path in the
+//! check-to-execute window (the classic seccomp-unotify race;
+//! `is_notif_id_valid` narrows but does not close it). We knowingly keep
+//! this because the bypass it enables is a **policy bypass, not an escape
+//! or escalation**:
+//!
+//! 1. The race only changes *which path the kernel resolves* — it cannot
+//!    conjure a binary. The path must resolve to a real executable in the
+//!    worker's post-`pivot_root` mount namespace, i.e. something the
+//!    recipe author bind-mounted read-only. Writable areas (CWD, /tmp,
+//!    writable binds, the root tmpfs) are mounted `noexec` whenever an
+//!    exec allow-list is in force (see the invariant below), so a dropped
+//!    payload cannot be race-exec'd.
+//! 2. `execve` preserves every confinement layer: `NO_NEW_PRIVS` (so
+//!    setuid bits / file caps are ignored), the seccomp filters, the
+//!    empty capability sets, the user/PID/mount/net namespaces, cgroups,
+//!    and rlimits all persist unchanged. A raced binary runs with
+//!    *identical* privilege and reach to the one it impersonated.
+//! 3. It therefore gains no escape primitive: no namespace creation
+//!    (static BPF + baseline deny), no direct network (no uplink in proxy
+//!    mode), no raw sockets, no remount. `memfd`/`AT_EMPTY_PATH` exec is
+//!    independently denied. The *initial* command is validated race-free
+//!    in the parent (`process::validate_execve`).
+//!
+//! ## Load-bearing invariant
+//!
+//! The supervisor only enforces a non-trivial allow-list when
+//! `process.exec()` is `Allow(paths)`, and in exactly that case
+//! `overlay.rs` mounts writable areas `noexec` (`exec_restricted`). So in
+//! every configuration where this race could defeat the allow-list, the
+//! worker also cannot introduce a new executable — the race can at most
+//! pick a different recipe-provided, read-only binary, which then runs
+//! fully confined. `allow_execve` is thus a best-effort hardening control,
+//! **not** a privilege/escape boundary. See `docs/ARCHITECTURE.md` §4b.
+//! If this invariant is ever weakened (e.g. an exec allow-list with an
+//! exec-mounted writable path), this analysis no longer holds.
 
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};

@@ -185,6 +185,13 @@ fn process_one_notification(fd: RawFd, policy: &NotifierPolicy) {
     let verdict = evaluate_syscall(&notif, policy, fd);
 
     let resp = match verdict {
+        // `CONTINUE` re-runs the real syscall, so the kernel re-reads the
+        // pathname pointer — a TOCTOU window. This is reached ONLY for
+        // `execve`/`execveat` (the only notified syscalls), and the race is
+        // deliberately tolerated as a bounded policy-bypass, not an escape:
+        // see the harmlessness analysis + load-bearing `noexec` invariant in
+        // `eval_proc.rs`. No memory-dependent egress/namespace verdict uses
+        // `CONTINUE` any more.
         Verdict::Allow => SeccompNotifResp {
             id: notif.id,
             val: 0,
