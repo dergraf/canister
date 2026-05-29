@@ -90,8 +90,9 @@ const SKELETON_DIRS: &[&str] = &[
 pub fn try_setup_filesystem(
     config: &FilesystemConfig,
     host_cwd: Option<&Path>,
+    exec_restricted: bool,
 ) -> Result<bool, OverlayError> {
-    match setup_filesystem(config, host_cwd) {
+    match setup_filesystem(config, host_cwd, exec_restricted) {
         Ok(()) => Ok(true),
         Err(OverlayError::Mount { ref path, source }) if is_permission_error(source) => {
             tracing::error!(
@@ -125,8 +126,18 @@ fn is_permission_error(err: nix::Error) -> bool {
 pub fn setup_filesystem(
     config: &FilesystemConfig,
     host_cwd: Option<&Path>,
+    exec_restricted: bool,
 ) -> Result<(), OverlayError> {
     let sandbox_root = PathBuf::from("/tmp/canister-root");
+
+    // When the exec policy is restricted (`exec = [paths]` or
+    // `entrypoint-only`), every *writable* mount is made `noexec` so the
+    // worker cannot drop a new binary and execute it — closing that path
+    // structurally rather than relying on the (raceable) supervisor. Under
+    // the default `exec = "any"` we leave writable mounts executable so
+    // dev workflows (`cargo run`, `go run`, building and running in the
+    // project dir) keep working.
+    let writable_noexec = exec_restricted;
 
     // 0. Break mount propagation. Make the mount tree subordinate (MS_SLAVE)
     //    then private. This prevents mounts from propagating back to
@@ -147,7 +158,7 @@ pub fn setup_filesystem(
     mkdir_p(&sandbox_root)?;
 
     // 2. Mount a tmpfs as the sandbox root.
-    mount_tmpfs(&sandbox_root)?;
+    mount_tmpfs(&sandbox_root, writable_noexec)?;
 
     // 3. Create the directory skeleton.
     create_skeleton(&sandbox_root)?;
@@ -161,11 +172,11 @@ pub fn setup_filesystem(
     // 4b. Bind-mount writable paths.
     //     These are paths the sandboxed process must write to (e.g., database
     //     files, caches, state directories). Changes persist on the host.
-    bind_mount_writable_paths(&sandbox_root, config)?;
+    bind_mount_writable_paths(&sandbox_root, config, writable_noexec)?;
 
     // 5. Create a writable /tmp inside the sandbox.
     let sandbox_tmp = sandbox_root.join("tmp");
-    mount_tmpfs(&sandbox_tmp)?;
+    mount_tmpfs(&sandbox_tmp, writable_noexec)?;
 
     // 5b. Bind-mount the host CWD writable so the sandboxed process
     //     can read and write project files (e.g., `mix new`, `cargo build`).
@@ -176,10 +187,11 @@ pub fn setup_filesystem(
             mkdir_p(parent)?;
         }
         mkdir_p(&target)?;
-        bind_mount_rw(cwd, &target)?;
+        bind_mount_rw(cwd, &target, writable_noexec)?;
         tracing::info!(
             source = %cwd.display(),
             target = %target.display(),
+            noexec = writable_noexec,
             "CWD bind-mounted writable"
         );
     }
@@ -209,14 +221,20 @@ pub fn setup_filesystem(
     Ok(())
 }
 
-/// Mount a tmpfs at the given path.
-fn mount_tmpfs(target: &Path) -> Result<(), OverlayError> {
-    tracing::debug!(target = %target.display(), "mounting tmpfs");
+/// Mount a tmpfs at the given path. When `noexec` is set, the tmpfs is
+/// mounted `MS_NOEXEC` (used for writable areas under a restricted exec
+/// policy so dropped binaries cannot be executed).
+fn mount_tmpfs(target: &Path, noexec: bool) -> Result<(), OverlayError> {
+    tracing::debug!(target = %target.display(), noexec, "mounting tmpfs");
+    let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    if noexec {
+        flags |= MsFlags::MS_NOEXEC;
+    }
     mount(
         Some("tmpfs"),
         target,
         Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        flags,
         Some("size=256m,mode=0755"),
     )
     .map_err(|source| OverlayError::Mount {
@@ -279,7 +297,11 @@ fn bind_mount_allowed(root: &Path, config: &FilesystemConfig) -> Result<(), Over
 /// These paths are mounted read-write so the sandboxed process can
 /// persist changes (e.g., databases, caches, state directories).
 /// Denied paths are still checked and skipped.
-fn bind_mount_writable_paths(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
+fn bind_mount_writable_paths(
+    root: &Path,
+    config: &FilesystemConfig,
+    noexec: bool,
+) -> Result<(), OverlayError> {
     for source in &config.write {
         if !source.exists() {
             tracing::warn!(path = %source.display(), "writable path not found, skipping");
@@ -306,8 +328,8 @@ fn bind_mount_writable_paths(root: &Path, config: &FilesystemConfig) -> Result<(
             touch(&target)?;
         }
 
-        bind_mount_rw(source, &target)?;
-        tracing::debug!(source = %source.display(), target = %target.display(), "writable path mounted");
+        bind_mount_rw(source, &target, noexec)?;
+        tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
     }
     Ok(())
 }
@@ -672,8 +694,10 @@ fn bind_mount_ro(source: &Path, target: &Path) -> Result<(), OverlayError> {
 ///
 /// Like `bind_mount_ro`, but does not remount as read-only.
 /// Used for the CWD so the sandboxed process can write project files.
-/// Still applies MS_NOSUID and MS_NODEV for safety.
-fn bind_mount_rw(source: &Path, target: &Path) -> Result<(), OverlayError> {
+/// Still applies MS_NOSUID and MS_NODEV for safety. When `noexec` is set
+/// (restricted exec policy), the mount is also `MS_NOEXEC` so the worker
+/// cannot execute binaries it writes there.
+fn bind_mount_rw(source: &Path, target: &Path, noexec: bool) -> Result<(), OverlayError> {
     mount(
         Some(source),
         target,
@@ -686,8 +710,11 @@ fn bind_mount_rw(source: &Path, target: &Path) -> Result<(), OverlayError> {
         source: source_err,
     })?;
 
-    // Remount with nosuid/nodev but keep writable.
-    let source_flags = read_mount_flags(target);
+    // Remount with nosuid/nodev (and noexec when restricted) but keep writable.
+    let mut source_flags = read_mount_flags(target);
+    if noexec {
+        source_flags |= MsFlags::MS_NOEXEC;
+    }
     mount(
         None::<&str>,
         target,

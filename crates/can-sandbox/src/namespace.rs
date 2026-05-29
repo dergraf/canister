@@ -762,7 +762,15 @@ fn child_entry(
     // Failures are always fatal — the sandbox aborts if filesystem isolation
     // cannot be established (e.g., AppArmor blocks mount operations).
     // Must happen AFTER enter_pid_namespace so /proc reflects the new PID ns.
-    let fs_isolated = overlay::try_setup_filesystem(&config.filesystem, host_cwd.as_deref())?;
+    // A restricted exec policy (`exec = [paths]` / `entrypoint-only`) makes
+    // writable mounts noexec so the worker cannot drop & run a binary;
+    // `exec = "any"` leaves them executable for dev build-and-run workflows.
+    let exec_restricted = !matches!(
+        config.process.exec(),
+        can_policy::config::ExecPolicy::Mode(can_policy::config::ExecMode::Any)
+    );
+    let fs_isolated =
+        overlay::try_setup_filesystem(&config.filesystem, host_cwd.as_deref(), exec_restricted)?;
     if fs_isolated {
         tracing::debug!("filesystem isolation active (pivot_root)");
     } else {
