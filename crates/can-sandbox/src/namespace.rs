@@ -393,54 +393,95 @@ fn setup_parent_network(
         return Err(can_net::NetError::Pasta("pasta not found".to_string()));
     }
 
-    let pasta_config = can_net::pasta::PastaConfig {
-        ports: config.network.ports.clone(),
-        allow_host_loopback: config.network.allow_host_loopback,
-        child_pid: Some(child_pid),
-    };
+    let mut proxy_port = 0u16;
+    let dns_addr;
 
-    // Start pasta to provide networking in the sandbox.
-    let (pasta_child, dns_addr) = can_net::pasta::start(&pasta_config)?;
-    state.pasta_child = Some(pasta_child);
-
-    let mut proxy_port = 0;
     if let Some(ca) = proxy_ca {
-        // We must use fork() rather than std::thread::spawn because setns(CLONE_NEWUSER)
-        // requires the process to be single-threaded.
-        let (rx_fd, tx_fd) = nix::unistd::pipe().map_err(can_net::NetError::Namespace)?;
+        // Proxy mode: the worker's netns gets NO uplink. The proxy process
+        // binds its listener *inside the worker's netns* (so the worker can
+        // reach 127.0.0.1:proxy_port over loopback), then `unshare`s its OWN
+        // network namespace for outbound traffic; pasta attaches to that
+        // proxy netns. The worker therefore cannot reach the internet
+        // directly — egress is structurally forced through the proxy, with no
+        // dependence on the (raceable) seccomp connect() supervisor.
+        //
+        // fork() (not a thread) because setns(CLONE_NEWUSER) / unshare require
+        // a single-threaded caller; the tokio runtime is built afterwards.
+        let (port_rx, port_tx) = nix::unistd::pipe().map_err(can_net::NetError::Namespace)?;
+        let (go_rx, go_tx) = nix::unistd::pipe().map_err(can_net::NetError::Namespace)?;
 
         match unsafe { nix::unistd::fork() }.map_err(can_net::NetError::Namespace)? {
             nix::unistd::ForkResult::Child => {
-                drop(rx_fd);
-
-                // If parent dies, kill the proxy
+                drop(port_rx);
+                drop(go_tx);
                 set_pdeathsig(libc::SIGKILL);
 
-                // Join user ns
-                let user_fd = match std::fs::File::open(format!("/proc/{}/ns/user", child_pid)) {
-                    Ok(f) => f,
+                // Join the worker's user namespace (for CAP_NET_ADMIN) then
+                // its network namespace.
+                proxy_join_worker_ns(child_pid, "user", nix::sched::CloneFlags::CLONE_NEWUSER);
+                proxy_join_worker_ns(child_pid, "net", nix::sched::CloneFlags::CLONE_NEWNET);
+
+                // Bring up loopback in the worker netns and bind the listener
+                // there — this is the address the worker connects to.
+                if let Err(e) = can_net::netns::bring_up_loopback() {
+                    tracing::error!("proxy process: lo up (worker netns) failed: {}", e);
+                    std::process::exit(1);
+                }
+                let std_listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                    Ok(l) => l,
                     Err(e) => {
-                        tracing::error!("proxy process: failed to open user ns: {}", e);
+                        tracing::error!("proxy process: failed to bind proxy listener: {}", e);
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = nix::sched::setns(user_fd, nix::sched::CloneFlags::CLONE_NEWUSER) {
-                    tracing::error!("proxy process: setns CLONE_NEWUSER failed: {}", e);
+                let port = std_listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                if let Err(e) = std_listener.set_nonblocking(true) {
+                    tracing::error!("proxy process: set_nonblocking failed: {}", e);
                     std::process::exit(1);
                 }
 
-                // Join net ns
-                let net_fd = match std::fs::File::open(format!("/proc/{}/ns/net", child_pid)) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("proxy process: failed to open net ns: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                if let Err(e) = nix::sched::setns(net_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
-                    tracing::error!("proxy process: setns CLONE_NEWNET failed: {}", e);
+                // Move into our OWN, fresh network namespace for outbound.
+                // The listener fd above stays bound in the worker netns and
+                // remains accept()-able; new outbound sockets use this netns.
+                if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET) {
+                    tracing::error!("proxy process: unshare(CLONE_NEWNET) failed: {}", e);
                     std::process::exit(1);
                 }
+                if let Err(e) = can_net::netns::bring_up_loopback() {
+                    tracing::error!("proxy process: lo up (proxy netns) failed: {}", e);
+                    std::process::exit(1);
+                }
+                // Let pasta (a sibling process) open our /proc/self/ns/*
+                // despite Yama ptrace_scope.
+                // SAFETY: prctl with PR_SET_PTRACER has no pointer args.
+                unsafe {
+                    libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+                }
+
+                // Hand the parent our port; it starts pasta against our netns.
+                let mut port_file = std::fs::File::from(port_tx);
+                if let Err(e) = std::io::Write::write_all(&mut port_file, &port.to_be_bytes()) {
+                    tracing::error!("proxy process: failed to send port to parent: {}", e);
+                    std::process::exit(1);
+                }
+                drop(port_file);
+
+                // Block until the parent has started pasta in our netns.
+                let mut go_file = std::fs::File::from(go_rx);
+                let mut go = [0u8; 1];
+                if std::io::Read::read_exact(&mut go_file, &mut go).is_err() {
+                    tracing::error!("proxy process: parent closed go pipe before signalling");
+                    std::process::exit(1);
+                }
+                drop(go_file);
+
+                // host.canister.local target — the proxy-netns default gateway
+                // pasta maps to the host's loopback. Detected after pasta is up.
+                let host_loopback_target = if config.network.allow_host_loopback {
+                    can_net::pasta::detect_default_gateway().map(std::net::IpAddr::V4)
+                } else {
+                    None
+                };
 
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -452,17 +493,6 @@ fn setup_parent_network(
                         std::process::exit(1);
                     }
                 };
-
-                // Detect the in-netns default gateway *after* setns. When
-                // `allow_host_loopback` is on, this is the address pasta
-                // maps to the host's 127.0.0.1, so the proxy uses it as
-                // the dial target for the `host.canister.local` alias.
-                let host_loopback_target = if config.network.allow_host_loopback {
-                    can_net::pasta::detect_default_gateway().map(std::net::IpAddr::V4)
-                } else {
-                    None
-                };
-
                 rt.block_on(async {
                     let mut proxy_server_config = can_proxy::server::ProxyServerConfig::new(ca)
                         .with_network(config.network.clone())
@@ -482,23 +512,13 @@ fn setup_parent_network(
                             std::process::exit(1);
                         }
                     };
-
-                    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                    let listener = match tokio::net::TcpListener::from_std(std_listener) {
                         Ok(l) => l,
                         Err(e) => {
-                            tracing::error!("proxy process: failed to bind proxy listener: {}", e);
+                            tracing::error!("proxy process: TcpListener::from_std failed: {}", e);
                             std::process::exit(1);
                         }
                     };
-                    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-                    tracing::debug!("proxy process: bound to port {}", port);
-
-                    let mut tx_file = std::fs::File::from(tx_fd);
-                    if let Err(e) = std::io::Write::write_all(&mut tx_file, &port.to_be_bytes()) {
-                        tracing::error!("proxy process: failed to send port to parent: {}", e);
-                    }
-                    drop(tx_file);
-
                     if let Err(e) = server.run(listener).await {
                         tracing::error!("proxy process: proxy server run error: {}", e);
                     }
@@ -506,24 +526,75 @@ fn setup_parent_network(
                 std::process::exit(0);
             }
             nix::unistd::ForkResult::Parent { child: proxy_pid } => {
-                drop(tx_fd);
+                drop(port_tx);
+                drop(go_rx);
                 state.proxy_pid = Some(proxy_pid);
 
-                let mut rx_file = std::fs::File::from(rx_fd);
+                // Receive the proxy's listening port (bound in the worker netns).
+                let mut port_file = std::fs::File::from(port_rx);
                 let mut buf = [0u8; 2];
-                if let Ok(()) = std::io::Read::read_exact(&mut rx_file, &mut buf) {
-                    proxy_port = u16::from_be_bytes(buf);
-                    if proxy_port > 0 {
-                        tracing::info!("Proxy started inside netns on port {}", proxy_port);
-                    }
-                } else {
-                    tracing::error!("parent: failed to recv proxy port from proxy process");
-                }
+                std::io::Read::read_exact(&mut port_file, &mut buf)
+                    .map_err(|e| can_net::NetError::Pasta(format!("recv proxy port: {e}")))?;
+                drop(port_file);
+                proxy_port = u16::from_be_bytes(buf);
+
+                // Start pasta against the PROXY's netns — only the proxy gets
+                // an uplink. The worker netns stays loopback-only.
+                let pasta_config = can_net::pasta::PastaConfig {
+                    ports: config.network.ports.clone(),
+                    allow_host_loopback: config.network.allow_host_loopback,
+                    child_pid: Some(proxy_pid.as_raw() as u32),
+                };
+                let (pasta_child, addr) = can_net::pasta::start(&pasta_config)?;
+                state.pasta_child = Some(pasta_child);
+                dns_addr = addr;
+
+                // Release the proxy to start serving now that pasta is up.
+                let mut go_file = std::fs::File::from(go_tx);
+                let _ = std::io::Write::write_all(&mut go_file, &[1u8]);
+                drop(go_file);
+
+                tracing::info!(
+                    proxy_port,
+                    "proxy running in dedicated netns; worker has no direct uplink"
+                );
             }
         }
+    } else {
+        // Non-proxy filtered mode (direct egress with port-forwarding): the
+        // worker itself needs the uplink, so pasta attaches to the worker
+        // netns as before, and no proxy is started.
+        let pasta_config = can_net::pasta::PastaConfig {
+            ports: config.network.ports.clone(),
+            allow_host_loopback: config.network.allow_host_loopback,
+            child_pid: Some(child_pid),
+        };
+        let (pasta_child, addr) = can_net::pasta::start(&pasta_config)?;
+        state.pasta_child = Some(pasta_child);
+        dns_addr = addr;
     }
 
     Ok((dns_addr, proxy_port))
+}
+
+/// Join the worker's `user`/`net` namespace from the proxy child, exiting
+/// the process on failure. `kind` is the `/proc/<pid>/ns/<kind>` basename.
+fn proxy_join_worker_ns(worker_pid: u32, kind: &str, flag: nix::sched::CloneFlags) {
+    let path = format!("/proc/{worker_pid}/ns/{kind}");
+    let ns_fd = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("proxy process: failed to open {kind} ns ({path}): {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = nix::sched::setns(ns_fd, flag) {
+        tracing::error!(
+            "proxy process: setns CLONE_NEW{} failed: {e}",
+            kind.to_uppercase()
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Child process entry point.
