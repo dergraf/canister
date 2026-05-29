@@ -42,7 +42,7 @@ discarded.
 - **Per-destination egress contracts** -- one `[[host]]` block per upstream declares the allowed methods, content types, paths, body size, and DLP credential scope; refused requests get a `415` with a copy-pasteable patch in the response body. Closes the "POST `image/png` to a JSON-only API" class of exfil. See [docs/refusals.md](docs/refusals.md).
 - **DLP (Data Loss Prevention)** -- L7 proxy scans outbound HTTP for ~14 credential types (GitHub PAT, AWS access key, OpenAI / Anthropic keys, npm tokens, SSH private keys, session canaries, …) through every encoding chain (base64 / hex / percent / gzip / zlib / zstd / ascii85 / utf16-le) and structured payload format (JSON, multipart, form-urlencoded, XML, HTTP/1.1 trailers). See [docs/DLP.md](docs/DLP.md).
 - **Seccomp BPF** -- default-deny allow-list syscall filtering with a single curated baseline (~187 syscalls) defined in `recipes/default.toml`; embedded in the binary, overridable on disk; recipes customize via `allow_extra` / `deny_extra`
-- **Seccomp USER_NOTIF supervisor** -- argument-level syscall filtering for `connect()` (IP allowlist), `sendmsg()` (blocks SCM_RIGHTS fd passing), `clone()`/`clone3()` (deny namespace creation), `socket()` (deny raw sockets, restrict AF_NETLINK to NETLINK_ROUTE only), `execve()`/`execveat()` (enforce `allow_execve` for every exec, not just the initial command). Requires Linux 5.9+, auto-detected.
+- **Static BPF register gates** -- race-free decisions from the immutable seccomp arguments: `socket()` denies raw sockets and restricts AF_NETLINK to NETLINK_ROUTE; `clone()` denies namespace flags; `clone3()` returns ENOSYS (forcing the register-filtered `clone()` fallback); `execveat()` denies AT_EMPTY_PATH. Egress and namespace creation are enforced structurally (separate-netns proxy / baseline deny-list), not by inspecting syscall-argument memory — so there is no `connect()`/`clone3()` TOCTOU. A thin USER_NOTIF supervisor (Linux 5.9+, auto-detected) remains only for the `allow_execve` path check on child execs, backed by `noexec` writable mounts.
 - **Process isolation** -- PID namespace with proper session setup (`setsid`), environment filtering, RLIMIT_NPROC, execve allow list with prefix rules (`/nix/store/*`)
 - **Recipe composition** -- multiple `-r` flags merged left-to-right; `base.toml` provides essential OS mounts; package manager recipes auto-detected via `match_prefix`; environment variable expansion (`$HOME`, `$USER`) in paths
 - **Credential protection** -- recipes explicitly deny sensitive paths (`$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`, etc.); cargo credentials excluded from the cargo recipe via deny rules
@@ -282,14 +282,23 @@ Canister combines twelve isolation mechanisms:
    bind-mounted writable. For commands installed via Nix, Homebrew, Cargo, or
    other package managers, the install prefix is auto-detected via `match_prefix`
    rules in recipe files and mounted automatically. The host filesystem is unmounted.
+   When the exec policy is restricted (`exec = [paths]` / `entrypoint-only`),
+   all writable mounts (the CWD, `/tmp`, the root tmpfs, writable binds) are
+   mounted `noexec`, so the worker cannot drop a new binary and run it — the
+   structural backstop for the exec allow-list. (`exec = "any"` keeps them
+   executable for build-and-run dev workflows.)
 
 3. **PID namespace** -- the sandboxed process becomes PID 1 in its own PID
    namespace. It cannot see or signal any host processes.
 
-4. **Network namespace + pasta** -- in filtered mode, the sandbox gets
-   its own network stack. `pasta` (from passt) provides user-mode TCP/IP by
-   mirroring the host's network configuration into the namespace. Allowed
-   domains are pre-resolved to IPs at startup.
+4. **Network namespace + pasta** -- the sandbox gets its own network stack.
+   In **proxy** mode the worker's netns has **no uplink at all**: `pasta`
+   (from passt) attaches to a *separate* netns in which the egress proxy runs,
+   and the worker reaches it only via a loopback listener the proxy binds in
+   the worker netns. The worker therefore cannot reach the internet directly —
+   egress is forced through the proxy by the network topology, not by
+   inspecting `connect()` arguments. In `none` mode the netns is empty
+   (loopback only); in `direct` mode the worker gets pasta directly (no proxy).
 
 5. **Seccomp BPF** -- a Berkeley Packet Filter program is loaded right before
    `exec`. It operates in **default-deny (allow-list) mode**: only syscalls
@@ -297,13 +306,24 @@ Canister combines twelve isolation mechanisms:
    The filter validates the CPU architecture (prevents x32 ABI bypass) and
    returns `EPERM` for unlisted syscalls (or `KILL_PROCESS` in strict mode).
 
-6. **Seccomp USER_NOTIF supervisor** -- a parent-process supervisor thread
-   intercepts `connect()`, `sendto()`, `sendmsg()`, `clone()`/`clone3()`,
-   `socket()`, `execve()`, and `execveat()` syscalls via `SECCOMP_RET_USER_NOTIF`.
-   It reads the actual arguments from `/proc/<pid>/mem` and enforces IP allowlists,
-   SCM_RIGHTS fd passing blocks, namespace creation blocks, raw socket denial,
-   AF_NETLINK protocol restrictions, and `allow_execve` path validation.
-   Auto-detected on Linux 5.9+.
+6. **Static BPF register gates** -- the same seccomp program also makes a
+   set of *register-decidable* decisions directly from the immutable
+   `seccomp_data` arguments, with no `/proc/<pid>/mem` read and therefore no
+   TOCTOU window: `socket()` denies `SOCK_RAW` and restricts `AF_NETLINK` to
+   `NETLINK_ROUTE`; `clone()` denies any namespace-creating flag; `clone3()`
+   returns `ENOSYS` (its flags sit behind a pointer BPF cannot read, so libc
+   falls back to the register-filtered `clone()`); `execveat()` denies
+   `AT_EMPTY_PATH` (fileless exec). Namespace creation via `unshare()`/`setns()`
+   is denied by the baseline deny-list.
+
+   A thin `SECCOMP_RET_USER_NOTIF` supervisor remains for **one** job: the
+   per-exec path allow-list (`allow_execve`) for *child* execs, on Linux 5.9+.
+   The initial command is validated before launch (race-free). There is no
+   longer any `CONTINUE`-based argument supervisor for egress or namespaces —
+   those are enforced structurally (network topology in step 4, `noexec`
+   writable mounts in step 2) — closing the `connect()`/`clone3()`
+   check-to-execute race class. The remaining exec path check is best-effort
+   and is backed by those `noexec` writable mounts.
 
 7. **Cgroups v2** -- memory and CPU limits are enforced via the cgroup
    filesystem. Canister creates a child cgroup under the user's systemd
@@ -550,9 +570,10 @@ Canister is defense-in-depth. Each layer independently restricts the sandboxed p
 |-------|-------------------|-----------------|
 | User namespace | No real root privileges | Kernel exploit |
 | Mount namespace | Filesystem view | Mount escape (blocked by seccomp) |
-| Network namespace | Network access | Namespace escape (blocked by seccomp) |
+| Network namespace | Network access; in proxy mode the worker netns has no uplink (egress only via the proxy netns) | Kernel/netns escape |
 | Seccomp BPF (allow-list) | Syscall access (default deny) | Filter bypass (architecture-validated) |
-| USER_NOTIF supervisor | connect() IPs, sendmsg() SCM_RIGHTS, clone() flags, socket() types, execve() paths | Kernel exploit or TOCTOU race |
+| Static BPF register gates | socket() raw/netlink, clone() ns flags, clone3()→ENOSYS, execveat() AT_EMPTY_PATH (register args — race-free) | Kernel exploit |
+| USER_NOTIF supervisor | `allow_execve` path check on child execs (best-effort; backed by noexec writable mounts) | Kernel exploit, or a TOCTOU race on the exec path (mitigated by noexec) |
 | PID namespace | Process visibility | Namespace escape (blocked by seccomp) |
 | Cgroups v2 | Memory and CPU usage | Cgroup escape (requires root) |
 | /proc hardening | Sensitive kernel info, mountinfo topology | Remount (blocked by seccomp) |
@@ -580,17 +601,17 @@ not expected to carry kernel exploits.
 
 - Untrusted code reading/writing files outside the sandbox
 - Untrusted code accessing the network without authorization
-- Untrusted code connecting to unauthorized IPs (USER_NOTIF supervisor intercepts `connect()`)
+- Untrusted code connecting to unauthorized destinations (in proxy mode the worker netns has no uplink; all egress is forced through the policy-checked proxy)
 - Untrusted code calling dangerous syscalls (module loading, rebooting, etc.)
 - Untrusted code seeing or signaling host processes
 - Untrusted code consuming unbounded memory or CPU
 - Untrusted code leaking host environment variables (API keys, tokens)
-- Untrusted code executing unauthorized binaries (USER_NOTIF intercepts `execve()`/`execveat()`)
+- Untrusted code dropping and executing a new binary (writable mounts are `noexec` under a restricted exec policy; `memfd_create` and `execveat(AT_EMPTY_PATH)` are denied)
 - Untrusted code sending the wrong shape of request to a known upstream — `POST image/png` to a JSON-only API, `DELETE` to a read-only API, oversize uploads (contract gate)
 - Untrusted code exfiltrating credentials over HTTP — even when wrapped in `base64(gzip(strip_separators(token)))` or hidden in HTTP/1.1 trailers, multipart parts, XML attributes, or form values (DLP scanner)
 - Fork bombs and resource exhaustion within the sandbox
 - x32 ABI syscall bypass attempts
-- Namespace escape via clone/clone3 flags (USER_NOTIF blocks namespace creation)
+- Namespace escape via `unshare`/`setns` (baseline-denied) or `clone`/`clone3` flags (static BPF denies `clone` ns flags and forces `clone3`→ENOSYS — no TOCTOU window; closes issue #4)
 
 **Out of scope (Canister does NOT defend against):**
 
