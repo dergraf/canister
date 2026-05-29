@@ -1,15 +1,15 @@
 //! Fd passing between worker and supervisor via pipe + `pidfd_getfd()`.
 //!
-//! The worker's seccomp notifier filter intercepts `sendmsg`, so we
-//! cannot use SCM_RIGHTS to pass the notifier fd from worker to
-//! supervisor — doing so would deadlock (the supervisor would need the
-//! notifier fd to process the very `sendmsg` notification that's trying
-//! to send it).
+//! The worker writes the raw notifier fd number over a pipe using
+//! `write()`, and the supervisor uses `pidfd_open()` + `pidfd_getfd()`
+//! (Linux 5.6+) to duplicate that fd from the worker's fd table.
 //!
-//! Instead, the worker writes the raw fd number over a pipe using
-//! `write()` (not intercepted), and the supervisor uses `pidfd_open()` +
-//! `pidfd_getfd()` (Linux 5.6+) to duplicate the fd from the worker's
-//! fd table.
+//! This avoids SCM_RIGHTS / `sendmsg`. Historically that was *required*
+//! because the notifier filter intercepted `sendmsg` (passing the fd over
+//! it would deadlock — the supervisor needs the fd to handle the very
+//! notification carrying it). `sendmsg` is no longer notified, but the
+//! pipe + `pidfd_getfd()` mechanism is kept: it is simple, needs no
+//! ancillary-data handling, and works regardless of the seccomp policy.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 

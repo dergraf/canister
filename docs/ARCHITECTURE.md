@@ -625,98 +625,99 @@ it cannot invoke unlisted syscalls. The filter is enforced by the kernel and
 cannot be removed or modified by the filtered process (loading new seccomp
 filters is blocked by the default baseline's deny list).
 
-### 4b. Seccomp USER_NOTIF Supervisor
+### 4b. Seccomp USER_NOTIF Supervisor (exec path allow-list only)
 
 **Syscall:** `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)`
-**Module:** `notifier.rs`
+**Module:** `notifier/` (`supervisor.rs`, `eval_proc.rs`, `proc_mem.rs`, `fd_channel.rs`)
 
-The USER_NOTIF supervisor extends seccomp BPF with argument-level inspection.
-Classic BPF can only check the syscall number and architecture — it cannot
-dereference pointers or read memory. The supervisor intercepts specific
-syscalls via `SECCOMP_RET_USER_NOTIF`, reads the actual argument data from
-`/proc/<pid>/mem`, and makes a policy decision.
+> **History.** The supervisor used to inspect `connect`/`sendto`/`sendmsg`
+> (egress), `clone`/`clone3` (namespaces), and `socket` (types) by reading the
+> worker's memory and answering `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. That
+> `CONTINUE`-after-read pattern is **TOCTOU-raceable** (issue #4): the kernel
+> re-reads the pointed-to argument when it actually executes the syscall, so a
+> sibling `CLONE_VM` thread can swap the argument in the check-to-execute
+> window. All of those checks were therefore **moved to layers that cannot be
+> raced**: register-decidable gates → static BPF (§4); egress → the network
+> topology (§3, the worker has no uplink in proxy mode); `clone3` → `ENOSYS`.
+> See `docs/notifier-removal-audit.md`.
 
-**Architecture:**
+What remains on USER_NOTIF is **one** check: the per-exec **path** allow-list
+(`allow_execve`) for *child* `execve`/`execveat` calls. Classic BPF cannot read
+the pathname string (it lives behind a pointer), so the supervisor reads it from
+`/proc/<pid>/mem`, canonicalises it, checks it against the allow-list, and
+answers `CONTINUE` (allow) or `ERRNO(EACCES)` (deny). `execveat(AT_EMPTY_PATH)`
+is denied in static BPF before it ever reaches the supervisor.
 
-The supervisor runs as **PID 1** inside the sandbox's PID namespace. This is
-necessary because:
+**Architecture:** the supervisor runs as **PID 1** in the sandbox's PID
+namespace (so it is an ancestor of every worker — Yama `ptrace_scope=1` is
+satisfied) with its own procfs mount (so `/proc/<pid>/mem` opens succeed from
+the child user namespace). It runs inline, single-threaded, `poll()`ing the
+notifier fd with a 200 ms timeout interleaved with non-blocking `waitpid`. The
+worker passes the notifier fd to PID 1 over a pipe + `pidfd_getfd()` (not
+SCM_RIGHTS). **Requirements:** Linux 5.9+, auto-detected; disabled in monitor
+mode; toggled by `[syscalls] notifier`.
 
-1. After `unshare(CLONE_NEWPID)`, `clone(CLONE_THREAD)` fails with `EINVAL`,
-   so a supervisor thread cannot be spawned.
-2. The host's procfs denies `/proc/<pid>/mem` opens from a child user namespace.
-   PID 1 mounts its own procfs (owned by the sandbox's user namespace).
-3. As PID 1, the supervisor is an ancestor of all sandboxed processes, satisfying
-   Yama `ptrace_scope=1` without `PR_SET_PTRACER`.
+#### The residual exec TOCTOU — present, and why it is contained
 
-```
-  PID 1 (supervisor)                     PID 2+ (worker / sandboxed)
-  ──────────────────                     ──────────────────────────
-  unshare(CLONE_NEWNS)                   Sandbox setup (overlay, pivot_root)
-  mount /proc                            seccomp() → notifier fd
-  recv_fd() via SCM_RIGHTS               send_fd() via SCM_RIGHTS
-       │                                 install main BPF filter
-       │    connect(AF_INET, ...)        execve()
-       │ ──── SUSPENDED ────────────►         │
-       │                               ┌──────┴──────────────┐
-       │                               │  Supervisor (PID 1) │
-       │                               │  1. NOTIF_RECV      │
-       │                               │  2. open+read       │
-       │                               │     /proc/<pid>/mem │
-       │                               │  3. Check policy    │
-       │                               │  4. NOTIF_ID_VALID  │
-       │    ALLOW / ERRNO(EPERM)       │  5. NOTIF_SEND      │
-       │ ◄──────────────────────────── └──────────────────────┘
-       │
-       ▼  (continues or gets EPERM)
-```
+The exec path check is the one surviving `CONTINUE`-on-inspected-memory path, so
+the race still *exists*: a multithreaded worker can show the supervisor an
+allowed pathname (e.g. `/usr/bin/python3`) and, from a `CLONE_VM` sibling
+thread, rewrite the pointer to a different path (e.g. `/bin/sh`) before the
+kernel re-reads it — running a binary the allow-list would have rejected.
 
-The supervisor runs inline (single-threaded) using `poll()` with a 200ms timeout,
-interleaved with non-blocking `waitpid` to detect when the worker exits. After the
-worker exits, remaining in-flight notifications are drained before the supervisor
-terminates.
+This is **contained to a policy bypass with no escalation or escape**, for five
+independent reasons. The argument is deliberately defense-in-depth: each point
+holds on its own.
 
-**Filtered syscalls:**
+1. **The race cannot introduce a binary — only reach one already mounted.** It
+   only changes *which path string* the kernel resolves; the path must resolve
+   to a real, executable file in the worker's (post-`pivot_root`) mount
+   namespace. That filesystem contains only what the recipe author exposed:
+   read-only bind mounts of `filesystem.read`. Writable areas (CWD, `/tmp`, the
+   root tmpfs, writable binds) are mounted **`noexec` whenever an exec
+   allow-list is in force** (see §2 and the invariant below), so the worker
+   cannot drop a payload and race-exec it. The reachable set is exactly "the
+   binaries the recipe already chose to make available, read-only" — the
+   allow-list is a *subset* of that set, and the race can reach the rest of it.
 
-| Syscall | What is inspected | Policy enforcement |
-|---------|------------------|--------------------|
-| `connect()` | `sockaddr` struct (IP + port) | Must match IPs resolved from each `[[host]]`'s `domain`, `reachable_ips` CIDRs, or loopback |
-| `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution; connected sockets (NULL addr) allowed |
-| `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing |
-| `clone()` | `flags` register | Namespace flags (`CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`) denied |
-| `clone3()` | `clone_args.flags` in userspace memory | Same namespace flag check, struct read via `/proc/<pid>/mem` |
-| `socket()` | `domain` + `type` + `protocol` registers | `SOCK_RAW` denied; `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only |
-| `execve()` | Pathname string in userspace memory | Must match `exec` paths (empty = allow all) |
-| `execveat()` | Pathname + dirfd | Same as `execve()`, with dirfd resolution |
+2. **`execve` preserves every confinement layer.** `PR_SET_NO_NEW_PRIVS` is set,
+   so setuid/setgid bits and file capabilities are ignored across `execve` — no
+   privilege is ever gained by exec. The seccomp filters, the empty capability
+   sets, the user/PID/mount/network namespaces, cgroup limits, and rlimits all
+   **persist across `execve` unchanged**. So a raced `/bin/sh` runs with
+   *identical* privileges and reach to the `python3` it impersonated.
 
-**TOCTOU mitigation:** Between reading the worker's memory and sending the verdict,
-a multi-threaded sandbox process could modify the inspected memory. The supervisor
-calls `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID)` after the policy check — if the
-notification ID is no longer valid (thread exited or memory was remapped), the
-verdict is skipped.
+3. **The raced binary still has no escape primitives.** It cannot create or join
+   namespaces (`unshare`/`setns` baseline-denied; `clone` ns flags + `clone3`
+   denied in static BPF), cannot reach the network directly (no uplink in proxy
+   mode), cannot open raw sockets, and cannot remount the rootfs. None of that
+   depends on the exec check.
 
-**Memory access:** The supervisor (PID 1) runs in the same user namespace and PID
-namespace as all sandboxed processes. It mounts its own procfs (the user namespace
-owns the PID namespace, so the mount succeeds). `notif.pid` in the seccomp
-notification matches PIDs visible in this procfs. As PID 1, the supervisor is an
-ancestor of all sandboxed processes, so Yama `ptrace_scope=1` is satisfied without
-`PR_SET_PTRACER`. The supervisor does NOT have `PR_SET_NO_NEW_PRIVS` set, which
-would otherwise block `/proc/<pid>/mem` access.
+4. **Fileless / memfd exec is independently blocked.** `memfd_create` is
+   baseline-denied and `execveat(AT_EMPTY_PATH)` is denied in static BPF, so the
+   race cannot be combined with "exec a memfd I just wrote."
 
-**Fd passing protocol:** Before `fork()`, the parent creates an anonymous
-Unix socket pair (`socketpair(AF_UNIX, SOCK_STREAM)`). One end is inherited by
-the worker (PID 2+), the other by the supervisor (PID 1). After the notifier
-filter is installed, the worker sends the notifier fd to PID 1 as `SCM_RIGHTS`
-ancillary data.
+5. **The initial command is validated race-free.** `process::validate_execve`
+   runs in the trusted parent before launch; the race only affects *child*
+   execs.
 
-**Requirements:** Linux 5.9+ (auto-detected from `/proc/sys/kernel/osrelease`).
-Disabled in monitor mode (incompatible with `SECCOMP_RET_LOG`). Configurable
-via `[syscalls] notifier` in recipe config.
+**The load-bearing invariant:** *the supervisor only enforces a non-trivial exec
+allow-list when `process.exec()` is `Allow(paths)`, and in exactly that case
+writable mounts are `noexec`.* (`exec = "any"` has no allow-list, so there is
+nothing to bypass; `entrypoint-only` seeds no paths either.) So in every
+configuration where the race could defeat the allow-list, the worker is *also*
+unable to introduce a new executable — the race can only pick a different
+recipe-provided, read-only binary, which then runs fully confined.
 
-**Security property:** Even syscalls that pass the main BPF filter are
-subject to argument-level inspection. A sandboxed process cannot connect to
-unauthorized IPs, pass file descriptors via SCM_RIGHTS, create new namespaces
-via clone flags, open raw sockets, open AF_NETLINK sockets beyond NETLINK_ROUTE,
-or exec binaries outside the `exec` list.
+**Therefore:** the exec allow-list is a **best-effort hardening/policy control**
+("limit which of the mounted tools may run"), **not a privilege or escape
+boundary.** Treat it as such: if you need a hard guarantee that a particular
+binary can never run, do not mount it into the sandbox (or use the optional MAC
+backstop — `docs/...`), rather than relying on `allow_execve` alone. The
+TOCTOU-affected sandbox-escape class (egress, namespaces) is **closed**; this
+residual is a bounded policy-bypass, retained because removing it would either
+drop per-recipe child-exec restriction entirely or make it depend on an
+enforcing LSM being installed.
 
 ### 5. Process Control
 

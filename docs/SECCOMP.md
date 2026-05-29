@@ -236,122 +236,80 @@ to bypass the filter (since the BPF checks are against x86_64 numbers).
 
 ---
 
-## USER_NOTIF Supervisor
+## Notifier prelude: static register gates + the exec supervisor
 
-Classic BPF can only inspect the syscall number and architecture (`seccomp_data.nr`
-and `seccomp_data.arch`). It cannot inspect syscall **arguments** — for pointer-based
-arguments like `connect()`'s `sockaddr` or `execve()`'s pathname, the BPF filter
-only sees the raw pointer value, not the data it points to.
+Classic BPF can inspect the syscall number, architecture, and the **register**
+arguments (`seccomp_data.args[0..6]`), but not memory behind a pointer. Canister
+splits argument-level filtering accordingly into two parts, both built in
+`crates/can-sandbox/src/notifier/`.
 
-Canister uses `SECCOMP_RET_USER_NOTIF` (Linux 5.9+) to bridge this gap. When the
-sandboxed process invokes a syscall that requires argument inspection, the kernel
-suspends the calling thread and delivers a notification to a supervisor process.
-The supervisor reads the actual argument data (via `/proc/<pid>/mem`), makes a
-policy decision, and sends an ALLOW or DENY verdict back to the kernel.
+### Part 1 — static register gates (race-free, no supervisor)
 
-### How it works
+A small BPF "prelude" (`filter.rs`, assembled via the label-based builder in
+`bpf.rs`) is installed *before* the main allow/deny filter and decides, purely
+from the immutable registers:
 
-The supervisor runs as **PID 1 inside the sandbox's PID namespace**, not as a
-thread in the parent. This architecture is required because of three cascading
-kernel restrictions:
+| Syscall | Register decision |
+|---------|-------------------|
+| `socket(domain, type, protocol)` | Deny `SOCK_RAW`; restrict `AF_NETLINK` to `NETLINK_ROUTE`; gate `AF_UNIX`/`AF_INET`/`AF_INET6` per policy — `→ ERRNO`/`ALLOW` |
+| `clone(flags, …)` | Any namespace-creating flag in `args[0]` `→ ERRNO(EPERM)` |
+| `clone3(…)` | Flags live behind a pointer BPF cannot read, so `→ ERRNO(ENOSYS)`, forcing libc to fall back to the register-filtered `clone()` |
+| `execveat(…, flags)` | `AT_EMPTY_PATH` in `args[4]` `→ ERRNO(EACCES)` (fileless exec) |
 
-1. After `unshare(CLONE_NEWPID)`, `clone(CLONE_THREAD)` returns `EINVAL`
-   (pid_ns_for_children != task_active_pid_ns), so a supervisor thread cannot
-   be spawned.
-2. The host's procfs (`s_user_ns = init_user_ns`) denies `/proc/<pid>/mem`
-   opens from a child user namespace, so the supervisor must mount its own
-   procfs.
-3. PID 1 is an ancestor of all sandboxed processes, satisfying Yama
-   `ptrace_scope=1` without `PR_SET_PTRACER`.
+Because these return a hard `ERRNO`/`ENOSYS`, there is **no notification, no
+memory read, and no TOCTOU window**. `unshare`/`setns` are denied separately by
+the baseline deny-list (see [Always-Denied Syscalls](#always-denied-syscalls)).
 
-```
-  PID 1 (supervisor, same user ns + PID ns)    PID 2+ (worker / sandboxed)
-  ─────────────────────────────────────────    ────────────────────────────
-  1. unshare(CLONE_NEWNS)                      1. Sandbox setup
-  2. mount /proc (owned by user ns)               (overlay, pivot_root, etc.)
-  3. recv_fd() via SCM_RIGHTS                  2. seccomp() → notifier fd
-     → notifier_fd                             3. send_fd() via SCM_RIGHTS
-  4. Loop:                                     4. Install main BPF filter
-     a. poll(notifier_fd, 200ms)               5. execve()
-     b. ioctl(NOTIF_RECV) → read notification
-     c. open+read /proc/<pid>/mem
-     d. Evaluate against policy
-     e. ioctl(NOTIF_ID_VALID) → TOCTOU check
-     f. ioctl(NOTIF_SEND) → verdict
-     g. waitpid(WNOHANG) → check child status
-```
+Egress (`connect`/`sendto`/`sendmsg`) is **not** filtered here at all — it is
+enforced by the network topology (the worker has no uplink in proxy mode; see
+the network isolation docs), not by inspecting sockaddrs.
 
-The supervisor runs inline (single-threaded) using `poll()` with a 200ms timeout,
-interleaved with non-blocking `waitpid` to detect when the worker exits. After the
-worker exits, remaining in-flight notifications are drained before the supervisor
-terminates.
+### Part 2 — USER_NOTIF exec supervisor (the only memory-reading check)
 
-### Two-filter architecture
+The one decision that needs pointer-dereferenced memory is the per-exec **path**
+allow-list (`allow_execve`) for child `execve`/`execveat`. For that, the prelude
+returns `SECCOMP_RET_USER_NOTIF` (Linux 5.9+); the kernel suspends the thread and
+a supervisor reads the pathname from `/proc/<pid>/mem`, canonicalises it, checks
+it, and answers `CONTINUE` (allow) or `ERRNO(EACCES)` (deny).
 
-The worker installs two seccomp filters:
+The supervisor runs as **PID 1** in the sandbox's PID namespace (ancestor of all
+workers → Yama `ptrace_scope=1` satisfied; mounts its own procfs so
+`/proc/<pid>/mem` opens succeed), single-threaded, `poll()`ing with a 200 ms
+timeout interleaved with non-blocking `waitpid`. The worker hands it the notifier
+fd over a pipe + `pidfd_getfd()`.
 
-1. **Notifier filter** (installed first via `seccomp()` syscall with
-   `SECCOMP_FILTER_FLAG_NEW_LISTENER`): Returns `SECCOMP_RET_USER_NOTIF` for the
-   eight intercepted syscalls (`connect`, `sendto`, `sendmsg`, `clone`, `clone3`,
-   `socket`, `execve`, `execveat`). All other syscalls return `SECCOMP_RET_ALLOW`.
+**Filter precedence (why this works):** the kernel runs all filters and takes the
+*highest-precedence* action. `SECCOMP_RET_ERRNO` (0x0005_0000) outranks
+`SECCOMP_RET_USER_NOTIF` (0x7fc0_0000), which outranks `SECCOMP_RET_ALLOW`
+(0x7fff_0000). So a prelude `ERRNO`/`ENOSYS` overrides the baseline's `ALLOW`,
+and the prelude's `USER_NOTIF` (for `execve`/`execveat`) takes effect over the
+baseline `ALLOW` while still being overridable by a baseline `ERRNO`/`KILL`
+(e.g. when `execveat` is baseline-denied).
 
-2. **Main filter** (installed second via `prctl(PR_SET_SECCOMP)`): The existing
-   allow-list or deny-list BPF filter. Returns `SECCOMP_RET_ERRNO`,
-   `SECCOMP_RET_KILL_PROCESS`, or `SECCOMP_RET_LOG` depending on mode.
+### The residual exec TOCTOU is bounded (present, not harmful)
 
-The kernel evaluates filters in reverse install order, but `SECCOMP_RET_USER_NOTIF`
-takes special precedence — when any filter returns USER_NOTIF, the kernel always
-delivers the notification to the supervisor, regardless of what other filters return.
+The exec path check is the **only** surviving `CONTINUE`-on-inspected-memory
+path, so the classic race still exists: a `CLONE_VM` sibling thread can rewrite
+the pathname pointer between the supervisor's read and the kernel's re-read at
+execute time, running a binary the allow-list would reject.
+`SECCOMP_IOCTL_NOTIF_ID_VALID` (checked after the read) narrows but does not
+eliminate the window. This is **contained to a policy bypass with no privilege
+escalation or sandbox escape**, because:
 
-### Intercepted syscalls
+- The race can only reach a binary **already present read-only** in the rootfs
+  (the recipe author mounted it); writable areas are `noexec` whenever an exec
+  allow-list is in force, so no new binary can be dropped and run.
+- `execve` preserves **all** confinement — `NO_NEW_PRIVS` (setuid/fcaps
+  ignored), seccomp, empty capabilities, the namespaces, cgroups, rlimits — so a
+  raced binary runs with identical, fully-confined privileges.
+- That binary still cannot create namespaces, reach the network, or open raw
+  sockets (all enforced elsewhere); `memfd`/`AT_EMPTY_PATH` exec is independently
+  denied; and the *initial* command is validated race-free in the parent.
 
-| Syscall | Argument inspected | Policy |
-|---------|-------------------|--------|
-| `connect()` | `sockaddr` (destination address) | Allow only IPs pre-resolved from each `[[host]]` block's `domain` and explicit `reachable_ips`. Loopback and Unix domain sockets always allowed. |
-| `sendto()` | `dest_addr` + `msg_controllen` | DNS queries on port 53 trigger supervisor-side resolution and dynamic allowlist population. Connected sockets (NULL dest_addr) allowed. |
-| `sendmsg()` | `msghdr` struct (`msg_controllen`) | Blocks any `sendmsg()` with ancillary data (`msg_controllen > 0`), preventing SCM_RIGHTS fd passing regardless of outbound restriction settings. |
-| `clone()` | `flags` (register value) | Deny namespace-creating flags: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` |
-| `clone3()` | `clone_args.flags` (read from userspace struct) | Same flag check as `clone()`, read from the `clone_args` struct via `/proc/<pid>/mem` |
-| `socket()` | `domain`, `type`, `protocol` (register values) | `SOCK_RAW` denied. `AF_NETLINK` restricted to `NETLINK_ROUTE` (protocol 0) only — all other netlink protocols denied. Normal TCP/UDP/Unix sockets allowed. |
-| `execve()` | `pathname` (read from userspace string) | Validate against `exec` paths. If `exec` is empty, allow all. |
-| `execveat()` | `pathname` (read from userspace string) | Same as `execve()`. Resolves the path relative to the `dirfd` argument. |
-
-### TOCTOU protection
-
-A time-of-check-time-of-use race exists: a multi-threaded sandboxed process
-could modify the memory that the supervisor reads between the read and the
-verdict. Canister mitigates this with `SECCOMP_IOCTL_NOTIF_ID_VALID`:
-
-1. Read notification (gets syscall args and a unique notification ID).
-2. Read memory via `/proc/<pid>/mem` for pointer-based arguments.
-3. Evaluate policy.
-4. Call `ioctl(SECCOMP_IOCTL_NOTIF_ID_VALID, &id)` — if the kernel returns
-   an error (`ENOENT`), the syscall was interrupted (the thread exited or
-   the memory was unmapped) and the notification is stale. The supervisor
-   skips sending a verdict.
-5. Send verdict.
-
-This is the standard mitigation recommended by the `seccomp_unotify(2)` man page.
-It is not airtight against a determined attacker with precise timing, but it
-eliminates the most common race windows.
-
-### CIDR matching
-
-For `connect()` filtering, the supervisor supports both exact IP matches and CIDR
-range matches (e.g., `10.0.0.0/8`, `2606:2800:220:1::/64`). The resolved IPs from
-each `[[host]]` block's `domain` are combined with any `reachable_ips` CIDR ranges
-from the config to build the allowlist. Loopback addresses (`127.0.0.0/8`,
-`::1`) and `AF_UNIX` sockets are always permitted.
-
-### DNS proxy integration
-
-When the notifier is active, a DNS proxy runs in the **parent process** on
-an ephemeral port. The sandbox's `/etc/resolv.conf` points to pasta's
-DNS address (`169.254.0.1:53`), which is configured via `--dns-forward`
-to forward queries to the parent's DNS proxy. The proxy
-only resolves domains that have a matching `[[host]]` block — all other
-queries receive an NXDOMAIN response. This prevents DNS-based information
-exfiltration and ensures the sandbox can only resolve allowed domains.
+So `allow_execve` is a **best-effort hardening control**, not a hard boundary:
+to guarantee a binary never runs, don't mount it (or use the MAC backstop). The
+full rationale and the load-bearing "enforced ⟹ writable-noexec" invariant are
+in `docs/ARCHITECTURE.md` (§4b) and `docs/notifier-removal-audit.md`.
 
 ### Configuration
 
