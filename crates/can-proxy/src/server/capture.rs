@@ -117,12 +117,93 @@ impl CaptureCtx {
         self.scrub_text(url)
     }
 
-    pub(super) fn chunk(&self, offset_ms: u64, data: &[u8]) -> BodyChunk {
-        let scrubbed = self.scrub_bytes(data);
-        BodyChunk {
-            offset_ms,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(&scrubbed),
+    /// Scrub a whole streamed body into chunks, with the whole body as
+    /// context.
+    ///
+    /// Scrubbing each frame on its own is not enough: a secret split
+    /// between two frames is in neither of them, so both halves survive
+    /// and rejoin in the evidence file — while `body_b64`, scrubbed as
+    /// one buffer, looks clean.
+    ///
+    /// So the matches are found once over the concatenated body, and
+    /// each frame is rebuilt from that: bytes no match covers are kept,
+    /// a match contributes `[redacted]` to the frame it *starts* in, and
+    /// its remaining bytes are dropped from the frames they run into.
+    /// Frame boundaries and their timings survive, and the chunks
+    /// concatenate to exactly the scrubbed body.
+    pub(super) fn chunks(&self, frames: &[(u64, Vec<u8>)]) -> Vec<BodyChunk> {
+        let whole: Vec<u8> = frames.iter().flat_map(|(_, data)| data.clone()).collect();
+        let redactions = self.redaction_ranges(&whole);
+
+        let mut chunks = Vec::with_capacity(frames.len());
+        let mut emitted = 0usize;
+        let mut position = 0usize;
+
+        for (offset_ms, data) in frames {
+            let (start, end) = (position, position + data.len());
+            position = end;
+
+            let mut out = Vec::with_capacity(data.len());
+            let mut cursor = start;
+
+            for (from, to) in redactions.iter().copied() {
+                if to <= start || from >= end {
+                    continue;
+                }
+                if from >= cursor {
+                    out.extend_from_slice(&whole[cursor..from]);
+                    out.extend_from_slice(REDACTED.as_bytes());
+                }
+                cursor = to.max(cursor);
+            }
+
+            if cursor < end {
+                out.extend_from_slice(&whole[cursor..end]);
+            }
+
+            if out.is_empty() || emitted >= self.max_bytes {
+                continue;
+            }
+
+            // The cap bounds what a run writes. Without it here, `chunks`
+            // would carry the whole body again regardless of `max_bytes`.
+            let room = self.max_bytes - emitted;
+            let slice = &out[..out.len().min(room)];
+            emitted += slice.len();
+
+            chunks.push(BodyChunk {
+                offset_ms: *offset_ms,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(slice),
+            });
         }
+
+        chunks
+    }
+
+    /// Byte ranges of `bytes` that `scrub_bytes` would replace, in
+    /// order and without overlap. Secrets are tried longest-first, the
+    /// same order `scrub_bytes` applies them in.
+    fn redaction_ranges(&self, bytes: &[u8]) -> Vec<(usize, usize)> {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+        for secret in self.secrets.iter() {
+            let needle = secret.as_bytes();
+            if needle.is_empty() {
+                continue;
+            }
+            let mut from = 0usize;
+            while let Some(found) = find_subslice(&bytes[from..], needle) {
+                let at = from + found;
+                let range = (at, at + needle.len());
+                if !ranges.iter().any(|(s, e)| range.0 < *e && *s < range.1) {
+                    ranges.push(range);
+                }
+                from = range.1;
+            }
+        }
+
+        ranges.sort_unstable();
+        ranges
     }
 
     fn scrub_text(&self, text: &str) -> String {
@@ -146,6 +227,15 @@ impl CaptureCtx {
 
 /// Byte-level `replace`: bodies are not necessarily UTF-8, and a secret
 /// embedded in binary content must still be removed.
+/// First occurrence of `needle` in `haystack`, as an index.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+
+    (0..=haystack.len() - needle.len()).find(|&i| haystack[i..].starts_with(needle))
+}
+
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return haystack.to_vec();
@@ -286,7 +376,7 @@ where
 
     let mut body = body;
     let mut bytes = Vec::new();
-    let mut chunks = Vec::new();
+    let mut frames: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut first_byte_ms = None;
     let mut trailers = None;
 
@@ -306,7 +396,7 @@ where
                     return Err(());
                 }
                 bytes.extend_from_slice(&data);
-                chunks.push(recorder.ctx().chunk(offset_ms, &data));
+                frames.push((offset_ms, data.to_vec()));
             }
             Err(frame) => {
                 if let Ok(map) = frame.into_trailers() {
@@ -318,7 +408,7 @@ where
 
     Ok(CapturedStream {
         bytes: Bytes::from(bytes),
-        chunks,
+        chunks: recorder.ctx().chunks(&frames),
         first_byte_ms,
         trailers,
     })

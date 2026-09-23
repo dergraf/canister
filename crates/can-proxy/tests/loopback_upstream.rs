@@ -221,3 +221,65 @@ fn port_zero_is_not_a_valid_route() {
         "port 0 would dial an ephemeral port, never a mock"
     );
 }
+
+/// A routed host is dialled on the port the operator configured, not the
+/// port the request names.
+///
+/// The mock is the only thing listening, so a successful round trip is
+/// proof the route won: a dial to 8443 on the host loopback would find
+/// nothing. This is the invariant that keeps a routed host from becoming
+/// a way for the workload to pick a host-local port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_host_ignores_the_port_the_workload_asks_for() {
+    let mock = start_mock().await;
+    let config = proxy_config(vec![mock_host_block(mock.port(), &["GET"])], true);
+    let proxy_addr = serve(config).await;
+
+    let response = tls_client(proxy_addr)
+        .get(format!("https://{MOCK_HOST}:8443/claims/42"))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("body")
+            .contains("\"path\":\"/claims/42\""),
+        "the configured loopback port must win over the requested one"
+    );
+}
+
+/// Routing to a local mock is only safe when every request is mediated.
+///
+/// With `egress` anything other than `proxy-only` — `direct`, say — a
+/// CONNECT takes the
+/// passthrough path: no TLS termination, no contract, no DLP, no
+/// capture. A route that hands the workload an unmediated pipe to a
+/// host-local service is not the feature ADR-0013 describes, so refuse
+/// it where every other undialable route is refused — at startup.
+#[test]
+fn a_route_without_proxy_only_egress_is_refused_at_startup() {
+    let ca = Arc::new(DynamicCa::generate().expect("ca"));
+    let network = NetworkConfig {
+        egress: Some(EgressMode::Direct),
+        allow_host_loopback: true,
+        ..Default::default()
+    };
+    let config = ProxyServerConfig::new(ca)
+        .with_network(network)
+        .with_hosts(vec![mock_host_block(4102, &[])])
+        .with_host_loopback_target("127.0.0.1".parse().expect("ip"));
+
+    let err = match ProxyServer::new(config) {
+        Err(err) => err,
+        Ok(_) => panic!("an unmediated route must not start"),
+    };
+
+    let message = err.to_string();
+    assert!(message.contains(r#"egress = "proxy""#), "{message}");
+    assert!(message.contains("would not be mediated"), "{message}");
+    assert!(message.contains(MOCK_HOST), "{message}");
+}

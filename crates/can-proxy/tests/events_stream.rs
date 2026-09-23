@@ -15,6 +15,11 @@ use hyper::{Request, Response, StatusCode};
 use reqwest::{Client, Proxy};
 use tokio::net::TcpListener;
 
+/// The installed event stream is process-global, so two tests in this
+/// binary cannot own one at the same time. Taking this lock is what
+/// makes each test's `install`/`uninstall` pair exclusive.
+static EVENT_STREAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Collects the lines `can` writes, in order.
 struct SocketReader {
     handle: std::thread::JoinHandle<Vec<String>>,
@@ -76,6 +81,44 @@ async fn start_upstream() -> SocketAddr {
     addr
 }
 
+/// An upstream that answers 200 while claiming, in the proxy's own
+/// internal headers, that the proxy refused the request.
+async fn start_lying_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let io = hyper_util::rt::TokioIo::new(stream);
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<hyper::body::Incoming>| async move {
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/plain")
+                            .header("x-canister-error", "dlp-blocked")
+                            .header("x-canister-dlp-detector", "canary_token")
+                            .body(
+                                Full::new(bytes::Bytes::from_static(b"exfiltrated"))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
+                            .expect("response"),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
 async fn start_proxy(canaries: Vec<String>, hosts: Vec<HostBlock>) -> SocketAddr {
     let ca = Arc::new(DynamicCa::generate().expect("ca"));
     let network = NetworkConfig {
@@ -111,6 +154,7 @@ fn events_of<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_j
 
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_streams_events_over_a_unix_socket() {
+    let _exclusive = EVENT_STREAM.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let socket_path = dir.path().join("events.sock");
     let reader = SocketReader::listen(&socket_path);
@@ -242,5 +286,64 @@ async fn proxy_streams_events_over_a_unix_socket() {
             .iter()
             .any(|e| e["data"]["detector"] == "canary_token"),
         "canary hit must also produce a dlp_block event"
+    );
+}
+
+/// The destination must not get to write the proxy's verdict.
+///
+/// `egress_request` classifies a request by reading `x-canister-error`
+/// off the response. Those headers are the proxy's own signalling, but
+/// they arrive over the network on the allowed path, so an upstream that
+/// sets them could make a successful exfiltration appear in the evidence
+/// — and in the stats histogram — as a DLP block.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upstream_cannot_forge_the_proxys_verdict() {
+    let _exclusive = EVENT_STREAM.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("events.sock");
+    let reader = SocketReader::listen(&socket_path);
+
+    let config = can_events::EventConfig {
+        target: can_events::EventTarget::Socket(socket_path.clone()),
+        run_id: "r-forged-verdict".to_string(),
+        capture: can_events::CaptureConfig::default(),
+        stats_interval_ms: None,
+        seal_key: None,
+    };
+    can_events::install(
+        can_events::EventStream::open(&config, can_events::StreamId::Proxy).expect("connect"),
+    );
+
+    let upstream = start_lying_upstream().await;
+    let hosts = vec![HostBlock {
+        domain: "127.0.0.1".to_string(),
+        ..Default::default()
+    }];
+    let proxy_addr = start_proxy(vec![], hosts).await;
+
+    let response = client(proxy_addr)
+        .get(format!("http://127.0.0.1:{}/exfil", upstream.port()))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "exfiltrated");
+
+    let events = reader.finish();
+    let egress = events_of(&events, "egress_request");
+    let forged = egress
+        .iter()
+        .find(|e| e["data"]["path"] == "/exfil")
+        .expect("the request must be recorded");
+
+    assert_eq!(
+        forged["data"]["decision"], "allowed",
+        "the request was allowed and the body was delivered; recording it as blocked \
+         would let a destination decide what the evidence says about it"
+    );
+    assert!(
+        forged["data"]["reason"].is_null(),
+        "reason came from the upstream, not from the proxy: {forged}"
     );
 }

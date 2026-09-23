@@ -138,20 +138,43 @@ impl ProxyServerConfig {
     }
 }
 
-/// Reject a mock route that could never be dialled, at construction
-/// time: a per-request failure here would look like an upstream outage
-/// and quietly send nothing where the operator expected a local mock
-/// (ADR-0013).
+/// Reject a mock route that could never be dialled, or that would not be
+/// mediated, at construction time: a per-request failure here would look
+/// like an upstream outage and quietly send nothing where the operator
+/// expected a local mock (ADR-0013).
 fn validate_upstreams(config: &ProxyServerConfig) -> Result<(), ProxyError> {
+    let egress = config
+        .network
+        .as_ref()
+        .map(|network| network.egress())
+        .unwrap_or(can_policy::config::EgressMode::ProxyOnly);
+
     for host in &config.hosts {
         let target = host
             .upstream_target()
             .map_err(|err| ProxyError::Config(err.to_string()))?;
-        if target.is_some() && config.host_loopback_target.is_none() {
+        if target.is_none() {
+            continue;
+        }
+        if config.host_loopback_target.is_none() {
             return Err(ProxyError::Config(format!(
                 "[[host]] {} sets upstream = {:?}, which requires [unsafe] host_loopback = true",
                 host.domain,
                 host.upstream.as_deref().unwrap_or_default()
+            )));
+        }
+        // Routing only keeps its ADR-0013 promise — TLS terminated, the
+        // contract applied, DLP scanned — on the mediated path. Under any
+        // other egress mode a CONNECT is passed through untouched, and a
+        // route would hand the workload an unmediated pipe to a
+        // host-local service instead of a mock.
+        if egress != can_policy::config::EgressMode::ProxyOnly {
+            return Err(ProxyError::Config(format!(
+                "[[host]] {} sets upstream = {:?}, which requires [network] egress = \"proxy\"; \
+                 under {:?} egress a routed host would not be mediated",
+                host.domain,
+                host.upstream.as_deref().unwrap_or_default(),
+                egress
             )));
         }
     }

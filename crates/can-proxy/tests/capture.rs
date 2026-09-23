@@ -70,7 +70,27 @@ async fn start_upstream() -> SocketAddr {
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
                     let streaming = req.uri().path() == "/stream";
+                    let split_secret = req.uri().path() == "/split-secret";
                     let bytes = req.into_body().collect().await.expect("body").to_bytes();
+
+                    if split_secret {
+                        // The real credential, cut in half across two
+                        // frames: neither frame contains it, their
+                        // concatenation does.
+                        let (head, tail) = REAL_SECRET.split_at(12);
+                        let chunks: Vec<Result<Frame<bytes::Bytes>, hyper::Error>> = vec![
+                            Ok(Frame::data(bytes::Bytes::from(format!("token: {head}")))),
+                            Ok(Frame::data(bytes::Bytes::from(format!("{tail}\n")))),
+                        ];
+                        let body = StreamBody::new(futures_util::stream::iter(chunks));
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(body.boxed())
+                                .expect("response"),
+                        );
+                    }
 
                     if streaming {
                         let chunks: Vec<Result<Frame<bytes::Bytes>, hyper::Error>> = vec![
@@ -394,5 +414,69 @@ async fn capture_is_off_unless_asked_for() {
     assert!(
         events.iter().any(|e| e["event"] == "egress_request"),
         "the run is still observed, just without payloads"
+    );
+}
+
+/// Per-frame redaction is not enough: a secret split across two frames
+/// is in neither frame, so scrubbing each one leaves both halves in
+/// `chunks[]`, and concatenating them rebuilds the credential inside the
+/// evidence file CI archives. `body_b64` is scrubbed as a whole and
+/// looks clean, which is what makes this quiet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secret_split_across_frames_does_not_survive_in_the_chunks() {
+    let _guard = STREAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("events.sock");
+    let reader = SocketReader::listen(&socket_path);
+
+    let capture = can_events::CaptureConfig {
+        exchanges: true,
+        max_bytes: 64 * 1024,
+    };
+    install_stream(&socket_path, capture.clone());
+
+    let upstream = start_upstream().await;
+    let proxy_addr = start_proxy(capture).await;
+
+    let response = client(proxy_addr)
+        .post(format!("http://127.0.0.1:{}/split-secret", upstream.port()))
+        .body("{}")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let delivered = response.text().await.expect("body");
+    assert!(
+        delivered.contains(REAL_SECRET),
+        "the workload must really receive the split secret, or this proves nothing"
+    );
+
+    let (events, raw) = reader.finish();
+
+    assert!(
+        !raw.contains(REAL_SECRET),
+        "a real secret must never appear anywhere in the event stream"
+    );
+
+    let captured = exchanges(&events);
+    assert_eq!(captured.len(), 1);
+
+    let rejoined: String = captured[0]["data"]["response"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .map(|chunk| {
+            let encoded = chunk["data_b64"].as_str().expect("data_b64");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("base64");
+            String::from_utf8_lossy(&decoded).into_owned()
+        })
+        .collect();
+
+    assert!(
+        !rejoined.contains(REAL_SECRET),
+        "chunks rejoin into the credential: {rejoined}"
     );
 }
