@@ -10,6 +10,7 @@ description = "Core sandbox runtime: namespaces, seccomp, overlayfs, cgroups"
 can-policy.workspace = true
 can-proxy = { path = "../can-proxy" }
 can-dlp = { path = "../can-dlp" }
+can-events.workspace = true
 can-net.workspace = true
 can-log.workspace = true
 thiserror.workspace = true

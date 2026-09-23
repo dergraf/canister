@@ -2,7 +2,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod canaries;
 mod commands;
+mod events;
+mod policy_event;
 mod recipes;
 mod registry;
 
@@ -51,6 +54,15 @@ enum Commands {
         /// Can be repeated. Implies filtered network mode.
         #[arg(short = 'p', long = "port")]
         ports: Vec<String>,
+
+        /// JSON file of externally supplied, tagged canaries to watch for
+        /// on egress (ADR-0012). Same shape as
+        /// `[[network.dlp.external_canaries]]`.
+        #[arg(long, value_name = "PATH")]
+        canaries_file: Option<std::path::PathBuf>,
+
+        #[command(flatten)]
+        events: events::EventFlags,
     },
 
     /// Run a command inside the sandbox.
@@ -82,6 +94,15 @@ enum Commands {
         /// Can be repeated. Implies filtered network mode.
         #[arg(short = 'p', long = "port")]
         ports: Vec<String>,
+
+        /// JSON file of externally supplied, tagged canaries to watch for
+        /// on egress (ADR-0012). Same shape as
+        /// `[[network.dlp.external_canaries]]`.
+        #[arg(long, value_name = "PATH")]
+        canaries_file: Option<std::path::PathBuf>,
+
+        #[command(flatten)]
+        events: events::EventFlags,
 
         /// The command to execute.
         #[arg(required = true)]
@@ -227,14 +248,34 @@ fn main() -> ExitCode {
             monitor,
             strict,
             ports,
-        } => commands::up(name.as_deref(), dry_run, monitor, strict, &ports),
+            canaries_file,
+            events,
+        } => commands::up(
+            name.as_deref(),
+            dry_run,
+            monitor,
+            strict,
+            &ports,
+            canaries_file.as_deref(),
+            &events,
+        ),
         Commands::Run {
             recipe,
             monitor,
             strict,
             ports,
+            canaries_file,
+            events,
             command,
-        } => commands::run(&recipe, monitor, strict, &ports, command),
+        } => commands::run(
+            &recipe,
+            monitor,
+            strict,
+            &ports,
+            canaries_file.as_deref(),
+            &events,
+            command,
+        ),
         Commands::Check => commands::check(),
         Commands::Setup {
             remove,

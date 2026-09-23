@@ -14,6 +14,7 @@ path = "src/main.rs"
 can-sandbox.workspace = true
 can-policy.workspace = true
 can-net.workspace = true
+can-events.workspace = true
 can-log.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -21,3 +22,7 @@ tracing.workspace = true
 toml.workspace = true
 sha2.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
