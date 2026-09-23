@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use can_events::schema::{Decision, Event, Location};
 use sha2::{Digest, Sha256};
 
 /// Sink for DLP events. Production code writes to stderr; tests substitute
@@ -49,12 +50,140 @@ fn emit(line: String) {
 /// wrapping orchestrator can grep / parse without dealing with the
 /// human-readable `warn!` log format. `matched_redacted` is the output of
 /// `can_dlp::redact`; the raw token never appears.
-pub fn dlp_block(host: &str, detector: &str, matched_redacted: &str) {
+pub fn dlp_block(
+    host: &str,
+    detector: &str,
+    matched_redacted: &str,
+    location: Option<Location>,
+    blocked: bool,
+) {
+    crate::server::stats::record_dlp_block(detector);
+    if can_events::enabled() {
+        can_events::emit(Event::DlpBlock(can_events::schema::DlpBlock {
+            host: host.to_string(),
+            detector: detector.to_string(),
+            matched_redacted: matched_redacted.to_string(),
+            location,
+            blocked,
+        }));
+        return;
+    }
+
     let payload = serde_json::json!({
         "event": "dlp_block",
         "host": host,
         "detector": detector,
         "matched_redacted": matched_redacted,
+        "timestamp_ms": unix_ms(),
+    });
+    emit(payload.to_string());
+}
+
+/// Emit `egress_request` for a request that reached the proxy, deriving
+/// the decision from the proxy's own refusal header. No-op unless an
+/// event stream is installed, so default `can` output is unchanged.
+pub(crate) fn egress_request<B>(
+    host: &str,
+    method: &str,
+    path: &str,
+    duration_ms: u64,
+    resp: &hyper::Response<B>,
+) {
+    let error = resp
+        .headers()
+        .get("x-canister-error")
+        .and_then(|v| v.to_str().ok());
+    let detector = resp
+        .headers()
+        .get("x-canister-dlp-detector")
+        .and_then(|v| v.to_str().ok());
+
+    // Upstream failures are not refusals: policy let the request out and
+    // the destination (or the network) failed afterwards.
+    let (decision, reason) = match error {
+        None => (Decision::Allowed, None),
+        Some("upstream-timeout") => (Decision::Allowed, Some("upstream-timeout".to_string())),
+        Some("upstream-error") => (Decision::Allowed, Some("upstream-error".to_string())),
+        Some("policy-blocked") => (Decision::Blocked, Some("policy".to_string())),
+        Some("contract-refused") => (Decision::Blocked, Some("contract".to_string())),
+        Some("dlp-blocked") => (
+            Decision::Blocked,
+            Some(detector.unwrap_or("dlp").to_string()),
+        ),
+        Some(other) => (Decision::Blocked, Some(other.to_string())),
+    };
+
+    crate::server::stats::record_request(decision, duration_ms);
+    emit_egress(host, method, path, decision, reason);
+}
+
+/// Emit `egress_request` for a refusal raised before there is a response
+/// to classify — currently the CONNECT policy gate.
+pub(crate) fn egress_blocked(host: &str, method: &str, path: &str, reason: &str) {
+    crate::server::stats::record_request(Decision::Blocked, 0);
+    emit_egress(
+        host,
+        method,
+        path,
+        Decision::Blocked,
+        Some(reason.to_string()),
+    );
+}
+
+fn emit_egress(host: &str, method: &str, path: &str, decision: Decision, reason: Option<String>) {
+    if !can_events::enabled() {
+        return;
+    }
+    can_events::emit(Event::EgressRequest(can_events::schema::EgressRequest {
+        host: host.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        decision,
+        reason,
+    }));
+}
+
+/// Emit `contract_violation` with the reason code from the contract gate.
+pub(crate) fn contract_violation(
+    host: &str,
+    method: &str,
+    path: &str,
+    reason: &str,
+    detail: Option<String>,
+) {
+    crate::server::stats::record_contract_violation(reason);
+    if !can_events::enabled() {
+        return;
+    }
+    can_events::emit(Event::ContractViolation(
+        can_events::schema::ContractViolation {
+            host: host.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            reason: reason.to_string(),
+            detail,
+        },
+    ));
+}
+
+/// Legacy stderr line for a contract refusal.
+///
+/// Contract refusals have always been reported through the `dlp_block`
+/// stderr shape with a pseudo-detector, and orchestrators grep for it.
+/// With an event stream installed the structured `contract_violation`
+/// event (emitted at the gate) is authoritative, so nothing is written
+/// here — and the refusal is not counted as a DLP block, which has its
+/// own counter.
+pub(crate) fn legacy_contract_block(host: &str, reason: &str) {
+    if can_events::enabled() {
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "event": "dlp_block",
+        "host": host,
+        "detector": "contract",
+        "matched_redacted": reason,
         "timestamp_ms": unix_ms(),
     });
     emit(payload.to_string());
@@ -90,7 +219,28 @@ static CANARY_FIRES: AtomicU64 = AtomicU64::new(0);
 /// uniquely valuable — by construction the value did not exist outside
 /// the sandbox, so any echo is an exfiltration attempt with zero false
 /// positives.
-pub fn canary_fire(host: &str, detector: &str, matched_redacted: &str) {
+pub fn canary_fire(
+    host: &str,
+    detector: &str,
+    matched_redacted: &str,
+    data_class: Option<String>,
+    allowed: bool,
+    location: Option<Location>,
+) {
+    CANARY_FIRES.fetch_add(1, Ordering::Relaxed);
+    crate::server::stats::record_canary_fire(data_class.as_deref(), allowed);
+    if can_events::enabled() {
+        can_events::emit(Event::CanaryFire(can_events::schema::CanaryFire {
+            host: host.to_string(),
+            detector: detector.to_string(),
+            matched_redacted: matched_redacted.to_string(),
+            data_class,
+            allowed,
+            location,
+        }));
+        return;
+    }
+
     let ts = unix_ms();
 
     let prev_hash = {
@@ -104,7 +254,6 @@ pub fn canary_fire(host: &str, detector: &str, matched_redacted: &str) {
         let mut guard = CHAIN_HASH.lock().expect("chain hash mutex poisoned");
         *guard = new_hash;
     }
-    CANARY_FIRES.fetch_add(1, Ordering::Relaxed);
 
     let payload = serde_json::json!({
         "event": "canary_fire",
@@ -197,9 +346,30 @@ mod tests {
         set_sink_for_test(Box::new(Adapter(sink.clone())));
         reset_canary_chain_for_test();
 
-        canary_fire("evil.example.com", "CanaryToken", "ghp_•••••1");
-        canary_fire("evil.example.com", "CanaryToken", "ghp_•••••2");
-        canary_fire("other.example.com", "CanaryToken", "npm_•••••3");
+        canary_fire(
+            "evil.example.com",
+            "CanaryToken",
+            "ghp_•••••1",
+            None,
+            false,
+            None,
+        );
+        canary_fire(
+            "evil.example.com",
+            "CanaryToken",
+            "ghp_•••••2",
+            None,
+            false,
+            None,
+        );
+        canary_fire(
+            "other.example.com",
+            "CanaryToken",
+            "npm_•••••3",
+            None,
+            false,
+            None,
+        );
 
         let lines = sink.0.lock().unwrap().clone();
         assert_eq!(lines.len(), 3);
@@ -250,6 +420,8 @@ mod tests {
             "evil.example.com",
             "GithubPat",
             "ghp_•••••deadbeef (len=40)",
+            None,
+            true,
         );
         let lines = sink.0.lock().unwrap().clone();
         assert_eq!(lines.len(), 1, "expected one event");

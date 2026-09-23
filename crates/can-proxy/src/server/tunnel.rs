@@ -12,6 +12,7 @@ use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 
+use super::capture::CaptureCtx;
 use super::dlp_ctx::DlpCtx;
 use super::limits::ProxyLimits;
 use super::request::handle_inner_request;
@@ -19,8 +20,9 @@ use super::util::parse_host_from_authority;
 use crate::ca::DynamicCa;
 use crate::policy::OutboundPolicy;
 
-// 8 distinct args, all genuinely required: TLS materials, dial state,
-// gates, dlp ctx. Bundling into one struct just shifts the noise.
+// 9 distinct args, all genuinely required: TLS materials, dial state,
+// gates, dlp ctx, capture ctx. Bundling into one struct just shifts the
+// noise.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_tunnel(
     upgraded: Upgraded,
@@ -31,6 +33,7 @@ pub(super) async fn handle_tunnel(
     contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: DlpCtx,
+    capture: Option<CaptureCtx>,
 ) -> Result<(), std::io::Error> {
     let host = parse_host_from_authority(&host_with_port);
     debug!("Establishing TLS tunnel for {}", host);
@@ -62,6 +65,7 @@ pub(super) async fn handle_tunnel(
                     "https",
                     limits.clone(),
                     Some(dlp.clone()),
+                    capture.clone(),
                 )
             }),
         )

@@ -22,18 +22,24 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pemfile = "2"
 x509-parser = "0.16"
 bytes = "1"
+base64 = "0.22"
 tracing = "0.1"
 thiserror = "2"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 can-policy = { path = "../can-policy" }
 can-dlp = { path = "../can-dlp" }
+can-events = { path = "../can-events" }
 rustls-native-certs = "0.8.3"
 can-net = { path = "../can-net" }
 ipnet.workspace = true
 
 [dev-dependencies]
 base64 = "0.22"
+can-events = { path = "../can-events" }
+serde_json = { workspace = true }
+tempfile = "3"
+futures-util = "0.3"
 reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
 flate2 = "1"
 proptest = "1"

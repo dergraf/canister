@@ -76,6 +76,32 @@ pub struct HostBlock {
     /// global default.
     #[serde(default)]
     pub contract_mode: Option<ContractMode>,
+
+    /// Route requests for this host to a service on the *host's*
+    /// loopback instead of the real destination, as `loopback:<port>`
+    /// (ADR-0013). The sandboxed workload still calls
+    /// `https://<domain>/...` and the proxy still terminates TLS with its
+    /// dynamic CA, applies the contract and scans with DLP; only the dial
+    /// target changes, and the hop to the mock is plain HTTP over
+    /// loopback. Requires `[unsafe] host_loopback = true`.
+    #[serde(default)]
+    pub upstream: Option<String>,
+}
+
+/// Where a `[[host]]` block's traffic is actually dialled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTarget {
+    /// A port on the host's loopback interface, reached through the
+    /// pasta gateway.
+    Loopback(u16),
+}
+
+/// Error returned for a malformed `upstream` value.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid upstream '{value}' for host '{domain}': expected `loopback:<port>`")]
+pub struct UpstreamParseError {
+    pub domain: String,
+    pub value: String,
 }
 
 impl HostBlock {
@@ -105,7 +131,31 @@ impl HostBlock {
             },
             allow_credentials: union_vecs(self.allow_credentials, overlay.allow_credentials),
             contract_mode: overlay.contract_mode.or(self.contract_mode),
+            upstream: overlay.upstream.or(self.upstream),
         }
+    }
+
+    /// Parse the `upstream` override. `None` means "dial the real
+    /// destination"; an unparsable value is an error rather than a
+    /// silent fallback, because falling back would send traffic meant
+    /// for a local mock to the internet.
+    pub fn upstream_target(&self) -> Result<Option<UpstreamTarget>, UpstreamParseError> {
+        let Some(value) = self.upstream.as_deref() else {
+            return Ok(None);
+        };
+
+        let invalid = || UpstreamParseError {
+            domain: self.domain.clone(),
+            value: value.to_string(),
+        };
+
+        let port = value.strip_prefix("loopback:").ok_or_else(invalid)?;
+        let port: u16 = port.parse().map_err(|_| invalid())?;
+        if port == 0 {
+            return Err(invalid());
+        }
+
+        Ok(Some(UpstreamTarget::Loopback(port)))
     }
 }
 

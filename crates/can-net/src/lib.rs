@@ -103,8 +103,33 @@ impl NetworkState {
             let _ = child.wait();
         }
         if let Some(pid) = self.proxy_pid.take() {
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-            let _ = nix::sys::wait::waitpid(pid, None);
+            // SIGTERM first so the proxy can emit its final `stats` event
+            // (ADR-0015); SIGKILL if it does not exit promptly, so a
+            // wedged proxy can never hold up teardown.
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            if !wait_for_exit(pid, std::time::Duration::from_millis(250)) {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(pid, None);
+            }
+        }
+    }
+}
+
+/// Reap `pid` if it exits within `timeout`. Returns whether it did.
+fn wait_for_exit(pid: nix::unistd::Pid, timeout: std::time::Duration) -> bool {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Exited, signalled, or already reaped: nothing left to kill.
+            Ok(_) | Err(_) => return true,
         }
     }
 }

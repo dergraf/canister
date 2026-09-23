@@ -8,30 +8,36 @@
 
 use hyper::Response;
 
+use can_events::schema::Location;
+
+use super::dlp_ctx::DlpCtx;
 use super::dlp_enforce::{FindingSource, enforce_one};
 use super::responses::ProxyBody;
 
 pub(super) fn stream_scan_body(
-    scanner: &can_dlp::DlpScanner,
+    ctx: &DlpCtx,
     bytes: &[u8],
     host: &str,
-    canaries: &[Vec<u8>],
-    monitor: bool,
-    max_decode_depth: usize,
 ) -> Option<Response<ProxyBody>> {
     const CHUNK: usize = 64 * 1024;
-    let mut s =
-        can_dlp::streaming::StreamingScanner::new(scanner.patterns(), canaries, max_decode_depth);
+    let mut s = can_dlp::streaming::StreamingScanner::new(
+        ctx.scanner.patterns(),
+        &ctx.canaries,
+        ctx.max_decode_depth,
+    );
     for chunk in bytes.chunks(CHUNK) {
         for finding in s.feed(chunk) {
-            let action = scanner.streaming_verdict(finding.detector, host);
+            let action = ctx.scanner.streaming_verdict(finding.detector, host);
             if let Some(resp) = enforce_one(
+                ctx,
                 finding.detector,
                 &finding.matched_text,
                 host,
                 action,
-                monitor,
                 FindingSource::Streaming,
+                // The streaming pass works on raw chunks, so all it can
+                // say is "somewhere in the body".
+                Some(Location::Body),
             ) {
                 return Some(resp);
             }
