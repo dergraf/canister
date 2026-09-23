@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"run_start","data":{"can_version":"0.1.0","command":["python3","agent/main.py"],"sandbox":"ci","monitor":false,"strict":true},"chain_hash":"4469309d606f8960ea197886796d56d21a74755f9edd6b502b10a78304c0cb7e"}

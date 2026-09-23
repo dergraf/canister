@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"process_exec","data":{"path":"/usr/bin/python3","argv":["/usr/bin/python3","agent/main.py"],"pid":7,"decision":"allowed"},"chain_hash":"4f6fd8f798ee689fa0ce468d351336a83d208a1f67c434ee04c5b2d116f530fc"}
