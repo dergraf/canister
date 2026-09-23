@@ -31,6 +31,7 @@ use http_body_util::{BodyExt, Limited};
 use hyper::Response;
 use tracing::warn;
 
+use super::capture::{ExchangeRecorder, collect_frames};
 use super::dlp_ctx::DlpCtx;
 use super::dlp_enforce::enforce_response_verdicts;
 use super::limits::ProxyLimits;
@@ -43,27 +44,65 @@ pub(super) async fn scan_response(
     dlp: &DlpCtx,
     host: &str,
     limits: &ProxyLimits,
+    recorder: Option<&mut ExchangeRecorder>,
 ) -> Response<ProxyBody> {
     let (parts, body) = response.into_parts();
-    let limited = Limited::new(body, limits.max_buffered_body_bytes);
-    let collected = match limited.collect().await {
-        Ok(c) => c,
-        Err(_) => {
-            // Fail closed: an unscanned oversize body is the same risk
-            // as a known-bad one.
-            warn!(
-                "DLP: response body from {} exceeded {} bytes — refusing to forward unscanned",
-                host, limits.max_buffered_body_bytes
-            );
-            return ProxyError::body_too_large(host, limits.max_buffered_body_bytes)
-                .into_response();
+    let mut recorder = recorder;
+
+    // With capture on, read frame by frame so SSE / chunked boundaries
+    // and their timing survive; otherwise keep the untouched
+    // buffer-everything path.
+    let (bytes, trailers, chunks, first_byte_ms) = match recorder.as_deref_mut() {
+        Some(recorder) => {
+            match collect_frames(body, limits.max_buffered_body_bytes, recorder).await {
+                Ok(stream) => {
+                    let trailers = trailer_pairs(stream.trailers.as_ref());
+                    (stream.bytes, trailers, stream.chunks, stream.first_byte_ms)
+                }
+                Err(()) => {
+                    warn!(
+                        "DLP: response body from {} exceeded {} bytes — refusing to forward unscanned",
+                        host, limits.max_buffered_body_bytes
+                    );
+                    return ProxyError::body_too_large(host, limits.max_buffered_body_bytes)
+                        .into_response();
+                }
+            }
+        }
+        None => {
+            let limited = Limited::new(body, limits.max_buffered_body_bytes);
+            let collected = match limited.collect().await {
+                Ok(c) => c,
+                Err(_) => {
+                    // Fail closed: an unscanned oversize body is the same
+                    // risk as a known-bad one.
+                    warn!(
+                        "DLP: response body from {} exceeded {} bytes — refusing to forward unscanned",
+                        host, limits.max_buffered_body_bytes
+                    );
+                    return ProxyError::body_too_large(host, limits.max_buffered_body_bytes)
+                        .into_response();
+                }
+            };
+            // Capture trailers before consuming the buffer — an attacker-
+            // controlled upstream can reflect the session canary back in
+            // `Trailer:`-declared headers just as easily as in `Set-Cookie`.
+            let trailers = trailer_pairs(collected.trailers());
+            (collected.to_bytes(), trailers, Vec::new(), None)
         }
     };
-    // Capture trailers before consuming the buffer — an attacker-
-    // controlled upstream can reflect the session canary back in
-    // `Trailer:`-declared headers just as easily as in `Set-Cookie`.
-    let trailers = trailer_pairs(collected.trailers());
-    let bytes = collected.to_bytes();
+
+    // Record what the upstream actually said, even if DLP refuses to
+    // forward it below — the refusal is evidence too.
+    if let Some(recorder) = recorder {
+        recorder.record_response(
+            parts.status.as_u16(),
+            &parts.headers,
+            &bytes,
+            chunks,
+            first_byte_ms,
+        );
+    }
 
     let headers_vec: Vec<(String, String)> = parts
         .headers
@@ -94,7 +133,7 @@ pub(super) async fn scan_response(
         host,
     );
 
-    if let Some(resp) = enforce_response_verdicts(&verdicts, host, dlp.monitor) {
+    if let Some(resp) = enforce_response_verdicts(dlp, &verdicts, host) {
         // canary_fire is emitted inside enforce_one when the detector
         // is `canary_token`; nothing extra to log here.
         return resp;

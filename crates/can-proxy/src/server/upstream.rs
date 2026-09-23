@@ -31,10 +31,17 @@ pub(super) async fn forward_upstream(
         .host()
         .ok_or("missing host in upstream URI")?
         .to_string();
-    let port = req
-        .uri()
-        .port_u16()
-        .unwrap_or(if original_scheme == "https" { 443 } else { 80 });
+
+    // ADR-0013: a host routed to a local mock keeps its name (TLS was
+    // already terminated against it, contracts and DLP already ran) but
+    // is dialled on the host's loopback, in the clear.
+    let loopback_port = outbound_policy.loopback_upstream(&host);
+    let use_tls = original_scheme == "https" && loopback_port.is_none();
+    let port = loopback_port.unwrap_or_else(|| {
+        req.uri()
+            .port_u16()
+            .unwrap_or(if original_scheme == "https" { 443 } else { 80 })
+    });
 
     // `connect_via_cache` internally rewrites `host.canister.local`
     // to the in-netns gateway IP that pasta maps to the host's
@@ -44,7 +51,7 @@ pub(super) async fn forward_upstream(
         .await
         .map_err(|e| format!("upstream connect to {host}:{port} failed: {e}"))?;
 
-    if original_scheme == "https" {
+    if use_tls {
         let connector =
             build_upstream_tls_connector().map_err(|e| format!("TLS connector: {e}"))?;
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
@@ -118,11 +125,16 @@ pub(super) async fn connect_via_cache(
     port: u16,
     outbound_policy: &OutboundPolicy,
 ) -> Result<tokio::net::TcpStream, std::io::Error> {
-    if host.eq_ignore_ascii_case(HOST_LOOPBACK_ALIAS) {
+    // Both the `host.canister.local` alias and a `[[host]] upstream =
+    // "loopback:<port>"` route resolve to the same place: the in-netns
+    // gateway address that pasta maps to the host's 127.0.0.1.
+    let routed_to_host_loopback = host.eq_ignore_ascii_case(HOST_LOOPBACK_ALIAS)
+        || outbound_policy.loopback_upstream(host).is_some();
+    if routed_to_host_loopback {
         let Some(target) = outbound_policy.host_loopback_target else {
-            return Err(std::io::Error::other(
-                "host.canister.local used but [network] allow_host_loopback is false",
-            ));
+            return Err(std::io::Error::other(format!(
+                "{host} is routed to the host loopback but [unsafe] host_loopback is false"
+            )));
         };
         return tokio::net::TcpStream::connect((target, port)).await;
     }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use super::ProxyServerConfig;
+use super::canaries::ExternalCanaryTable;
 use super::lifecycle::ProxyError;
 
 /// Cloned into every request handler. Always cheap to clone (Arcs).
@@ -29,6 +30,9 @@ pub(super) struct DlpCtx {
     /// Fake→real env-var secret substitutions, applied to authorized
     /// egress just before forwarding. Empty unless `fake_secrets` is set.
     pub(super) swaps: Arc<Vec<super::secret_swap::SecretSwap>>,
+    /// Externally supplied canaries, keyed by value, with the data class
+    /// and destinations each is allowed to reach (ADR-0012).
+    pub(super) external_canaries: Arc<ExternalCanaryTable>,
 }
 
 impl DlpCtx {
@@ -72,8 +76,14 @@ impl DlpCtx {
             .map(|d| d.dns_entropy_threshold())
             .unwrap_or(can_policy::config::DlpConfig::DEFAULT_DNS_ENTROPY_THRESHOLD);
 
+        // External canaries are recognized exactly like generated ones;
+        // what differs is how a hit is classified (see `canaries.rs`).
+        let external_canaries = ExternalCanaryTable::new(config.external_canaries.clone());
+        let mut canaries = config.canaries.clone();
+        canaries.extend(external_canaries.values());
+
         let scanner = can_dlp::DlpScanner::new(
-            config.canaries.clone(),
+            canaries.clone(),
             &user_scopes,
             max_depth,
             do_decompress,
@@ -86,11 +96,7 @@ impl DlpCtx {
             config.strict, config.monitor
         );
 
-        let canary_bytes: Vec<Vec<u8>> = config
-            .canaries
-            .iter()
-            .map(|c| c.as_bytes().to_vec())
-            .collect();
+        let canary_bytes: Vec<Vec<u8>> = canaries.iter().map(|c| c.as_bytes().to_vec()).collect();
 
         Ok(Some(Self {
             scanner: Arc::new(scanner),
@@ -100,6 +106,7 @@ impl DlpCtx {
             canaries: Arc::new(canary_bytes),
             max_decode_depth: max_depth,
             swaps: Arc::new(config.secret_swaps.clone()),
+            external_canaries: Arc::new(external_canaries),
         }))
     }
 }
