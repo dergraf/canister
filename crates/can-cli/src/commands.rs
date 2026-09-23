@@ -157,6 +157,8 @@ pub fn up(
     monitor: bool,
     strict: bool,
     port_args: &[String],
+    canaries_file: Option<&Path>,
+    event_flags: &crate::events::EventFlags,
 ) -> Result<i32> {
     // Discover canister.toml by walking up from CWD.
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -235,6 +237,10 @@ pub fn up(
         config.network.ports.push(mapping);
     }
 
+    if let Some(path) = canaries_file {
+        crate::canaries::apply_canaries_file(&mut config, path)?;
+    }
+
     // CLI --strict overrides (can only tighten).
     let effective_strict = strict || config.strict;
 
@@ -264,15 +270,18 @@ pub fn up(
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty command in sandbox '{sandbox_name}'"))?;
 
+    let events = event_flags.init()?;
+
     let opts = SandboxOpts {
         command: cmd.clone(),
         args: args.to_vec(),
         config,
         monitor,
         strict: effective_strict,
+        events,
     };
 
-    let exit_code = can_sandbox::run(&opts)?;
+    let exit_code = run_sandbox(&opts, Some(&sandbox_name))?;
 
     if monitor {
         print_monitor_exit_summary(exit_code, &opts.config);
@@ -442,12 +451,12 @@ fn print_dry_run(config: &SandboxConfig, strict: bool) -> Result<i32> {
 /// recipe file.
 pub fn show(recipe_args: &[String], command: Vec<String>) -> Result<i32> {
     let cmd_name = command.first().map(|s| s.as_str());
-    let mut config = load_recipes(recipe_args, cmd_name)?;
+    let config = load_recipes(recipe_args, cmd_name)?;
 
     // Resolve Option fields to their effective values so the output is
-    // fully explicit — no hidden defaults.
-    config.network.egress = Some(config.network.egress());
-    config.syscalls.seccomp_mode = Some(config.syscalls.seccomp_mode());
+    // fully explicit — no hidden defaults. The same resolution feeds the
+    // `policy_resolved` event.
+    let config = crate::policy_event::resolved(&config);
 
     let toml_str =
         toml::to_string_pretty(&config).context("serializing resolved config to TOML")?;
@@ -461,6 +470,8 @@ pub fn run(
     monitor: bool,
     strict: bool,
     port_args: &[String],
+    canaries_file: Option<&Path>,
+    event_flags: &crate::events::EventFlags,
     command: Vec<String>,
 ) -> Result<i32> {
     let cmd_name = command.first().map(|s| s.as_str());
@@ -489,6 +500,10 @@ pub fn run(
         config.network.ports.push(mapping);
     }
 
+    if let Some(path) = canaries_file {
+        crate::canaries::apply_canaries_file(&mut config, path)?;
+    }
+
     // CLI --strict flag overrides config (can only tighten, never loosen).
     let effective_strict = strict || config.strict;
 
@@ -513,21 +528,69 @@ pub fn run(
 
     tracing::debug!("effective egress mode: {:?}", config.network.egress());
 
+    let events = event_flags.init()?;
+
     let opts = SandboxOpts {
         command: cmd.clone(),
         args: args.to_vec(),
         config,
         monitor,
         strict: effective_strict,
+        events,
     };
 
-    let exit_code = can_sandbox::run(&opts)?;
+    let exit_code = run_sandbox(&opts, None)?;
 
     if monitor {
         print_monitor_exit_summary(exit_code, &opts.config);
     }
 
     Ok(exit_code)
+}
+
+/// Run the sandbox, bracketed by `run_start` / `run_end` events.
+///
+/// Emission is a no-op unless an event stream was installed, so this is
+/// the single launch path for both `can run` and `can up`.
+fn run_sandbox(opts: &SandboxOpts, sandbox_name: Option<&str>) -> Result<i32> {
+    let mut command_line = vec![opts.command.clone()];
+    command_line.extend(opts.args.iter().cloned());
+
+    can_events::emit(can_events::Event::RunStart(can_events::schema::RunStart {
+        can_version: env!("CARGO_PKG_VERSION").to_string(),
+        command: command_line.clone(),
+        sandbox: sandbox_name.map(str::to_string),
+        monitor: opts.monitor,
+        strict: opts.strict,
+    }));
+    crate::policy_event::emit(&opts.config)?;
+
+    can_events::emit(can_events::Event::ProcessExec(
+        can_events::schema::ProcessExec {
+            path: opts.command.clone(),
+            argv: command_line,
+            pid: None,
+            decision: can_events::schema::Decision::Allowed,
+            reason: None,
+        },
+    ));
+
+    let started = std::time::Instant::now();
+    let result = can_sandbox::run(opts);
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let (exit_code, error) = match &result {
+        Ok(code) => (Some(*code), None),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    can_events::emit(can_events::Event::RunEnd(can_events::schema::RunEnd {
+        exit_code,
+        error,
+        duration_ms,
+    }));
+    can_events::seal();
+
+    Ok(result?)
 }
 
 /// Execute the `can check` command.

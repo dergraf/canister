@@ -22,6 +22,7 @@ of a sandboxed process, and the security properties of each isolation layer.
   - [Monitor Mode](#10-monitor-mode)
   - [Strict Mode](#11-strict-mode)
 - [Parent-Child Protocol](#parent-child-protocol)
+- [Event Stream](#event-stream)
 - [Mandatory Access Control (MAC)](#mandatory-access-control-mac)
 - [Known Limitations](#known-limitations)
 
@@ -78,6 +79,17 @@ canister/
 │                  loopback interface, pasta integration,
 │                  DNS proxy with domain filtering.
 │
+├── can-proxy      L7 egress proxy. TLS termination with a dynamic
+│                  CA, per-destination contracts, DLP enforcement,
+│                  upstream forwarding.
+│
+├── can-dlp        Detection engine. Credential detectors, encoding
+│                  chain recursion, canaries, scope enforcement.
+│
+├── can-events     Structured event stream (schema v1, ADR-0010).
+│                  Envelope, hash chain, socket/file transports.
+│                  Opt-in: nothing is emitted without --events-*.
+│
 └── can-log        Logging setup. TTY detection, human vs JSON
                    output selection, monitor-mode event types
                    and summary output.
@@ -85,6 +97,8 @@ canister/
 
 Dependencies flow downward: `can-cli` -> `can-sandbox` -> `can-policy`,
 `can-net`. `can-policy` and `can-log` have no internal dependencies.
+`can-events` is used by `can-cli`, `can-sandbox` and `can-proxy`, and
+depends on nothing internal.
 
 ### Outbound Defense Model (Filtered + Proxy + DLP)
 
@@ -1136,6 +1150,67 @@ This three-pipe protocol is necessary because:
    syscall returns the notifier fd in the worker's process. The fd is sent to
    PID 1 (supervisor) via `SCM_RIGHTS` over an anonymous Unix socket pair
    created before the supervisor/worker fork.
+
+---
+
+## Event Stream
+
+Opt-in, off by default. With `--events-socket <path>` (or `--events-file
+<path>`) plus `--run-id`, `can` emits one compact JSON object per line
+describing what a run did: `run_start`, `policy_resolved`, `process_exec`,
+`egress_request`, `contract_violation`, `dlp_block`, `canary_fire`,
+`stats` and `run_end` — plus `exchange` when capture is on and
+`stream_seal` when signing is.
+
+| Flag | Effect |
+|---|---|
+| `--events-socket <path>` | Connect to a listening `SOCK_STREAM` Unix socket. |
+| `--events-file <path>` | Append JSONL to a file instead. |
+| `--run-id <id>` | Stamped on every event (generated when omitted). |
+| `--capture-exchanges` | Add an `exchange` event per HTTP exchange (ADR-0011). |
+| `--capture-max-bytes <n>` | Per-body capture cap, default 1 MiB. |
+| `--stats-interval-ms <ms>` | Cumulative `stats` cadence, default 5000, `0` to disable (ADR-0015). |
+| `--canaries-file <path>` | External, tagged canaries for this run (ADR-0012). |
+| `--events-sign-key <path>` | Sign each stream's closing seal with this Ed25519 key (ADR-0016). |
+
+`can` is the **client**: the consumer listens on the socket. Every
+emitting process opens its own connection, because the CLI, the proxy
+process and the USER_NOTIF supervisor are separate processes and
+concurrent writes to one stream socket are not atomic. The envelope
+therefore carries a `stream` field (`cli`, `proxy`, `supervisor`), and
+each stream has its own `seq` counter and hash chain:
+
+```
+chain_hash = sha256(line with the trailing `,"chain_hash":"…"` removed)
+prev_hash  = the previous event's chain_hash in the same stream
+```
+
+A consumer detects dropped, reordered or rewritten lines without
+re-serializing anything. The full schema is published as
+`docs/events-schema-v1.json` and generated from `can-events`; the design
+rationale is ADR-0010.
+
+The sandboxed workload can never write to the stream: connections are
+opened `CLOEXEC` before any namespace work, and the worker branch drops
+its inherited handle before the workload runs.
+
+### Seals
+
+The chain proves a stream is internally *consistent*; it does not say
+who wrote it, because anyone holding the file can rewrite a line and
+recompute every hash after it. With `--events-sign-key`, each emitting
+process closes its stream with a `stream_seal` event: an Ed25519
+signature over
+
+```
+canister-event-stream-v1\n<run_id>\n<stream>\n<events>\n<chain_head>
+```
+
+One signature commits to the whole stream, since the chain binds each
+event to its predecessor. The key is read before any namespace is
+entered and never reaches the workload. A stream with no seal is
+*unsealed*, not invalid — a killed process never gets to sign, and
+crashing is not forgery. See ADR-0016.
 
 ---
 

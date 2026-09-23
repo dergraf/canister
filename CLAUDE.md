@@ -22,6 +22,7 @@ external runtime. Targets Linux 5.6+ (USER_NOTIF supervisor needs 5.9+).
 | `crates/can-proxy` | L7 egress proxy with DLP scanning | `server.rs` (entrypoint), `egress.rs`, `policy.rs`, `ca.rs` |
 | `crates/can-net` | Netns setup, pasta integration, DNS cache | `pasta.rs`, `netns.rs`, `dns_cache.rs` |
 | `crates/can-log` | TTY-aware tracing init | `lib.rs` (small) |
+| `crates/can-events` | Structured event stream (schema v1, ADR-0010): envelope, hash chain, socket/file transports | `schema.rs` (the whole schema), `lib.rs` |
 | `crates/can-docgen` | mdBook reference generation; runs `can --help` | `main.rs` |
 
 Recipes live in `recipes/`. `base.toml` (essential OS mounts) and `default.toml`
@@ -38,6 +39,7 @@ canonical source of truth for the baseline.
 | "How does the fork/ns/pivot dance work?" | `crates/can-sandbox/src/namespace.rs` (`spawn_sandboxed`) — **do not reorder steps**, the parent↔child pipe protocol is order-sensitive |
 | "Why is this recipe field merged that way?" | `crates/can-policy/src/config/recipe_merge.rs` (`RecipeFile::merge`) — per-section merge lives next to each `FooConfig` |
 | "What does `can up <name>` do?" | `crates/can-cli/src/commands.rs` (`up` command) → `can-policy/src/manifest/mod.rs::discover_manifest` |
+| "What does `--events-socket` emit, and how is the chain verified?" | `crates/can-events/src/schema.rs`, `docs/adr/0010-event-stream.md`, `docs/events-schema-v1.json` |
 | "Proxy / DLP behavior?" | `crates/can-proxy/src/server/request.rs` (`handle_inner_request`), `crates/can-dlp/src/scanner.rs` |
 | "How is the egress mode decided?" | `crates/can-policy/src/config/network.rs` `NetworkConfig::egress` (`none`/`proxy-only`/`direct`), unified in commit 6f81746 |
 | "Where does the FQDN allow-list live?" | `[[host]]` blocks (top-level recipe table) — see `crates/can-policy/src/config/host.rs` |
@@ -118,5 +120,5 @@ these is fine; large refactors should ride along with the planned splits in
 - `docs/ARCHITECTURE.md` — design and execution flow
 - `docs/CONFIGURATION.md` — full recipe and manifest reference
 - `docs/SECCOMP.md` — baseline and filtering model
-- `docs/adr/0001-…` through `0006-…` — ADRs
+- `docs/adr/0001-…` through `0016-…` — ADRs (0010–0016 cover the event stream, capture, tagged canaries, loopback routing, resolved policy, stats, stream seals)
 - `docs/guardrails-agentic-development-plan.md` — 5-PR plan for CI guardrails
