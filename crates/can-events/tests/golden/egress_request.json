@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"egress_request","data":{"host":"api.anthropic.com","method":"POST","path":"/v1/messages","decision":"allowed"},"chain_hash":"c26a06559e2bf86ae0d5e31c1d0f791752d15bb5e47c9a3d24a15ac3e575a53c"}

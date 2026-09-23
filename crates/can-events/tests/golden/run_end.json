@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"run_end","data":{"exit_code":0,"duration_ms":42000},"chain_hash":"5c427b1672dfc758149764d1f10eb0eaf32bdab41495cc3d126d815f18a3fea2"}

@@ -1,0 +1,844 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Envelope",
+  "description": "Documentation-only view of one line of the stream, used to generate `docs/events-schema-v1.json`. The runtime writer builds the same shape field by field (see `render_envelope`), with `chain_hash` always last.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "First event of a run, emitted by the CLI process.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/RunStart"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "run_start"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Fully resolved policy plus its canonical hash (ADR-0014).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/PolicyResolved"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "policy_resolved"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A command was executed: the sandbox entrypoint, or a supervised `execve`/`execveat` when argument-level filtering is active.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/ProcessExec"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "process_exec"
+          ]
+        }
+      }
+    },
+    {
+      "description": "An HTTP request reached the proxy and was allowed or blocked.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/EgressRequest"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "egress_request"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A request was refused by its per-destination contract.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/ContractViolation"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "contract_violation"
+          ]
+        }
+      }
+    },
+    {
+      "description": "DLP refused (or, in monitor mode, observed) a request or response.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/DlpBlock"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "dlp_block"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A canary token was observed leaving the sandbox (ADR-0012).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/CanaryFire"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "canary_fire"
+          ]
+        }
+      }
+    },
+    {
+      "description": "A full HTTP exchange through the proxy (ADR-0011).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/Exchange"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "exchange"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Periodic counters and latency histogram (ADR-0015).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/Stats"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "stats"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Last event of a run, emitted by the CLI process.",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/RunEnd"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "run_end"
+          ]
+        }
+      }
+    },
+    {
+      "description": "Closing signature over a stream's hash chain (ADR-0016).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/StreamSeal"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "stream_seal"
+          ]
+        }
+      }
+    }
+  ],
+  "required": [
+    "chain_hash",
+    "prev_hash",
+    "run_id",
+    "schema",
+    "seq",
+    "stream",
+    "ts_ms"
+  ],
+  "properties": {
+    "chain_hash": {
+      "description": "`sha256` of this line with the trailing `,\"chain_hash\":\"…\"` removed.",
+      "type": "string"
+    },
+    "prev_hash": {
+      "description": "`chain_hash` of the previous event in this stream; 64 zeros for the first event.",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "Run identifier, from `--run-id`.",
+      "type": "string"
+    },
+    "schema": {
+      "description": "Schema version. Always `1` for this document.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "seq": {
+      "description": "Position within the stream, starting at 0 and incrementing by one.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "stream": {
+      "description": "Emitting process: `cli`, `proxy` or `supervisor`. Each stream has its own `seq` space and hash chain.",
+      "type": "string"
+    },
+    "ts_ms": {
+      "description": "Emission time, milliseconds since the Unix epoch.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "BodyChunk": {
+      "type": "object",
+      "required": [
+        "data_b64",
+        "offset_ms"
+      ],
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "offset_ms": {
+          "description": "Milliseconds after the request started.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "CanaryFire": {
+      "type": "object",
+      "required": [
+        "allowed",
+        "detector",
+        "host",
+        "matched_redacted"
+      ],
+      "properties": {
+        "allowed": {
+          "description": "`true` when this destination is allowed to see this data class — the fire is observational, not a block.",
+          "type": "boolean"
+        },
+        "data_class": {
+          "description": "Data class of the canary (`ahv`, `iban_ch`, …) for externally supplied canaries; absent for canaries generated by `can` itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detector": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Location"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "matched_redacted": {
+          "type": "string"
+        }
+      }
+    },
+    "ContractViolation": {
+      "type": "object",
+      "required": [
+        "host",
+        "method",
+        "path",
+        "reason"
+      ],
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Reason code from `ContractViolation::reason` in `can-proxy`.",
+          "type": "string"
+        }
+      }
+    },
+    "Decision": {
+      "description": "Whether the enforcement layer let something through.",
+      "type": "string",
+      "enum": [
+        "allowed",
+        "blocked"
+      ]
+    },
+    "DlpBlock": {
+      "type": "object",
+      "required": [
+        "blocked",
+        "detector",
+        "host",
+        "matched_redacted"
+      ],
+      "properties": {
+        "blocked": {
+          "description": "`false` in monitor mode, where the finding is observed but the request proceeds.",
+          "type": "boolean"
+        },
+        "detector": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "location": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Location"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "matched_redacted": {
+          "description": "Redacted match — the raw secret never enters the stream.",
+          "type": "string"
+        }
+      }
+    },
+    "EgressRequest": {
+      "type": "object",
+      "required": [
+        "decision",
+        "host",
+        "method",
+        "path"
+      ],
+      "properties": {
+        "decision": {
+          "$ref": "#/definitions/Decision"
+        },
+        "host": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Machine-readable reason for a block (`policy`, `contract`, `dlp`, `dns-entropy`, …). Absent when allowed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Exchange": {
+      "type": "object",
+      "required": [
+        "host",
+        "request",
+        "timings"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/definitions/ExchangeRequest"
+        },
+        "response": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExchangeResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timings": {
+          "$ref": "#/definitions/ExchangeTimings"
+        },
+        "upgrade": {
+          "description": "Set for protocol upgrades we do not decode (`websocket`), in which case no frames are captured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ExchangeRequest": {
+      "description": "Base64-encoded body plus truncation state.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "headers",
+        "method",
+        "truncated",
+        "url"
+      ],
+      "properties": {
+        "body_b64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Length of the body before truncation.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "method": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "ExchangeResponse": {
+      "description": "Base64-encoded body plus truncation state.",
+      "type": "object",
+      "required": [
+        "body_bytes",
+        "headers",
+        "status",
+        "truncated"
+      ],
+      "properties": {
+        "body_b64": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_bytes": {
+          "description": "Length of the body before truncation.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "chunks": {
+          "description": "Chunk boundaries for streamed responses (SSE, chunked transfer), so a consumer can reconstruct streamed messages in order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BodyChunk"
+          }
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "status": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "ExchangeTimings": {
+      "type": "object",
+      "required": [
+        "started_ms"
+      ],
+      "properties": {
+        "ended_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "first_byte_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "started_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Histogram": {
+      "description": "Fixed-bucket latency histogram. Buckets are upper bounds in milliseconds; `counts` has one entry per bucket plus a final `+Inf` entry.",
+      "type": "object",
+      "required": [
+        "buckets_ms",
+        "count",
+        "counts",
+        "sum_ms"
+      ],
+      "properties": {
+        "buckets_ms": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "counts": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "sum_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Location": {
+      "description": "Where in a request a detector matched.",
+      "type": "string",
+      "enum": [
+        "header",
+        "path",
+        "query",
+        "body",
+        "trailer",
+        "response"
+      ]
+    },
+    "PolicyResolved": {
+      "type": "object",
+      "required": [
+        "policy",
+        "policy_sha256"
+      ],
+      "properties": {
+        "policy": {
+          "description": "The fully resolved policy, same content as `can recipe show`."
+        },
+        "policy_sha256": {
+          "description": "SHA-256 over the canonical serialization of `policy`.",
+          "type": "string"
+        }
+      }
+    },
+    "ProcessExec": {
+      "type": "object",
+      "required": [
+        "decision",
+        "path"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "decision": {
+          "$ref": "#/definitions/Decision"
+        },
+        "path": {
+          "type": "string"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RunEnd": {
+      "description": "Terminal event of a run.\n\n`exit_code` follows the POSIX `128 + signal` convention that `can` itself applies when the workload is killed by a signal; the raw wait status is not preserved through the supervised PID-namespace path, so no separate `signal` field is reported. `exit_code` is absent when the sandbox failed before the workload ran, in which case `error` says why.",
+      "type": "object",
+      "required": [
+        "duration_ms"
+      ],
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "RunStart": {
+      "type": "object",
+      "required": [
+        "can_version",
+        "command",
+        "monitor",
+        "strict"
+      ],
+      "properties": {
+        "can_version": {
+          "description": "Version of the `can` binary emitting the stream.",
+          "type": "string"
+        },
+        "command": {
+          "description": "Command line of the sandboxed workload.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "monitor": {
+          "type": "boolean"
+        },
+        "sandbox": {
+          "description": "Sandbox name from `canister.toml`, when the run came from `can up`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strict": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Stats": {
+      "description": "Cumulative counters since the emitting process started, so a dropped event costs resolution rather than correctness: a consumer diffs consecutive snapshots. Each stream reports what it observes; the proxy stream carries these.",
+      "type": "object",
+      "required": [
+        "canary_fires",
+        "contract_violations_by_reason",
+        "dlp_blocks_by_detector",
+        "proxy_latency_ms",
+        "requests_by_decision"
+      ],
+      "properties": {
+        "canary_fires": {
+          "description": "Canary fires keyed by `\"<data_class>:<allowed|blocked>\"`. A generated tripwire canary has no class and reports `\"-:blocked\"`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "contract_violations_by_reason": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "dlp_blocks_by_detector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "proxy_latency_ms": {
+          "$ref": "#/definitions/Histogram"
+        },
+        "requests_by_decision": {
+          "description": "Proxied requests keyed by decision (`allowed`, `blocked`).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        }
+      }
+    },
+    "StreamSeal": {
+      "description": "Signature over everything a stream emitted (ADR-0016).\n\nThe hash chain proves a stream is internally consistent; it does not say who wrote it, and anyone who can rewrite a line can rewrite the chain along with it. The seal closes that gap: the emitting process signs its final chain head with a key the sandboxed workload never sees, so a consumer can tell \"these are the bytes `can` wrote\" from \"these are bytes someone produced later\".\n\nSigned message, exactly:\n\n```text canister-event-stream-v1\\n<run_id>\\n<stream>\\n<events>\\n<chain_head> ```\n\n`events` is the number of events that preceded the seal, and `chain_head` their last `chain_hash` in lowercase hex — so the signature commits to the whole stream, not merely to its last line.",
+      "type": "object",
+      "required": [
+        "algorithm",
+        "chain_head",
+        "events",
+        "public_key",
+        "signature"
+      ],
+      "properties": {
+        "algorithm": {
+          "description": "Signature algorithm. Only `ed25519` exists today; the field is present so a verifier refuses what it does not understand rather than guessing.",
+          "type": "string"
+        },
+        "chain_head": {
+          "description": "The chain head that was signed, lowercase hex.",
+          "type": "string"
+        },
+        "events": {
+          "description": "Number of events sealed, excluding the seal itself.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "public_key": {
+          "description": "Verifying key, lowercase hex. A consumer decides which keys it trusts; the seal only says which one signed.",
+          "type": "string"
+        },
+        "signature": {
+          "description": "Signature over the message above, lowercase hex.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"contract_violation","data":{"host":"claims.mock.internal","method":"DELETE","path":"/claims/42","reason":"method-not-allowed"},"chain_hash":"dfcb69052cc3af9a14c18cb937b6c56da191929b8c2907da1b47c389a51112c1"}

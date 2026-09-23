@@ -9,6 +9,7 @@ members = [
     "crates/can-docgen",
     "crates/can-proxy",
     "crates/can-dlp",
+    "crates/can-events",
 ]
 
 [workspace.package]
@@ -50,8 +51,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Crypto (recipe checksum verification)
 sha2 = "0.10"
 
+# Crypto (event-stream seals, ADR-0016)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
 # Internal crates
 can-sandbox = { path = "crates/can-sandbox" }
 can-policy = { path = "crates/can-policy" }
 can-net = { path = "crates/can-net" }
 can-log = { path = "crates/can-log" }
+can-events = { path = "crates/can-events" }

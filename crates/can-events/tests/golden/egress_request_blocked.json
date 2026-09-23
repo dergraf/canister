@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"egress_request","data":{"host":"evil.example.com","method":"POST","path":"/collect","decision":"blocked","reason":"policy"},"chain_hash":"ffaebe8cdc06671d7e1095f3ceca4448dd0b10ce6c393f592758b769ddd9426b"}
