@@ -233,6 +233,7 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
 
     tracing::info!(child_pid, ports = config.ports.len(), "starting pasta");
 
+    let spawned_path = pasta_path.clone();
     let mut cmd = Command::new(pasta_path);
 
     // Run in foreground so we can manage the process lifecycle.
@@ -405,10 +406,17 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
             if let Some(mut stderr) = child.stderr.take() {
                 let _ = std::io::Read::read_to_string(&mut stderr, &mut stderr_output);
             }
-            let msg = format!(
+            let mut msg = format!(
                 "pasta exited immediately with {status}. stderr: {}",
                 stderr_output.trim()
             );
+            if let Some(hint) = userns_denied_hint(
+                &stderr_output,
+                &spawned_path,
+                apparmor_restricts_unprivileged_userns(),
+            ) {
+                msg.push_str(&hint);
+            }
             tracing::error!("{}", msg);
             return Err(NetError::Pasta(msg));
         }
@@ -451,9 +459,76 @@ fn build_port_spec(ports: &[PortMapping], protocol: PortProtocol) -> Option<Stri
     }
 }
 
+/// Whether the kernel makes unprivileged user namespaces subject to
+/// AppArmor (Ubuntu 24.04+ sets this to `1`).
+fn apparmor_restricts_unprivileged_userns() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Turn AppArmor's refusal into the command that fixes it.
+///
+/// `can setup` writes `allow ux` rules for the pasta it finds on PATH at
+/// install time. A pasta somewhere else — Nix, Homebrew, a local build —
+/// is then unconfined under `apparmor_restrict_unprivileged_userns=1`,
+/// and every run dies with a denial that names neither AppArmor nor the
+/// binary it objects to.
+fn userns_denied_hint(stderr: &str, pasta_path: &Path, restricted: bool) -> Option<String> {
+    if !restricted {
+        return None;
+    }
+    if !(stderr.contains("user namespace") && stderr.contains("Permission denied")) {
+        return None;
+    }
+    Some(format!(
+        "\n\nThis is AppArmor: kernel.apparmor_restrict_unprivileged_userns is 1 and the \
+         installed profile does not cover {}. Run:\n\n    sudo can setup --force --pasta-path {}",
+        pasta_path.display(),
+        pasta_path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn userns_denial_names_the_pasta_apparmor_objects_to() {
+        let hint = userns_denied_hint(
+            "Couldn't open user namespace /proc/71086/ns/user: Permission denied",
+            Path::new("/home/u/.nix-profile/bin/pasta"),
+            true,
+        )
+        .expect("a denial under a restricting kernel must explain itself");
+
+        assert!(hint.contains("/home/u/.nix-profile/bin/pasta"));
+        assert!(hint.contains("sudo can setup --force --pasta-path"));
+    }
+
+    #[test]
+    fn an_unrelated_pasta_failure_gets_no_apparmor_hint() {
+        assert!(
+            userns_denied_hint(
+                "Couldn't bind to port 53: Address already in use",
+                Path::new("/usr/bin/pasta"),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_kernel_that_does_not_restrict_userns_gets_no_hint() {
+        assert!(
+            userns_denied_hint(
+                "Couldn't open user namespace /proc/1/ns/user: Permission denied",
+                Path::new("/usr/bin/pasta"),
+                false,
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn detect_gateway_parses_proc_net_route() {
