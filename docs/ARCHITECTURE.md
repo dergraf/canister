@@ -1173,6 +1173,13 @@ describing what a run did: `run_start`, `policy_resolved`, `process_exec`,
 | `--canaries-file <path>` | External, tagged canaries for this run (ADR-0012). |
 | `--events-sign-key <path>` | Sign each stream's closing seal with this Ed25519 key (ADR-0016). |
 
+`can up` also takes `--recipe <path>`, repeatable, merged after the
+manifest's own recipes and overrides — for policy a caller generates per
+run, such as routing a declared host to a local mock on a port it only
+learns at startup. Those recipes are untrusted like any unpinned recipe:
+credential scope in one is dropped, and belongs in `canister.toml`
+(ADR-0017).
+
 `can` is the **client**: the consumer listens on the socket. Every
 emitting process opens its own connection, because the CLI, the proxy
 process and the USER_NOTIF supervisor are separate processes and

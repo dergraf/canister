@@ -114,7 +114,16 @@ fn load_recipes(recipe_args: &[String], _command: Option<&str>) -> Result<Sandbo
 /// 1. `base.toml` — essential OS filesystem mounts (always loaded)
 /// 2. Recipes listed in the manifest sandbox (resolved by name, left-to-right)
 /// 3. Manifest overrides (filesystem, network, etc. from the sandbox definition)
-fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
+/// 4. Recipes passed with `--recipe`, merged last so they win
+///
+/// Step 4 exists for callers that generate part of the policy per run —
+/// an orchestrator routing a declared host to a local mock on a port it
+/// only knows once the mock has bound it. Those recipes are written by a
+/// program and cannot be checksum-pinned, so they stay untrusted:
+/// credential scope in them is dropped exactly as it is for any other
+/// unpinned recipe, and has to come from the manifest, which the project
+/// controls (ADR-0017).
+fn load_manifest_recipes(def: &SandboxDef, extra_recipes: &[String]) -> Result<SandboxConfig> {
     // 1. Start with base.toml.
     let mut merged = resolve_base().context("loading base.toml")?;
     tracing::debug!("loaded base.toml (essential OS mounts)");
@@ -138,9 +147,21 @@ fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
         merged = merged.merge(recipe);
     }
 
-    // 4. Apply manifest-level overrides as the final layer.
+    // 3. Apply manifest-level overrides.
     let overrides: can_policy::RecipeFile = def.into();
     merged = merged.merge(overrides);
+
+    // 4. Merge `--recipe` arguments last, so a generated overlay's
+    // routing wins over the project's own declaration of the same host.
+    for arg in extra_recipes {
+        let path = resolve_recipe_path(arg)?;
+        let recipe = RecipeFile::from_file(&path)
+            .with_context(|| format!("loading recipe: {}", path.display()))?;
+
+        tracing::info!(path = %path.display(), "loaded recipe (from --recipe)");
+
+        merged = merged.merge(recipe);
+    }
 
     merged
         .into_sandbox_config()
@@ -151,15 +172,32 @@ fn load_manifest_recipes(def: &SandboxDef) -> Result<SandboxConfig> {
 ///
 /// Discovers `canister.toml`, resolves the named sandbox (or the first
 /// defined), composes recipes, and runs the command.
-pub fn up(
-    name: Option<&str>,
-    dry_run: bool,
-    monitor: bool,
-    strict: bool,
-    port_args: &[String],
-    canaries_file: Option<&Path>,
-    event_flags: &crate::events::EventFlags,
-) -> Result<i32> {
+pub struct UpArgs<'a> {
+    /// Sandbox to run; the first defined when absent.
+    pub name: Option<&'a str>,
+    pub dry_run: bool,
+    pub monitor: bool,
+    pub strict: bool,
+    pub ports: &'a [String],
+    pub canaries_file: Option<&'a Path>,
+    /// Recipes merged after the manifest, for policy a caller generates
+    /// per run (ADR-0017).
+    pub recipes: &'a [String],
+    pub events: &'a crate::events::EventFlags,
+}
+
+pub fn up(args: UpArgs<'_>) -> Result<i32> {
+    let UpArgs {
+        name,
+        dry_run,
+        monitor,
+        strict,
+        ports: port_args,
+        canaries_file,
+        recipes: extra_recipes,
+        events: event_flags,
+    } = args;
+
     // Discover canister.toml by walking up from CWD.
     let cwd = std::env::current_dir().context("getting current directory")?;
     let manifest_path = discover_manifest(&cwd).ok_or_else(|| {
@@ -211,10 +249,13 @@ pub fn up(
     }
     println!("command: {}", def.command);
     println!("recipes: {}", def.recipes.join(", "));
+    if !extra_recipes.is_empty() {
+        println!("extra recipes: {}", extra_recipes.join(", "));
+    }
     println!();
 
     // Compose recipes.
-    let mut config = load_manifest_recipes(def)?;
+    let mut config = load_manifest_recipes(def, extra_recipes)?;
 
     // Auto-mask canister.toml so the sandboxed process cannot read the
     // security policy. This is the core anti-detection mechanism.
@@ -1026,6 +1067,111 @@ mod tests {
     // recipe search path, so they can be unit-tested deterministically.
     // The "happy path" lookup and ambiguity errors are covered by
     // tests/integration/t_recipes.sh which exercises real recipe trees.
+
+    fn write_recipe(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write recipe");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn sandbox_def() -> SandboxDef {
+        SandboxDef {
+            description: None,
+            recipes: vec![],
+            command: "true".to_string(),
+            strict: None,
+            filesystem: Default::default(),
+            network: Default::default(),
+            process: Default::default(),
+            resources: Default::default(),
+            syscalls: Default::default(),
+            proxy: Default::default(),
+            hosts: vec![],
+            unsafe_block: Default::default(),
+        }
+    }
+
+    /// A generated recipe is what an orchestrator has: routing it only
+    /// knows once a mock has bound its port. It has to be able to win
+    /// over the project's own declaration of that host.
+    #[test]
+    fn an_extra_recipe_is_merged_after_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let overlay = write_recipe(
+            dir.path(),
+            "overlay.toml",
+            "[unsafe]\nhost_loopback = true\n\n[[host]]\ndomain = \"api.example\"\nupstream = \"loopback:41231\"\n",
+        );
+
+        let mut def = sandbox_def();
+        def.hosts = vec![can_policy::config::HostBlock {
+            domain: "api.example".to_string(),
+            ..Default::default()
+        }];
+
+        let config = load_manifest_recipes(&def, &[overlay]).expect("compose");
+
+        let host = config
+            .hosts
+            .iter()
+            .find(|host| host.domain == "api.example")
+            .expect("the host survives the merge");
+
+        assert_eq!(
+            host.upstream.as_deref(),
+            Some("loopback:41231"),
+            "the generated route must win over the manifest's own host block"
+        );
+    }
+
+    /// The reason `--recipe` is safe to add: it does not widen credential
+    /// trust. A generated recipe can never match a pinned checksum, so
+    /// credential scope in one is dropped — it belongs in canister.toml,
+    /// which the project controls and a reviewer reads.
+    #[test]
+    fn an_extra_recipe_cannot_grant_credential_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let overlay = write_recipe(
+            dir.path(),
+            "overlay.toml",
+            "[[host]]\ndomain = \"api.example\"\nallow_credentials = [\"anthropic_key\"]\n",
+        );
+
+        let config = load_manifest_recipes(&sandbox_def(), &[overlay]).expect("compose");
+
+        let host = config
+            .hosts
+            .iter()
+            .find(|host| host.domain == "api.example")
+            .expect("host");
+
+        assert!(
+            host.allow_credentials.is_empty(),
+            "an unpinned recipe must not be able to route a real credential anywhere"
+        );
+    }
+
+    /// The manifest is the trusted place, so the same declaration there
+    /// survives — otherwise there would be no way to grant scope at all.
+    #[test]
+    fn the_manifest_can_grant_credential_scope() {
+        let mut def = sandbox_def();
+        def.hosts = vec![can_policy::config::HostBlock {
+            domain: "api.example".to_string(),
+            allow_credentials: vec!["anthropic_key".to_string()],
+            ..Default::default()
+        }];
+
+        let config = load_manifest_recipes(&def, &[]).expect("compose");
+
+        let host = config
+            .hosts
+            .iter()
+            .find(|host| host.domain == "api.example")
+            .expect("host");
+
+        assert_eq!(host.allow_credentials, vec!["anthropic_key".to_string()]);
+    }
 
     #[test]
     fn resolve_recipe_path_treats_slash_as_file_path() {
