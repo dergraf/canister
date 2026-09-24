@@ -100,6 +100,14 @@ and final chain hash. One signature per stream, at the end.
   the sandbox's SIGKILL follows.
 - Without a key, `seal()` closes the stream and writes nothing. An unsigned seal
   would look like evidence of authenticity while proving nothing.
+- **A seal proves a stream was signed; it cannot prove one should have been.**
+  Absence is indistinguishable from a run that never asked for signing, so a
+  consumer that treats an unsealed stream as acceptable can be defeated by
+  deleting the seal and rebuilding the chain. Whether signing was requested has to
+  be recorded where the emitter cannot reach — in the orchestrator's own record of
+  the run — and consumers are expected to fail a run that claims signing but
+  arrives unsealed. A `stream_seal` that is present but not last should likewise
+  be treated as invalid rather than absent.
 - New dependency: `ed25519-dalek` (default features off, `std` on). Justified by
   being the standard pure-Rust implementation of the one primitive needed; the
   alternative, reusing the proxy's `ring` through `rustls`, would pull a TLS stack
@@ -111,8 +119,9 @@ and final chain hash. One signature per stream, at the end.
 - Evidence can travel. A consumer that knows the public key can distinguish the
   bytes `can` wrote from bytes produced afterwards, without trusting the transport,
   the CI job, or the tool reporting on them.
-- A forger who rewrites a line *and* rebuilds the entire chain is caught, which is
-  the only attack the chain alone cannot see.
+- A forger who rewrites a line *and* rebuilds the entire chain is caught — given a
+  consumer that knows the run was signed (see above); the signature alone cannot
+  speak for a stream it was deleted from.
 - The seal states who signed; which keys are trusted stays a consumer decision.
 
 ### Negative
