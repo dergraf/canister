@@ -493,6 +493,39 @@ reachable_ips = ["10.0.0.5/32"]
 }
 
 #[test]
+fn a_generated_mock_routing_overlay_resolves() {
+    // The shape a CI harness generates per run (ADR-0013): host
+    // loopback plus one route per mock server. Such recipes are written
+    // by a program, so a field name that only *looks* right fails every
+    // run at startup.
+    let overlay = parse_recipe(
+        r#"
+[unsafe]
+host_loopback = true
+
+[[host]]
+domain = "claims.mock.internal"
+upstream = "loopback:41231"
+
+[[host]]
+domain = "api.anthropic.com"
+"#,
+    );
+
+    let config = overlay.into_sandbox_config().unwrap();
+
+    assert!(config.network.allow_host_loopback);
+    assert_eq!(
+        config
+            .hosts
+            .iter()
+            .find(|h| h.domain == "claims.mock.internal")
+            .and_then(|h| h.upstream.as_deref()),
+        Some("loopback:41231")
+    );
+}
+
+#[test]
 fn merge_syscall_extras_union() {
     let a = parse_recipe(
         r#"

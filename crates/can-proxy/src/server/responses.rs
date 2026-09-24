@@ -211,7 +211,7 @@ impl<'a> ProxyError<'a> {
                 if self.emit_event {
                     // Caller didn't emit an event itself; the body's
                     // ".dlp_blocked()" form gets an empty-redaction event.
-                    crate::events::dlp_block(self.host, detector, "");
+                    crate::events::dlp_block(self.host, detector, "", None, true);
                 }
                 warn!(
                     "DLP blocked request to {}: detector={}",
@@ -242,7 +242,7 @@ impl<'a> ProxyError<'a> {
                     "contract refusal for {}: {} — {}",
                     self.host, reason, detail
                 );
-                crate::events::dlp_block(self.host, "contract", reason);
+                crate::events::legacy_contract_block(self.host, reason);
                 let body = format!(
                     "Refused by canister: {detail}\n\
                      \n\

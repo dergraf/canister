@@ -233,6 +233,7 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
 
     tracing::info!(child_pid, ports = config.ports.len(), "starting pasta");
 
+    let spawned_path = pasta_path.clone();
     let mut cmd = Command::new(pasta_path);
 
     // Run in foreground so we can manage the process lifecycle.
@@ -283,31 +284,12 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
     // Set MTU for optimal performance.
     cmd.arg("--mtu").arg("65520");
 
-    // Disable host loopback access for security:
-    // prevents the sandbox from reaching host services via gateway→loopback mapping.
-    //
-    // Three pasta variants in the wild:
-    //   1. Old: only `--no-map-gw`.
-    //   2. Transitional (e.g. Fedora 42 default): both flags appear in
-    //      --help but `--map-host-loopback` rejects `none` as an address
-    //      ("Invalid address to remap to host: none").
-    //   3. New: `--map-host-loopback none` works.
-    //
-    // Prefer `--no-map-gw` when available — it has stable disable semantics
-    // across both old and transitional pastas. Fall back to
-    // `--map-host-loopback none` only when `--no-map-gw` has actually been
-    // removed.
-    //
-    // When `allow_host_loopback` is true we skip these flags entirely so
-    // pasta's default mapping (host loopback ↔ gateway IP) stays in place;
-    // the proxy's `host.canister.local` alias uses that gateway to reach
-    // host services.
-    if !config.allow_host_loopback {
-        if pasta_supports_option("--no-map-gw") {
-            cmd.arg("--no-map-gw");
-        } else if pasta_supports_option("--map-host-loopback") {
-            cmd.arg("--map-host-loopback").arg("none");
-        }
+    for arg in host_loopback_args(
+        config.allow_host_loopback,
+        pasta_supports_option("--no-map-gw"),
+        pasta_supports_option("--map-host-loopback"),
+    ) {
+        cmd.arg(arg);
     }
 
     // Port forwarding setup.
@@ -405,10 +387,17 @@ pub fn start(config: &PastaConfig) -> Result<(Child, String), NetError> {
             if let Some(mut stderr) = child.stderr.take() {
                 let _ = std::io::Read::read_to_string(&mut stderr, &mut stderr_output);
             }
-            let msg = format!(
+            let mut msg = format!(
                 "pasta exited immediately with {status}. stderr: {}",
                 stderr_output.trim()
             );
+            if let Some(hint) = userns_denied_hint(
+                &stderr_output,
+                &spawned_path,
+                apparmor_restricts_unprivileged_userns(),
+            ) {
+                msg.push_str(&hint);
+            }
             tracing::error!("{}", msg);
             return Err(NetError::Pasta(msg));
         }
@@ -451,9 +440,177 @@ fn build_port_spec(ports: &[PortMapping], protocol: PortProtocol) -> Option<Stri
     }
 }
 
+/// The in-netns address that refers to the host's loopback when
+/// `[unsafe] host_loopback` is on.
+///
+/// Deliberately *not* the default gateway. pasta's own default maps the
+/// gateway address to host loopback, and on an ordinary machine that one
+/// address is also the DNS server and the next hop for every outbound
+/// packet — so taking it over silently costs the sandbox its name
+/// resolution and its route to the internet. A link-local address of our
+/// own choosing carries no such second job.
+pub const HOST_LOOPBACK_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 1, 1);
+
+/// The pasta flags that decide whether — and how — the sandbox can reach
+/// services on the host's loopback.
+///
+/// Three pasta variants are in the wild:
+///   1. Old: only `--no-map-gw`.
+///   2. Transitional (e.g. Fedora 42 default): both flags appear in
+///      `--help` but `--map-host-loopback` rejects `none` as an address
+///      ("Invalid address to remap to host: none").
+///   3. New: `--map-host-loopback none` works.
+///
+/// Off (the default), the mapping is disabled outright. On, the host's
+/// loopback is mapped to [`HOST_LOOPBACK_ADDR`] and the gateway is left
+/// alone — pasta's built-in default would take the gateway instead, and
+/// that address is usually also the resolver and the default route.
+///
+/// A pasta too old for `--map-host-loopback` cannot separate the two, so
+/// the caller is told that enabling host loopback there costs external
+/// egress rather than finding out through a timeout.
+fn host_loopback_args(allow: bool, supports_no_map_gw: bool, supports_map: bool) -> Vec<String> {
+    match (allow, supports_no_map_gw, supports_map) {
+        (false, true, _) => vec!["--no-map-gw".to_string()],
+        (false, false, true) => vec!["--map-host-loopback".to_string(), "none".to_string()],
+        (false, false, false) => Vec::new(),
+
+        (true, _, true) => vec![
+            "--no-map-gw".to_string(),
+            "--map-host-loopback".to_string(),
+            HOST_LOOPBACK_ADDR.to_string(),
+        ],
+
+        (true, _, false) => {
+            tracing::warn!(
+                "[unsafe] host_loopback is on but this pasta has no --map-host-loopback, so the \
+                 gateway must be remapped to reach the host — DNS and outbound egress through \
+                 that address will not work. Upgrade pasta to keep both."
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Whether the kernel makes unprivileged user namespaces subject to
+/// AppArmor (Ubuntu 24.04+ sets this to `1`).
+fn apparmor_restricts_unprivileged_userns() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Turn AppArmor's refusal into the command that fixes it.
+///
+/// `can setup` writes `allow ux` rules for the pasta it finds on PATH at
+/// install time. A pasta somewhere else — Nix, Homebrew, a local build —
+/// is then unconfined under `apparmor_restrict_unprivileged_userns=1`,
+/// and every run dies with a denial that names neither AppArmor nor the
+/// binary it objects to.
+fn userns_denied_hint(stderr: &str, pasta_path: &Path, restricted: bool) -> Option<String> {
+    if !restricted {
+        return None;
+    }
+    if !(stderr.contains("user namespace") && stderr.contains("Permission denied")) {
+        return None;
+    }
+    Some(format!(
+        "\n\nThis is AppArmor: kernel.apparmor_restrict_unprivileged_userns is 1 and the \
+         installed profile does not cover {}. Run:\n\n    sudo can setup --force --pasta-path {}",
+        pasta_path.display(),
+        pasta_path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: pasta's default maps the *gateway* to host
+    /// loopback, and on an ordinary machine that address is also the DNS
+    /// server and the default route. Enabling host loopback then costs
+    /// the sandbox its name resolution and its egress — with no error,
+    /// just a timeout.
+    #[test]
+    fn enabling_host_loopback_does_not_surrender_the_gateway() {
+        let args = host_loopback_args(true, true, true);
+
+        assert!(
+            args.contains(&"--no-map-gw".to_string()),
+            "the gateway must stay the gateway: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--no-map-gw".to_string(),
+                "--map-host-loopback".to_string(),
+                "169.254.1.1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn host_loopback_off_disables_the_mapping_however_pasta_spells_it() {
+        assert_eq!(host_loopback_args(false, true, true), vec!["--no-map-gw"]);
+        assert_eq!(
+            host_loopback_args(false, false, true),
+            vec!["--map-host-loopback", "none"]
+        );
+        assert!(host_loopback_args(false, false, false).is_empty());
+    }
+
+    #[test]
+    fn an_old_pasta_cannot_have_both_and_says_so() {
+        // Nothing is passed, so pasta's default mapping applies and the
+        // sandbox reaches the host — at the cost of egress. Warned, not
+        // silently chosen.
+        assert!(host_loopback_args(true, true, false).is_empty());
+    }
+
+    #[test]
+    fn the_host_loopback_address_is_not_a_plausible_gateway() {
+        assert!(
+            HOST_LOOPBACK_ADDR.is_link_local(),
+            "a routable address could collide with real infrastructure"
+        );
+    }
+
+    #[test]
+    fn userns_denial_names_the_pasta_apparmor_objects_to() {
+        let hint = userns_denied_hint(
+            "Couldn't open user namespace /proc/71086/ns/user: Permission denied",
+            Path::new("/home/u/.nix-profile/bin/pasta"),
+            true,
+        )
+        .expect("a denial under a restricting kernel must explain itself");
+
+        assert!(hint.contains("/home/u/.nix-profile/bin/pasta"));
+        assert!(hint.contains("sudo can setup --force --pasta-path"));
+    }
+
+    #[test]
+    fn an_unrelated_pasta_failure_gets_no_apparmor_hint() {
+        assert!(
+            userns_denied_hint(
+                "Couldn't bind to port 53: Address already in use",
+                Path::new("/usr/bin/pasta"),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_kernel_that_does_not_restrict_userns_gets_no_hint() {
+        assert!(
+            userns_denied_hint(
+                "Couldn't open user namespace /proc/1/ns/user: Permission denied",
+                Path::new("/usr/bin/pasta"),
+                false,
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn detect_gateway_parses_proc_net_route() {

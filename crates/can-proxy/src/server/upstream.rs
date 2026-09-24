@@ -31,10 +31,17 @@ pub(super) async fn forward_upstream(
         .host()
         .ok_or("missing host in upstream URI")?
         .to_string();
-    let port = req
-        .uri()
-        .port_u16()
-        .unwrap_or(if original_scheme == "https" { 443 } else { 80 });
+
+    // ADR-0013: a host routed to a local mock keeps its name (TLS was
+    // already terminated against it, contracts and DLP already ran) but
+    // is dialled on the host's loopback, in the clear.
+    let loopback_port = outbound_policy.loopback_upstream(&host);
+    let use_tls = original_scheme == "https" && loopback_port.is_none();
+    let port = loopback_port.unwrap_or_else(|| {
+        req.uri()
+            .port_u16()
+            .unwrap_or(if original_scheme == "https" { 443 } else { 80 })
+    });
 
     // `connect_via_cache` internally rewrites `host.canister.local`
     // to the in-netns gateway IP that pasta maps to the host's
@@ -44,7 +51,7 @@ pub(super) async fn forward_upstream(
         .await
         .map_err(|e| format!("upstream connect to {host}:{port} failed: {e}"))?;
 
-    if original_scheme == "https" {
+    if use_tls {
         let connector =
             build_upstream_tls_connector().map_err(|e| format!("TLS connector: {e}"))?;
         let server_name = rustls::pki_types::ServerName::try_from(host.clone())
@@ -68,7 +75,11 @@ pub(super) async fn forward_upstream(
             }
         });
 
-        sender.send_request(req).await.map_err(|e| e.to_string())
+        sender
+            .send_request(req)
+            .await
+            .map(strip_internal_headers)
+            .map_err(|e| e.to_string())
     } else {
         let io = TokioIo::new(stream);
 
@@ -85,7 +96,11 @@ pub(super) async fn forward_upstream(
             }
         });
 
-        sender.send_request(req).await.map_err(|e| e.to_string())
+        sender
+            .send_request(req)
+            .await
+            .map(strip_internal_headers)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -105,6 +120,23 @@ fn build_upstream_tls_connector() -> Result<tokio_rustls::TlsConnector, std::io:
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
+/// Remove the proxy's own signalling headers from an upstream response.
+///
+/// `x-canister-error` and `x-canister-dlp-detector` are how a refusal
+/// built by this proxy announces itself, and `crate::events` classifies
+/// a request by reading them back. On the allowed path the response is
+/// the destination's, so without this a destination could set them and
+/// decide what the run's evidence says about it: a delivered body
+/// recorded as a DLP block, or real traffic recorded as an upstream
+/// timeout. Strip them on the way in — the proxy adds its own on the way
+/// out, and nothing upstream has any business speaking for it.
+fn strip_internal_headers<B>(mut response: Response<B>) -> Response<B> {
+    let headers = response.headers_mut();
+    headers.remove("x-canister-error");
+    headers.remove("x-canister-dlp-detector");
+    response
+}
+
 /// Connect to `host:port`, honouring the outbound policy at every gate
 /// (IP literals checked against `allow_ips`, DNS names checked against
 /// the `[[host]]` allow-set, resolved IPs checked against `allow_ips`
@@ -118,11 +150,24 @@ pub(super) async fn connect_via_cache(
     port: u16,
     outbound_policy: &OutboundPolicy,
 ) -> Result<tokio::net::TcpStream, std::io::Error> {
-    if host.eq_ignore_ascii_case(HOST_LOOPBACK_ALIAS) {
+    // Both the `host.canister.local` alias and a `[[host]] upstream =
+    // "loopback:<port>"` route resolve to the same place: the in-netns
+    // gateway address that pasta maps to the host's 127.0.0.1.
+    // A routed host is dialled on the port its `[[host]]` block names,
+    // never on the port the caller passed: on any path that does not
+    // resolve the route itself, that port comes from the request, and
+    // the workload must not get to choose which host-local service a
+    // route reaches. The `host.canister.local` alias keeps the caller's
+    // port — picking the port is the whole point of that alias.
+    let routed_port = outbound_policy.loopback_upstream(host);
+    let routed_to_host_loopback =
+        host.eq_ignore_ascii_case(HOST_LOOPBACK_ALIAS) || routed_port.is_some();
+    let port = routed_port.unwrap_or(port);
+    if routed_to_host_loopback {
         let Some(target) = outbound_policy.host_loopback_target else {
-            return Err(std::io::Error::other(
-                "host.canister.local used but [network] allow_host_loopback is false",
-            ));
+            return Err(std::io::Error::other(format!(
+                "{host} is routed to the host loopback but [unsafe] host_loopback is false"
+            )));
         };
         return tokio::net::TcpStream::connect((target, port)).await;
     }

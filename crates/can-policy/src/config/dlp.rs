@@ -53,6 +53,48 @@ pub struct DlpConfig {
     /// leaks the useless fake. See `docs/refusals.md`.
     #[serde(default)]
     pub fake_secrets: Vec<FakeSecret>,
+
+    /// Canaries supplied from outside the sandbox — values an
+    /// orchestrator planted in the workload's input data, each tagged
+    /// with the class of data it stands for and the destinations that
+    /// are allowed to see it. Unlike generated canary tokens, these are
+    /// never injected into the environment: `can` only learns to
+    /// recognize them on egress. See ADR-0012.
+    #[serde(default)]
+    pub external_canaries: Vec<ExternalCanary>,
+}
+
+/// One externally supplied canary.
+///
+/// `allowed_hosts` lists the destinations for which an appearance of
+/// this value is expected rather than a leak: the fire is recorded with
+/// `allowed: true` and the request proceeds. Any other destination is a
+/// leak — blocked outside monitor mode, always recorded. An empty
+/// `allowed_hosts` means "this value may not leave at all".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalCanary {
+    /// The literal value to watch for.
+    pub value: String,
+    /// Class of data this value stands for (`ahv`, `iban_ch`, ...).
+    /// Free text: `can` treats it as an opaque label.
+    pub data_class: String,
+    /// Destinations allowed to receive this data class. Matching is
+    /// case-insensitive and covers subdomains.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl ExternalCanary {
+    /// Whether `host` is allowed to see this canary's data class.
+    /// Subdomain matching mirrors the `[[host]]` allow-list.
+    pub fn allows_host(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.allowed_hosts.iter().any(|allowed| {
+            let allowed = allowed.to_ascii_lowercase();
+            host == allowed || host.ends_with(&format!(".{allowed}"))
+        })
+    }
 }
 
 /// One env-var secret to fake-and-swap. `env` is the variable name the
@@ -116,8 +158,33 @@ impl DlpConfig {
                 .session_entropy_budget
                 .or(self.session_entropy_budget),
             fake_secrets: merge_fake_secrets(self.fake_secrets, overlay.fake_secrets),
+            external_canaries: merge_external_canaries(
+                self.external_canaries,
+                overlay.external_canaries,
+            ),
         }
     }
+}
+
+/// Union two `external_canaries` lists keyed by `value`: base order is
+/// preserved and an overlay entry for a value already declared replaces
+/// its class and destinations, so one value never carries two
+/// contradictory policies.
+fn merge_external_canaries(
+    base: Vec<ExternalCanary>,
+    overlay: Vec<ExternalCanary>,
+) -> Vec<ExternalCanary> {
+    let mut out = base;
+    for o in overlay {
+        match out.iter_mut().find(|e| e.value == o.value) {
+            Some(existing) => {
+                existing.data_class = o.data_class;
+                existing.allowed_hosts = o.allowed_hosts;
+            }
+            None => out.push(o),
+        }
+    }
+    out
 }
 
 /// Union two `fake_secrets` lists keyed by `env`: base order is

@@ -53,6 +53,13 @@ pub struct SandboxOpts {
     /// Run in monitor mode (log but don't enforce).
     pub monitor: bool,
 
+    /// Structured event stream settings (ADR-0010). `None` disables
+    /// event emission entirely — the default behavior of `can`.
+    ///
+    /// The CLI process has already opened its own stream; the forked proxy
+    /// process opens a second connection from this config.
+    pub events: Option<can_events::EventConfig>,
+
     /// Strict mode: fail hard on all setup failures.
     ///
     /// When true:

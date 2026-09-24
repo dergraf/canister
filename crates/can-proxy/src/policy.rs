@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 /// Magic alias the sandbox can use to reach host loopback services
@@ -18,6 +18,10 @@ pub struct OutboundPolicy {
     /// and this IP literal as allowed, and the upstream connector
     /// rewrites the dial target of alias requests to this IP.
     pub host_loopback_target: Option<IpAddr>,
+    /// Hosts whose traffic is dialled to a port on the host's loopback
+    /// instead of the real destination (`[[host]] upstream =
+    /// "loopback:<port>"`, ADR-0013). Keyed by lower-cased domain.
+    pub loopback_upstreams: HashMap<String, u16>,
 }
 
 impl Default for OutboundPolicy {
@@ -40,6 +44,7 @@ impl Default for OutboundPolicy {
             allowed_cidrs: Vec::new(),
             enforce_ip_policy: false,
             host_loopback_target: None,
+            loopback_upstreams: HashMap::new(),
         }
     }
 }
@@ -62,6 +67,18 @@ impl OutboundPolicy {
             ..Self::default()
         };
 
+        for host in hosts {
+            // A malformed `upstream` is rejected at `ProxyServer::new`;
+            // here an unparsable value simply routes nowhere special.
+            if let Ok(Some(can_policy::config::UpstreamTarget::Loopback(port))) =
+                host.upstream_target()
+            {
+                policy
+                    .loopback_upstreams
+                    .insert(host.domain.to_ascii_lowercase(), port);
+            }
+        }
+
         for item in &network.allow_ips {
             if let Ok(cidr) = item.parse::<ipnet::IpNet>() {
                 policy.allowed_cidrs.push(cidr);
@@ -71,6 +88,16 @@ impl OutboundPolicy {
         }
 
         policy
+    }
+
+    /// The host-loopback port this host is routed to, if any.
+    pub fn loopback_upstream(&self, host: &str) -> Option<u16> {
+        if self.loopback_upstreams.is_empty() {
+            return None;
+        }
+        self.loopback_upstreams
+            .get(&host.to_ascii_lowercase())
+            .copied()
     }
 
     pub fn allows_host(&self, host: &str) -> bool {

@@ -253,6 +253,7 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
                     opts.monitor,
                     canary_values.clone(),
                     secret_swaps,
+                    opts.events.clone(),
                 ) {
                     Ok((addr, port)) => {
                         dns_addr = addr;
@@ -302,6 +303,11 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
             // kills the `can run` process or it crashes.
             set_pdeathsig(libc::SIGKILL);
 
+            // Open this branch's event connection now, before the mount
+            // namespace and pivot_root make the socket path unreachable.
+            // The supervisor inherits it; the worker drops it again below.
+            install_event_stream(opts.events.as_ref(), can_events::StreamId::Supervisor);
+
             let result = child_entry(
                 &cmd,
                 &argv,
@@ -329,6 +335,32 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     }
 }
 
+/// Give this process its own event-stream connection (ADR-0010).
+///
+/// A forked child inherits the parent's connection; sharing one socket
+/// between processes would interleave lines, so every emitting process
+/// opens its own. Call this **before** joining or creating namespaces,
+/// while the socket path is still reachable. `None` drops the inherited
+/// stream without opening a new one.
+fn install_event_stream(events: Option<&can_events::EventConfig>, stream: can_events::StreamId) {
+    let Some(config) = events else {
+        can_events::uninstall();
+        return;
+    };
+
+    match can_events::EventStream::open(config, stream) {
+        Ok(opened) => can_events::install(opened),
+        Err(e) => {
+            tracing::warn!(
+                stream = stream.as_str(),
+                error = %e,
+                "event stream unavailable in this process; continuing without events"
+            );
+            can_events::uninstall();
+        }
+    }
+}
+
 /// Set up parent-side network infrastructure (pasta).
 ///
 /// `child_pid` is the PID of the sandboxed child process. pasta is
@@ -346,6 +378,7 @@ fn setup_parent_network(
     monitor: bool,
     canary_values: Vec<String>,
     secret_swaps: Vec<can_proxy::server::SecretSwap>,
+    events: Option<can_events::EventConfig>,
 ) -> Result<(String, u16), can_net::NetError> {
     if !can_net::pasta::is_available() {
         tracing::warn!(
@@ -377,6 +410,10 @@ fn setup_parent_network(
                 drop(port_rx);
                 drop(go_tx);
                 set_pdeathsig(libc::SIGKILL);
+
+                // Own event connection before any setns(): the inherited
+                // one belongs to the CLI process.
+                install_event_stream(events.as_ref(), can_events::StreamId::Proxy);
 
                 // Join the worker's user namespace (for CAP_NET_ADMIN) then
                 // its network namespace.
@@ -437,10 +474,12 @@ fn setup_parent_network(
                 }
                 drop(go_file);
 
-                // host.canister.local target — the proxy-netns default gateway
-                // pasta maps to the host's loopback. Detected after pasta is up.
+                // host.canister.local target — the address pasta was told
+                // to map to the host's loopback. A dedicated one: mapping
+                // the gateway instead would take the sandbox's resolver
+                // and default route with it.
                 let host_loopback_target = if config.network.allow_host_loopback {
-                    can_net::pasta::detect_default_gateway().map(std::net::IpAddr::V4)
+                    Some(std::net::IpAddr::V4(can_net::pasta::HOST_LOOPBACK_ADDR))
                 } else {
                     None
                 };
@@ -463,7 +502,20 @@ fn setup_parent_network(
                         .with_strict(config.strict)
                         .with_monitor(monitor)
                         .with_canaries(canary_values)
-                        .with_secret_swaps(secret_swaps);
+                        .with_secret_swaps(secret_swaps)
+                        .with_external_canaries(
+                            config
+                                .network
+                                .dlp
+                                .as_ref()
+                                .map(|d| d.external_canaries.clone())
+                                .unwrap_or_default(),
+                        );
+                    if let Some(events) = events.as_ref() {
+                        proxy_server_config = proxy_server_config
+                            .with_capture(events.capture.clone())
+                            .with_stats_interval_ms(events.stats_interval_ms);
+                    }
                     if let Some(target) = host_loopback_target {
                         proxy_server_config = proxy_server_config.with_host_loopback_target(target);
                     }
@@ -1337,7 +1389,9 @@ fn enter_pid_namespace_supervised(
 
             match supervisor_context {
                 None => {
-                    // No supervisor — this process continues as the sandbox worker.
+                    // No supervisor — this process continues as the sandbox
+                    // worker, which must not be able to write events.
+                    can_events::uninstall();
                     tracing::debug!(
                         pid = std::process::id(),
                         "entered PID namespace as PID 1 (no supervisor)"
@@ -1403,6 +1457,11 @@ fn enter_pid_namespace_supervised(
                         nix::unistd::ForkResult::Child => {
                             // Worker child: close recv end (supervisor receives).
                             drop(recv_fd);
+
+                            // The sandboxed workload must not be able to
+                            // forge events; drop the inherited connection
+                            // before any of its code runs.
+                            can_events::uninstall();
 
                             // Stash the send fd for later — child_entry will
                             // retrieve it after installing the seccomp filter.

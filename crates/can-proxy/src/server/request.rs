@@ -17,6 +17,7 @@ use tracing::{debug, error};
 
 use can_dlp::entropy::dns_label_entropy;
 
+use super::capture::{CaptureCtx, ExchangeRecorder};
 use super::dlp_ctx::DlpCtx;
 use super::dlp_enforce::enforce_request_verdicts;
 use super::limits::ProxyLimits;
@@ -36,6 +37,7 @@ use crate::policy::OutboundPolicy;
 
 /// Top-level dispatch: CONNECT → tunnel-or-passthrough; WebSocket → 501;
 /// everything else → inner handler.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_proxy_request(
     req: Request<hyper::body::Incoming>,
     ca: Arc<DynamicCa>,
@@ -44,11 +46,23 @@ pub(super) async fn handle_proxy_request(
     contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
+    capture: Option<CaptureCtx>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     if req.method() == Method::CONNECT {
-        return handle_connect(req, ca, dns_cache, outbound_policy, contracts, limits, dlp).await;
+        return handle_connect(
+            req,
+            ca,
+            dns_cache,
+            outbound_policy,
+            contracts,
+            limits,
+            dlp,
+            capture,
+        )
+        .await;
     }
     if crate::websocket::is_websocket_upgrade(&req) {
+        record_websocket_upgrade(&req, capture.as_ref());
         return Ok(crate::websocket::not_implemented_ws_bridge().await);
     }
     match dlp {
@@ -61,6 +75,7 @@ pub(super) async fn handle_proxy_request(
                 "http",
                 limits,
                 Some(ctx),
+                capture,
             )
             .await
         }
@@ -68,6 +83,27 @@ pub(super) async fn handle_proxy_request(
     }
 }
 
+/// WebSocket bridging is not implemented (the proxy answers 501). With
+/// capture on, record the attempt so a consumer sees that the workload
+/// tried to open a socket the proxy does not inspect.
+fn record_websocket_upgrade(req: &Request<hyper::body::Incoming>, capture: Option<&CaptureCtx>) {
+    let Some(ctx) = capture else {
+        return;
+    };
+
+    let host = extract_host(req);
+    let mut recorder = ExchangeRecorder::new(ctx.clone(), &host);
+    recorder.record_request(
+        req.method().as_str(),
+        &req.uri().to_string(),
+        req.headers(),
+        &[],
+    );
+    recorder.record_upgrade("websocket");
+    recorder.emit();
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_connect(
     req: Request<hyper::body::Incoming>,
     ca: Arc<DynamicCa>,
@@ -76,6 +112,7 @@ async fn handle_connect(
     contracts: Arc<crate::contracts::ContractTable>,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
+    capture: Option<CaptureCtx>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let authority = req
         .uri()
@@ -91,6 +128,7 @@ async fn handle_connect(
     // SNI to the proxy, costing cert-generation work, and (pre-fix) then
     // happily forwarding the request upstream regardless of allow lists.
     if !host_allowed_by_outbound_policy(&host_name_only, &outbound_policy) {
+        crate::events::egress_blocked(&host_name_only, "CONNECT", "", "policy");
         return Ok(
             ProxyError::policy_blocked(&host_name_only, host_is_ip(&host_name_only))
                 .into_response(),
@@ -112,6 +150,7 @@ async fn handle_connect(
                         contracts_for_tunnel.clone(),
                         limits.clone(),
                         ctx,
+                        capture.clone(),
                     )
                     .await
                     {
@@ -138,7 +177,12 @@ async fn handle_connect(
 }
 
 /// Inner-request handling, after TLS termination (or from plain HTTP
-/// when DLP is enabled). Each stage is a named function below.
+/// when DLP is enabled).
+///
+/// Wraps the stage pipeline so that every proxied request produces
+/// exactly one `egress_request` event, classified from the response the
+/// pipeline returned.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_inner_request(
     req: Request<hyper::body::Incoming>,
     dns_cache: can_net::dns_cache::DnsCache,
@@ -147,13 +191,57 @@ pub(super) async fn handle_inner_request(
     default_scheme: &'static str,
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
+    capture: Option<CaptureCtx>,
+) -> Result<Response<ProxyBody>, hyper::Error> {
+    let host = extract_host(&req);
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let mut recorder = capture.map(|ctx| ExchangeRecorder::new(ctx, &host));
+    let started = std::time::Instant::now();
+
+    let response = run_request_stages(
+        req,
+        &host,
+        dns_cache,
+        outbound_policy,
+        contracts,
+        default_scheme,
+        limits,
+        dlp,
+        recorder.as_mut(),
+    )
+    .await?;
+
+    crate::events::egress_request(
+        &host,
+        &method,
+        &path,
+        started.elapsed().as_millis() as u64,
+        &response,
+    );
+    if let Some(recorder) = recorder {
+        recorder.emit();
+    }
+    Ok(response)
+}
+
+/// The request pipeline itself. Each stage is a named function below.
+#[allow(clippy::too_many_arguments)]
+async fn run_request_stages(
+    req: Request<hyper::body::Incoming>,
+    host: &str,
+    dns_cache: can_net::dns_cache::DnsCache,
+    outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
+    default_scheme: &'static str,
+    limits: ProxyLimits,
+    dlp: Option<DlpCtx>,
+    mut recorder: Option<&mut ExchangeRecorder>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     debug!("Intercepting request: {} {}", req.method(), req.uri());
 
-    let host = extract_host(&req);
-
     // Stage 1: policy gate (connect permission).
-    if let Some(resp) = gate_by_policy(&host, &outbound_policy) {
+    if let Some(resp) = gate_by_policy(host, &outbound_policy) {
         return Ok(resp);
     }
 
@@ -166,14 +254,14 @@ pub(super) async fn handle_inner_request(
     let is_loopback_alias = outbound_policy.host_loopback_target.is_some()
         && host.eq_ignore_ascii_case(crate::policy::HOST_LOOPBACK_ALIAS);
     if !is_loopback_alias {
-        if let Some(resp) = gate_by_contract(&host, &req, &contracts) {
+        if let Some(resp) = gate_by_contract(host, &req, &contracts) {
             return Ok(resp);
         }
     }
 
     // Stage 3: DNS-entropy gate (DLP only).
     if let Some(ctx) = dlp.as_ref() {
-        if let Some(resp) = gate_by_dns_entropy(&host, ctx) {
+        if let Some(resp) = gate_by_dns_entropy(host, ctx) {
             return Ok(resp);
         }
     }
@@ -181,14 +269,14 @@ pub(super) async fn handle_inner_request(
     // Stage 3: upstream URI + headers.
     let (uri, original_scheme) = match egress::build_upstream_uri(
         &req,
-        &host,
+        host,
         default_scheme,
         limits.upstream_scheme.as_deref(),
     ) {
         Ok(v) => v,
         Err(err) => {
             error!("{}", err);
-            return Ok(ProxyError::bad_request(&host).into_response());
+            return Ok(ProxyError::bad_request(host).into_response());
         }
     };
 
@@ -201,26 +289,44 @@ pub(super) async fn handle_inner_request(
 
     // Stage 4: scan headers + URI (DLP only).
     if let Some(ctx) = dlp.as_ref() {
-        if let Some(resp) = scan_headers_and_uri(ctx, &parts, &original_uri, &host) {
+        if let Some(resp) = scan_headers_and_uri(ctx, &parts, &original_uri, host) {
             return Ok(resp);
         }
     }
 
     // Stage 5: buffer + scan body.
-    let req_body =
-        match buffer_and_scan_body(parts.headers.clone(), body, dlp.as_ref(), &limits, &host).await
-        {
-            BodyOutcome::Ready {
-                body,
-                content_length,
-            } => {
-                if let Some(len) = content_length {
-                    update_content_length(&mut parts.headers, len);
-                }
-                body
+    let req_body = match buffer_and_scan_body(
+        parts.headers.clone(),
+        body,
+        dlp.as_ref(),
+        &limits,
+        host,
+        recorder.is_some(),
+    )
+    .await
+    {
+        BodyOutcome::Ready {
+            body,
+            content_length,
+            captured,
+        } => {
+            if let Some(len) = content_length {
+                update_content_length(&mut parts.headers, len);
             }
-            BodyOutcome::Refused(resp) => return Ok(resp),
-        };
+            // Capture before the secret swap below, so the recorded
+            // request carries the fake credential, never the real one.
+            if let (Some(recorder), Some(bytes)) = (recorder.as_deref_mut(), captured) {
+                recorder.record_request(
+                    parts.method.as_str(),
+                    &parts.uri.to_string(),
+                    &parts.headers,
+                    &bytes,
+                );
+            }
+            body
+        }
+        BodyOutcome::Refused(resp) => return Ok(resp),
+    };
 
     // Fake→real secret swap (DLP only): the sandbox carries only fake
     // credentials; substitute the real value into headers bound for a
@@ -228,7 +334,7 @@ pub(super) async fn handle_inner_request(
     // (which sees the fake) and only on authorized hosts, so the real
     // secret never reaches an unauthorized destination.
     if let Some(ctx) = dlp.as_ref() {
-        super::secret_swap::swap_in_headers(&ctx.swaps, &ctx.scanner, &host, &mut parts.headers);
+        super::secret_swap::swap_in_headers(&ctx.swaps, &ctx.scanner, host, &mut parts.headers);
     }
 
     let mut upstream_req = Request::from_parts(parts, req_body);
@@ -244,7 +350,8 @@ pub(super) async fn handle_inner_request(
         &original_scheme,
         &limits,
         dlp.as_ref(),
-        &host,
+        host,
+        recorder,
     )
     .await
 }
@@ -298,6 +405,9 @@ fn gate_by_contract(
         body_size: None,
     };
     let violation = contracts.check(host, &shape)?;
+    // The event carries the reason code; the offending method and path
+    // are already fields of the event, so no prose detail is needed.
+    crate::events::contract_violation(host, shape.method, path, violation.reason(), None);
     Some(ProxyError::contract_refused(host, violation).into_response())
 }
 
@@ -329,11 +439,11 @@ fn scan_headers_and_uri(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     let header_verdicts = ctx.scanner.scan_headers(&headers, host);
-    if let Some(resp) = enforce_request_verdicts(&header_verdicts, host, ctx.monitor) {
+    if let Some(resp) = enforce_request_verdicts(ctx, &header_verdicts, host) {
         return Some(resp);
     }
     let uri_verdicts = ctx.scanner.scan_uri(&original_uri.to_string(), host);
-    enforce_request_verdicts(&uri_verdicts, host, ctx.monitor)
+    enforce_request_verdicts(ctx, &uri_verdicts, host)
 }
 
 enum BodyOutcome {
@@ -342,6 +452,9 @@ enum BodyOutcome {
         /// New content length (after re-buffering). `None` when the body
         /// was streamed through unchanged.
         content_length: Option<usize>,
+        /// The buffered request bytes, when capture is on. Taken before
+        /// the fake→real secret swap (ADR-0011).
+        captured: Option<Bytes>,
     },
     Refused(Response<ProxyBody>),
 }
@@ -352,11 +465,13 @@ async fn buffer_and_scan_body(
     dlp: Option<&DlpCtx>,
     limits: &ProxyLimits,
     host: &str,
+    capturing: bool,
 ) -> BodyOutcome {
     let Some(ctx) = dlp else {
         return BodyOutcome::Ready {
             body: body.boxed(),
             content_length: None,
+            captured: None,
         };
     };
 
@@ -391,13 +506,13 @@ async fn buffer_and_scan_body(
         let body_verdicts =
             ctx.scanner
                 .scan_body_with_type(&bytes, content_encoding, content_type, host);
-        if let Some(resp) = enforce_request_verdicts(&body_verdicts, host, ctx.monitor) {
+        if let Some(resp) = enforce_request_verdicts(ctx, &body_verdicts, host) {
             return BodyOutcome::Refused(resp);
         }
         // Trailers ride after the body in chunked transfer-encoding
         // and were a complete bypass before this scan was added.
         let trailer_verdicts = ctx.scanner.scan_trailers(&trailer_pairs, host);
-        if let Some(resp) = enforce_request_verdicts(&trailer_verdicts, host, ctx.monitor) {
+        if let Some(resp) = enforce_request_verdicts(ctx, &trailer_verdicts, host) {
             return BodyOutcome::Refused(resp);
         }
         if ctx
@@ -410,14 +525,7 @@ async fn buffer_and_scan_body(
                 ProxyError::dlp_blocked(host, "entropy-budget").into_response(),
             );
         }
-    } else if let Some(resp) = stream_scan_body(
-        &ctx.scanner,
-        &bytes,
-        host,
-        &ctx.canaries,
-        ctx.monitor,
-        ctx.max_decode_depth,
-    ) {
+    } else if let Some(resp) = stream_scan_body(ctx, &bytes, host) {
         return BodyOutcome::Refused(resp);
     }
 
@@ -425,15 +533,18 @@ async fn buffer_and_scan_body(
     // upstream — only for swaps authorized at `host`. `content_length` is
     // recomputed from the post-swap bytes so a length-changing swap keeps
     // the forwarded `Content-Length` correct.
+    let captured = capturing.then(|| bytes.clone());
     let bytes = super::secret_swap::swap_in_body(&ctx.swaps, &ctx.scanner, host, bytes);
 
     let len = bytes.len();
     BodyOutcome::Ready {
         body: super::responses::body_from(bytes),
         content_length: Some(len),
+        captured,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_and_scan_response(
     upstream_req: Request<BoxBody<Bytes, hyper::Error>>,
     dns_cache: &can_net::dns_cache::DnsCache,
@@ -442,6 +553,7 @@ async fn forward_and_scan_response(
     limits: &ProxyLimits,
     dlp: Option<&DlpCtx>,
     host: &str,
+    recorder: Option<&mut ExchangeRecorder>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let upstream_fut = forward_upstream(dns_cache, outbound_policy, upstream_req, original_scheme);
     let response = match tokio::time::timeout(limits.upstream_request_timeout, upstream_fut).await {
@@ -466,7 +578,7 @@ async fn forward_and_scan_response(
     // short-circuit, because the scanner now runs the full detector
     // registry, not just the canary substring check.
     if let Some(ctx) = dlp {
-        return Ok(scan_response(response, ctx, host, limits).await);
+        return Ok(scan_response(response, ctx, host, limits, recorder).await);
     }
     Ok(response.map(|body| body.boxed()))
 }
