@@ -328,6 +328,55 @@ fn socket_target_round_trips() {
 }
 
 #[test]
+fn a_connected_socket_bounds_how_long_a_write_may_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("events.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+
+    let sock = connect_socket(&path).expect("connect");
+
+    assert_eq!(
+        sock.write_timeout().expect("timeout readable"),
+        Some(WRITE_TIMEOUT),
+        "an unbounded write blocks the request path it is emitted from"
+    );
+}
+
+#[test]
+fn a_consumer_that_stops_reading_does_not_block_the_emitter() {
+    // The half-alive consumer: still connected, no longer reading. The
+    // socket buffer fills and the write would block forever without a
+    // timeout. Uses a short one so the test does not wait out the real
+    // five seconds; the mechanism is the same.
+    let (writer, _reader) = std::os::unix::net::UnixStream::pair().expect("pair");
+    writer
+        .set_write_timeout(Some(std::time::Duration::from_millis(50)))
+        .expect("set timeout");
+
+    let stream = EventStream::with_writer("r-wedged", StreamId::Proxy, Box::new(writer));
+
+    let started = std::time::Instant::now();
+    // Enough events to overflow any socket buffer; emission stops as
+    // soon as one write times out.
+    for _ in 0..100_000 {
+        stream.emit(&run_start());
+        if !stream.alive() {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        !stream.alive(),
+        "a stream whose writes cannot make progress must be given up for dead"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "emission took {elapsed:?}; a wedged consumer must not hold the emitter"
+    );
+}
+
+#[test]
 fn connecting_to_a_missing_socket_is_a_typed_error() {
     let config = EventConfig {
         target: EventTarget::Socket(PathBuf::from("/nonexistent/can-events.sock")),

@@ -38,8 +38,9 @@ impl ExternalCanaryTable {
     ///
     /// `matched_text` is what the detector matched, which may be a
     /// decoded or normalized form, so an entry matches when either value
-    /// contains the other. A hit that belongs to no external canary is a
-    /// generated tripwire: no data class, never allowed.
+    /// contains the other — see [`Self::lookup`] for why the direction
+    /// matters. A hit that belongs to no external canary is a generated
+    /// tripwire: no data class, never allowed.
     pub(super) fn classify(&self, matched_text: &str, host: &str) -> CanaryVerdict {
         let Some(entry) = self.lookup(matched_text) else {
             return CanaryVerdict {
@@ -54,10 +55,34 @@ impl ExternalCanaryTable {
         }
     }
 
+    /// The entry a match belongs to.
+    ///
+    /// Two kinds of match, and the order between them is what keeps a
+    /// value from borrowing another entry's permissions:
+    ///
+    /// 1. **The entry's value is in the traffic** — the value really did
+    ///    leave. The longest such entry wins, so a short prefix entry
+    ///    cannot shadow the specific one it is a prefix of.
+    /// 2. **The traffic is part of an entry's value** — a detector
+    ///    reported a decoded or normalized form. Only considered when
+    ///    nothing matched the first way: otherwise a narrow value with
+    ///    no allowed destinations would resolve to a wider entry that
+    ///    has one, and a leak would be recorded as an expected flow.
     fn lookup(&self, matched_text: &str) -> Option<&ExternalCanary> {
+        let longest = |left: &&ExternalCanary, right: &&ExternalCanary| {
+            left.value.len().cmp(&right.value.len())
+        };
+
         self.entries
             .iter()
-            .find(|entry| matched_text.contains(&entry.value) || entry.value.contains(matched_text))
+            .filter(|entry| matched_text.contains(&entry.value))
+            .max_by(longest)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.value.contains(matched_text))
+                    .max_by(longest)
+            })
     }
 }
 
