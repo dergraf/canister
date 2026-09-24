@@ -474,10 +474,12 @@ fn setup_parent_network(
                 }
                 drop(go_file);
 
-                // host.canister.local target — the proxy-netns default gateway
-                // pasta maps to the host's loopback. Detected after pasta is up.
+                // host.canister.local target — the address pasta was told
+                // to map to the host's loopback. A dedicated one: mapping
+                // the gateway instead would take the sandbox's resolver
+                // and default route with it.
                 let host_loopback_target = if config.network.allow_host_loopback {
-                    can_net::pasta::detect_default_gateway().map(std::net::IpAddr::V4)
+                    Some(std::net::IpAddr::V4(can_net::pasta::HOST_LOOPBACK_ADDR))
                 } else {
                     None
                 };
