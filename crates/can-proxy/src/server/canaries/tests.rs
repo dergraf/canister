@@ -91,3 +91,57 @@ fn values_feed_the_detector_set() {
         vec!["CNRY-7Q2X-AHV", "CNRY-5H1M-DIAG", "CNRY-NOEXIT"]
     );
 }
+
+/// A value must not inherit another entry's permissions by being a
+/// prefix of it.
+///
+/// Structured identifiers overlap by construction: an AHV number and the
+/// same number with its check digits, an IBAN and its account part. If a
+/// shorter match can resolve to a longer entry, the *narrower* value
+/// silently acquires the *wider* value's allowed destinations, and a
+/// leak is recorded as an expected flow.
+#[test]
+fn a_shorter_value_does_not_inherit_a_longer_entrys_permissions() {
+    let table = ExternalCanaryTable::new(vec![
+        ExternalCanary {
+            value: "756.1234.5678.9712".to_string(),
+            data_class: "ahv".to_string(),
+            allowed_hosts: vec!["analytics.vendor.example".to_string()],
+        },
+        ExternalCanary {
+            value: "756.1234.5678.97".to_string(),
+            data_class: "ahv".to_string(),
+            allowed_hosts: vec![],
+        },
+    ]);
+
+    let verdict = table.classify("756.1234.5678.97", "analytics.vendor.example");
+
+    assert!(
+        !verdict.allowed,
+        "the entry that may not leave at all must not borrow the other's allow-list"
+    );
+}
+
+/// The longest entry that matches wins, whatever order they are listed
+/// in: a prefix entry must not shadow a more specific one.
+#[test]
+fn the_most_specific_match_wins() {
+    let table = ExternalCanaryTable::new(vec![
+        ExternalCanary {
+            value: "756.1234".to_string(),
+            data_class: "partial".to_string(),
+            allowed_hosts: vec![],
+        },
+        ExternalCanary {
+            value: "756.1234.5678.9712".to_string(),
+            data_class: "ahv".to_string(),
+            allowed_hosts: vec!["analytics.vendor.example".to_string()],
+        },
+    ]);
+
+    let verdict = table.classify("756.1234.5678.9712", "analytics.vendor.example");
+
+    assert_eq!(verdict.data_class.as_deref(), Some("ahv"));
+    assert!(verdict.allowed);
+}

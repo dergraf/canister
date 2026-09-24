@@ -40,6 +40,20 @@ pub use seal::{SealError, SealKey};
 /// Genesis value for a stream's `prev_hash`.
 pub const GENESIS_HASH: [u8; 32] = [0u8; 32];
 
+/// How long a write to the event consumer may block before the stream is
+/// given up for dead.
+///
+/// A consumer that exits is harmless: the socket closes and the next
+/// write fails. A consumer that stops *reading* without closing is not —
+/// the socket buffer fills, `write_all` blocks, and because emission
+/// happens on the proxy's request path that blocks enforcement behind
+/// observation. Losing the observer must never do that, so a write that
+/// cannot make progress in this long kills the stream instead.
+///
+/// Generous enough that a busy consumer is not dropped for being slow,
+/// short enough that a run cannot wedge on one.
+pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
     #[error("failed to connect to event socket {path}: {source}")]
@@ -155,11 +169,9 @@ impl EventStream {
                 // Rust sets SOCK_CLOEXEC, so the fd is gone after the
                 // worker's execve — the sandboxed workload cannot forge
                 // events.
-                let sock = std::os::unix::net::UnixStream::connect(path).map_err(|source| {
-                    EventError::Connect {
-                        path: path.clone(),
-                        source,
-                    }
+                let sock = connect_socket(path).map_err(|source| EventError::Connect {
+                    path: path.clone(),
+                    source,
                 })?;
                 Box::new(sock)
             }
@@ -313,6 +325,15 @@ impl EventStream {
         inner.writer = None;
     }
 
+    /// Whether this stream is still writing. A stream goes dead on the
+    /// first write it cannot complete, and stays dead.
+    pub fn alive(&self) -> bool {
+        match self.inner.lock() {
+            Ok(guard) => guard.writer.is_some(),
+            Err(poisoned) => poisoned.into_inner().writer.is_some(),
+        }
+    }
+
     /// Number of events written so far. Tests and the run summary use it.
     pub fn emitted(&self) -> u64 {
         match self.inner.lock() {
@@ -405,6 +426,17 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Connect to the consumer and bound how long a write may block.
+pub(crate) fn connect_socket(
+    path: &std::path::Path,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    // Rust sets SOCK_CLOEXEC, so the fd is gone after the worker's
+    // execve — the sandboxed workload cannot forge events.
+    let sock = std::os::unix::net::UnixStream::connect(path)?;
+    sock.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    Ok(sock)
 }
 
 fn unix_ms() -> u64 {
