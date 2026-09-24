@@ -36,6 +36,15 @@ enum Commands {
         /// Sandbox name to run (defaults to the first defined in canister.toml).
         name: Option<String>,
 
+        /// Extra recipe to merge on top of the sandbox definition.
+        ///
+        /// Repeatable, merged after the manifest so it wins. For policy a
+        /// caller generates per run — routing a declared host to a local
+        /// mock, say. Like any recipe that is not pinned by checksum, it
+        /// cannot grant credential scope; that belongs in canister.toml.
+        #[arg(long = "recipe", value_name = "PATH")]
+        recipes: Vec<String>,
+
         /// Preview the resolved policy without running the sandbox.
         #[arg(long)]
         dry_run: bool,
@@ -244,21 +253,23 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Up {
             name,
+            recipes,
             dry_run,
             monitor,
             strict,
             ports,
             canaries_file,
             events,
-        } => commands::up(
-            name.as_deref(),
+        } => commands::up(commands::UpArgs {
+            name: name.as_deref(),
             dry_run,
             monitor,
             strict,
-            &ports,
-            canaries_file.as_deref(),
-            &events,
-        ),
+            ports: &ports,
+            canaries_file: canaries_file.as_deref(),
+            recipes: &recipes,
+            events: &events,
+        }),
         Commands::Run {
             recipe,
             monitor,
