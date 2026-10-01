@@ -62,7 +62,17 @@ fn all_events() -> Vec<(&'static str, Event)> {
             Event::PolicyResolved(PolicyResolved {
                 policy_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                     .to_string(),
-                policy: serde_json::json!({"network": {"egress": "proxy-only"}}),
+                policy: serde_json::json!({
+                    "network": {"egress": "proxy-only"},
+                    "unsafe": {
+                        "unfiltered_egress": false,
+                        "reachable_ips": [],
+                        "host_loopback": true,
+                        "expose_ports": [],
+                        "seccomp_default_allow": false,
+                        "extra_syscalls": [],
+                    },
+                }),
             }),
         ),
         (

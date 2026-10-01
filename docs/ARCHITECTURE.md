@@ -1162,6 +1162,12 @@ describing what a run did: `run_start`, `policy_resolved`, `process_exec`,
 `stats` and `run_end` — plus `exchange` when capture is on and
 `stream_seal` when signing is.
 
+`policy_resolved` carries the resolved policy and its canonical hash
+(ADR-0014). Its `unsafe` object lists every isolation-weakening setting
+in effect — `host_loopback`, `reachable_ips`, `expose_ports` and the
+rest — read back from the runtime policy, so a run's evidence shows
+what weakened its sandbox (ADR-0022).
+
 | Flag | Effect |
 |---|---|
 | `--events-socket <path>` | Connect to a listening `SOCK_STREAM` Unix socket. |

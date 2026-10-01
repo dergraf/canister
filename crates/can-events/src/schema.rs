@@ -102,7 +102,8 @@ pub struct RunStart {
 pub struct PolicyResolved {
     /// SHA-256 over the canonical serialization of `policy`.
     pub policy_sha256: String,
-    /// The fully resolved policy, same content as `can recipe show`.
+    /// The fully resolved policy, same content as `can recipe show`, plus
+    /// `unsafe`: the isolation-weakening settings in effect (ADR-0022).
     pub policy: serde_json::Value,
 }
 

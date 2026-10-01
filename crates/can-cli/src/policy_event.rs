@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use can_policy::SandboxConfig;
+use can_policy::config::UnsafeConfig;
 use sha2::{Digest, Sha256};
 
 /// Resolve the effective policy: the same document `can recipe show`
@@ -26,9 +27,21 @@ pub fn resolved(config: &SandboxConfig) -> SandboxConfig {
 /// lexicographically, then written compactly with no insignificant
 /// whitespace. The SHA-256 is taken over exactly those UTF-8 bytes, so a
 /// consumer can recompute it from the `policy` field alone.
+///
+/// The document also carries `unsafe`: the isolation-weakening settings in
+/// effect (ADR-0022). The runtime config keeps several of them out of its
+/// own serialization, so without it a run with `host_loopback` would leave
+/// no trace of it in the evidence.
 pub fn canonical(config: &SandboxConfig) -> Result<(serde_json::Value, String)> {
-    let value = serde_json::to_value(resolved(config))
-        .context("serializing the resolved policy as JSON")?;
+    let resolved = resolved(config);
+    let unsafe_in_effect = serde_json::to_value(UnsafeConfig::in_effect(&resolved))
+        .context("serializing the unsafe settings in effect as JSON")?;
+    let mut value =
+        serde_json::to_value(resolved).context("serializing the resolved policy as JSON")?;
+    value
+        .as_object_mut()
+        .context("the resolved policy serializes as a JSON object")?
+        .insert("unsafe".to_string(), unsafe_in_effect);
     let canonical = serde_json::to_string(&value).context("canonicalizing the resolved policy")?;
 
     let mut hasher = Sha256::new();
@@ -141,6 +154,72 @@ mod tests {
         assert_eq!(
             hash, recomputed,
             "a consumer can verify from `policy` alone"
+        );
+    }
+
+    #[test]
+    fn a_policy_without_unsafe_settings_says_so_explicitly() {
+        let (policy, _) = canonical(&config()).expect("canonical");
+
+        assert_eq!(
+            policy["unsafe"],
+            serde_json::json!({
+                "unfiltered_egress": false,
+                "reachable_ips": [],
+                "host_loopback": false,
+                "expose_ports": [],
+                "seccomp_default_allow": false,
+                "extra_syscalls": [],
+            })
+        );
+    }
+
+    #[test]
+    fn host_loopback_reaches_the_policy_and_changes_the_hash() {
+        let mut loopback = config();
+        loopback.network.allow_host_loopback = true;
+
+        let (policy, with_loopback) = canonical(&loopback).expect("canonical");
+        let (_, without) = canonical(&config()).expect("canonical");
+
+        assert_eq!(policy["unsafe"]["host_loopback"], true);
+        assert_ne!(
+            with_loopback, without,
+            "a weakened sandbox must not hash like the one it weakened"
+        );
+    }
+
+    #[test]
+    fn every_unsafe_switch_reaches_the_policy() {
+        let mut weakened = config();
+        weakened.network.egress = Some(EgressMode::Direct);
+        weakened.network.allow_ips = vec!["10.0.0.0/8".to_string()];
+        weakened.network.ports =
+            vec![can_policy::config::PortMapping::parse("127.0.0.1:8080:80").expect("port")];
+        weakened.syscalls.seccomp_mode = Some(can_policy::config::SeccompMode::DenyList);
+        weakened.syscalls.allow_extra = vec!["ptrace".to_string(), "sendmmsg".to_string()];
+
+        let (policy, _) = canonical(&weakened).expect("canonical");
+        let unsafe_block = &policy["unsafe"];
+
+        assert_eq!(unsafe_block["unfiltered_egress"], true);
+        assert_eq!(
+            unsafe_block["reachable_ips"],
+            serde_json::json!(["10.0.0.0/8"])
+        );
+        assert_eq!(
+            unsafe_block["expose_ports"],
+            serde_json::json!([{
+                "host_ip": "127.0.0.1",
+                "host_port": 8080,
+                "container_port": 80,
+                "protocol": "tcp",
+            }])
+        );
+        assert_eq!(unsafe_block["seccomp_default_allow"], true);
+        assert_eq!(
+            unsafe_block["extra_syscalls"],
+            serde_json::json!(["ptrace"])
         );
     }
 

@@ -650,7 +650,7 @@
       ],
       "properties": {
         "policy": {
-          "description": "The fully resolved policy, same content as `can recipe show`."
+          "description": "The fully resolved policy, same content as `can recipe show`, plus `unsafe`: the isolation-weakening settings in effect (ADR-0022)."
         },
         "policy_sha256": {
           "description": "SHA-256 over the canonical serialization of `policy`.",
