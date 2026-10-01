@@ -49,6 +49,9 @@ pub enum OverlayError {
 
     #[error("umount failed for {path}: {source}")]
     Umount { path: String, source: nix::Error },
+
+    #[error("denied path {path} is a symlink inside a mounted path; deny its target instead")]
+    DeniedSymlink { path: String },
 }
 
 /// Standard directories to create in the sandbox root.
@@ -196,6 +199,12 @@ pub fn setup_filesystem(
         );
     }
 
+    // 5b'. Hide denied paths that lie inside a mounted path. Mounting skips
+    //      a source that is denied or lies under a denied path, but a denied
+    //      path *below* a mounted one would otherwise come along with its
+    //      parent (`read = ["$HOME"]`, `deny = ["$HOME/.ssh"]`).
+    hide_denied(&sandbox_root, &denied_within_mounts(config, host_cwd))?;
+
     // 5c. Mask files that should be hidden inside the sandbox.
     //     This must happen AFTER the CWD bind-mount so the target files
     //     exist at their expected paths, but BEFORE pivot_root so we still
@@ -330,6 +339,84 @@ fn bind_mount_writable_paths(
 
         bind_mount_rw(source, &target, noexec)?;
         tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
+    }
+    Ok(())
+}
+
+/// Deny entries that lie strictly inside a path that will be mounted: a
+/// `read` or `write` entry, or the working directory. Mount sources that
+/// are themselves denied are skipped by the mount loops and do not count.
+fn denied_within_mounts(config: &FilesystemConfig, host_cwd: Option<&Path>) -> Vec<PathBuf> {
+    let is_denied = |path: &Path| config.deny.iter().any(|d| path.starts_with(d));
+    let mounted: Vec<&Path> = config
+        .read
+        .iter()
+        .chain(config.write.iter())
+        .map(PathBuf::as_path)
+        .chain(host_cwd)
+        .filter(|m| !is_denied(m))
+        .collect();
+
+    let mut hidden: Vec<PathBuf> = config
+        .deny
+        .iter()
+        .filter(|d| {
+            mounted
+                .iter()
+                .any(|m| d.starts_with(m) && d.as_path() != *m)
+        })
+        .cloned()
+        .collect();
+    hidden.sort();
+    hidden.dedup();
+    hidden
+}
+
+/// Hide each denied path inside the sandbox root: an empty read-only tmpfs
+/// over a directory, `/dev/null` over a file. Unlike `mask_files`, a
+/// failure is fatal — a deny rule that silently does not apply is exactly
+/// what this exists to prevent. A path that does not exist needs nothing;
+/// a symlink is refused, because a mount would follow it and leave the
+/// denied content reachable through the link.
+fn hide_denied(root: &Path, denied: &[PathBuf]) -> Result<(), OverlayError> {
+    for path in denied {
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let target = root.join(rel);
+
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            tracing::debug!(path = %path.display(), "denied path does not exist, nothing to hide");
+            continue;
+        };
+
+        if metadata.file_type().is_symlink() {
+            return Err(OverlayError::DeniedSymlink {
+                path: path.display().to_string(),
+            });
+        }
+
+        let result = if metadata.is_dir() {
+            mount(
+                None::<&str>,
+                &target,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                Some("size=0,mode=0000"),
+            )
+        } else {
+            mount(
+                Some(Path::new("/dev/null")),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+        };
+
+        result.map_err(|source| OverlayError::Mount {
+            path: path.display().to_string(),
+            source,
+        })?;
+        tracing::info!(path = %path.display(), "denied path hidden inside a mounted path");
     }
     Ok(())
 }
@@ -811,4 +898,76 @@ fn touch(path: &Path) -> Result<(), OverlayError> {
             source,
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(read: &[&str], write: &[&str], deny: &[&str]) -> FilesystemConfig {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect();
+        FilesystemConfig {
+            read: paths(read),
+            write: paths(write),
+            deny: paths(deny),
+            ..FilesystemConfig::default()
+        }
+    }
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_deny_below_a_read_path_is_hidden() {
+        let config = config(&["/home/dev"], &[], &["/home/dev/.ssh"]);
+        assert_eq!(
+            denied_within_mounts(&config, None),
+            paths(&["/home/dev/.ssh"])
+        );
+    }
+
+    #[test]
+    fn a_deny_below_a_write_path_or_the_working_directory_is_hidden() {
+        let config = config(
+            &[],
+            &["/var/cache/app"],
+            &["/var/cache/app/keys", "/work/.env"],
+        );
+        assert_eq!(
+            denied_within_mounts(&config, Some(Path::new("/work"))),
+            paths(&["/var/cache/app/keys", "/work/.env"])
+        );
+    }
+
+    #[test]
+    fn a_deny_that_is_not_inside_a_mount_needs_no_hiding() {
+        // `/etc/shadow` is never mounted, and `/root` equals a denied
+        // source the mount loop already skips.
+        let config = config(&["/etc/passwd", "/root"], &[], &["/etc/shadow", "/root"]);
+        assert!(denied_within_mounts(&config, None).is_empty());
+    }
+
+    #[test]
+    fn a_path_boundary_is_respected() {
+        let config = config(&["/home/dev"], &[], &["/home/developer/.ssh"]);
+        assert!(denied_within_mounts(&config, None).is_empty());
+    }
+
+    #[test]
+    fn a_mount_that_is_itself_denied_does_not_count() {
+        // `/home` is skipped because `/home` is denied, so nothing below it
+        // is mounted through it.
+        let config = config(&["/home"], &[], &["/home", "/home/dev/.ssh"]);
+        assert!(denied_within_mounts(&config, None).is_empty());
+    }
+
+    #[test]
+    fn each_denied_path_is_listed_once() {
+        let config = config(&["/home/dev", "/home"], &["/home/dev"], &["/home/dev/.ssh"]);
+        assert_eq!(
+            denied_within_mounts(&config, None),
+            paths(&["/home/dev/.ssh"])
+        );
+    }
 }
