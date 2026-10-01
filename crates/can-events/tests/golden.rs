@@ -217,6 +217,16 @@ fn all_events() -> Vec<(&'static str, Event)> {
                     .to_string(),
             }),
         ),
+        (
+            "fs_access",
+            Event::FsAccess(FsAccess {
+                path: "/home/dev/.ssh/id_ed25519".to_string(),
+                operation: FsOperation::Open,
+                mechanism: FsMechanism::Decoy,
+                count: 3,
+                pid: None,
+            }),
+        ),
     ]
 }
 
@@ -239,6 +249,7 @@ fn every_variant_has_a_golden() {
             Event::Stats(_) => "stats",
             Event::RunEnd(_) => "run_end",
             Event::StreamSeal(_) => "stream_seal",
+            Event::FsAccess(_) => "fs_access",
         };
 
         // egress_request appears twice: allowed and blocked.

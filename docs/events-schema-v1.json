@@ -212,6 +212,25 @@
           ]
         }
       }
+    },
+    {
+      "description": "The workload touched a filesystem tripwire (ADR-0019).",
+      "type": "object",
+      "required": [
+        "data",
+        "event"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/FsAccess"
+        },
+        "event": {
+          "type": "string",
+          "enum": [
+            "fs_access"
+          ]
+        }
+      }
     }
   ],
   "required": [
@@ -591,6 +610,65 @@
           "minimum": 0.0
         }
       }
+    },
+    "FsAccess": {
+      "description": "The workload touched a watched path (ADR-0019). Occurrences within a one-second window are coalesced into one event with their `count`.",
+      "type": "object",
+      "required": [
+        "count",
+        "mechanism",
+        "operation",
+        "path"
+      ],
+      "properties": {
+        "count": {
+          "description": "Occurrences coalesced into this event (at least 1).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "mechanism": {
+          "$ref": "#/definitions/FsMechanism"
+        },
+        "operation": {
+          "$ref": "#/definitions/FsOperation"
+        },
+        "path": {
+          "description": "The path as the workload sees it.",
+          "type": "string"
+        },
+        "pid": {
+          "description": "The process, when the mechanism can tell (a decoy cannot).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "FsMechanism": {
+      "description": "How a filesystem access was observed.",
+      "oneOf": [
+        {
+          "description": "A decoy file at the path, watched from outside the sandbox.",
+          "type": "string",
+          "enum": [
+            "decoy"
+          ]
+        }
+      ]
+    },
+    "FsOperation": {
+      "description": "What the workload did to a watched path.",
+      "type": "string",
+      "enum": [
+        "open",
+        "read",
+        "write",
+        "list"
+      ]
     },
     "Histogram": {
       "description": "Fixed-bucket latency histogram. Buckets are upper bounds in milliseconds; `counts` has one entry per bucket plus a final `+Inf` entry.",
