@@ -193,3 +193,87 @@ fn debug_never_prints_key_material() {
         "a signing key must not reach a log line"
     );
 }
+
+#[test]
+fn a_multi_byte_character_is_malformed_not_a_panic() {
+    // "é" is two bytes: each of these has an even byte length, and in
+    // "aaé" and "0é0" a two-byte step lands inside the character.
+    for candidate in ["aaé", "0é0", "éé"] {
+        assert_eq!(candidate.len() % 2, 0, "precondition: {candidate:?}");
+
+        assert!(
+            matches!(
+                unhex(candidate, "signature"),
+                Err(SealError::Malformed {
+                    field: "signature",
+                    ..
+                })
+            ),
+            "{candidate:?} must be refused as malformed"
+        );
+    }
+}
+
+#[test]
+fn a_multi_byte_character_in_a_seal_field_is_refused() {
+    let (key, _signature) = signed();
+    let signature = format!("{}é", "a".repeat(126));
+
+    assert!(matches!(
+        verify(
+            SEAL_ALGORITHM,
+            &key.public_key_hex(),
+            &signature,
+            "r-1",
+            "cli",
+            12,
+            &head_hex()
+        ),
+        Err(SealError::Malformed {
+            field: "signature",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn an_odd_number_of_hex_characters_is_malformed() {
+    assert!(matches!(
+        unhex("abc", "public_key"),
+        Err(SealError::Malformed {
+            field: "public_key",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn non_hex_ascii_is_malformed() {
+    for candidate in ["zz", "0g", "+1", "-1", " 1", "0x"] {
+        assert!(
+            matches!(unhex(candidate, "key"), Err(SealError::Malformed { .. })),
+            "{candidate:?} must be refused"
+        );
+    }
+}
+
+#[test]
+fn hex_decodes_both_cases() {
+    assert_eq!(
+        unhex("00ffAb10", "key").expect("valid hex"),
+        vec![0x00, 0xff, 0xab, 0x10]
+    );
+    assert_eq!(unhex("", "key").expect("empty"), Vec::<u8>::new());
+}
+
+#[test]
+fn a_key_file_with_a_multi_byte_character_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("utf8.key");
+    std::fs::write(&path, format!("{}é", "a".repeat(62))).expect("write");
+
+    assert!(matches!(
+        SealKey::from_file(&path),
+        Err(SealError::KeyLength { .. })
+    ));
+}

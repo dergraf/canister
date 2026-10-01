@@ -181,22 +181,34 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str, field: &'static str) -> Result<Vec<u8>, SealError> {
-    if text.len() % 2 != 0 {
-        return Err(SealError::Malformed {
-            field,
-            detail: "odd number of hex characters".to_string(),
-        });
+    let malformed = |detail: &str| SealError::Malformed {
+        field,
+        detail: detail.to_string(),
+    };
+
+    // Work on bytes, never on `str` offsets: a multi-byte character must
+    // be refused, not panic a verifier that was handed hostile input.
+    let bytes = text.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err(malformed("odd number of hex characters"));
     }
 
-    (0..text.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&text[index..index + 2], 16).map_err(|_| SealError::Malformed {
-                field,
-                detail: "not hexadecimal".to_string(),
-            })
+    bytes
+        .chunks_exact(2)
+        .map(|pair| match (hex_digit(pair[0]), hex_digit(pair[1])) {
+            (Some(high), Some(low)) => Ok(high << 4 | low),
+            _ => Err(malformed("not hexadecimal")),
         })
         .collect()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
