@@ -303,7 +303,12 @@ honestly; `write` is the one that persists to the host.
 
 **Behavior:**
 
-- Deny rules take precedence over `read`/`write` rules.
+- Deny rules take precedence over `read`/`write` rules. A denied path is
+  never mounted; a denied path *inside* a mounted one (`read = ["$HOME"]`,
+  `deny = ["$HOME/.ssh"]`, or under the working directory) is hidden: a
+  directory appears empty and unreadable, a file reads as empty. A denied
+  path that is a symlink inside a mounted path is refused at startup — deny
+  its target instead.
 - Paths are matched by prefix: allowing `/usr/lib` also allows `/usr/lib/python3`.
 - Essential paths are defined in `recipes/base.toml` (embedded in the binary,
   overridable on disk) and always bind-mounted: `/bin`, `/sbin`, `/usr/bin`,
