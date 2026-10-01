@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 mod canaries;
 mod commands;
 mod events;
+mod keys;
 mod policy_event;
 mod recipes;
 mod registry;
@@ -139,6 +140,34 @@ enum Commands {
         ///   sudo can setup --pasta-path $(which pasta)
         #[arg(long)]
         pasta_path: Option<String>,
+    },
+
+    /// Generate an Ed25519 key for --events-sign-key (ADR-0021).
+    ///
+    /// Writes a fresh 32-byte seed to PATH as 64 hex characters, with
+    /// mode 0600, and prints its public key — the value a consumer adds
+    /// to its trusted keys. The seed is never printed: stdout ends up in
+    /// terminal scrollback and CI logs, the places a key must not reach.
+    Keygen {
+        /// File to write the seed to.
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+
+        /// Replace an existing file. Seals signed with the old key will
+        /// no longer match the new public key.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Print the public key of an --events-sign-key seed file.
+    ///
+    /// Prints 64 lowercase hex characters, exactly as a `stream_seal`
+    /// event carries it in `public_key`. Accepts the same files as
+    /// --events-sign-key: 32 raw bytes or 64 hex characters.
+    Pubkey {
+        /// Seed file (from `can keygen` or `openssl rand -hex 32`).
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
     },
 
     /// Manage and inspect recipes.
@@ -293,6 +322,8 @@ fn main() -> ExitCode {
             force,
             pasta_path,
         } => commands::setup(remove, force, pasta_path.as_deref()),
+        Commands::Keygen { path, force } => keys::keygen(&path, force),
+        Commands::Pubkey { path } => keys::pubkey(&path),
         Commands::Recipe { action } => match action {
             RecipeAction::List => recipes::list(),
             RecipeAction::Show { recipe, command } => commands::show(&recipe, command),

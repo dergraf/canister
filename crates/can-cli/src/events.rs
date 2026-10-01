@@ -50,7 +50,9 @@ pub struct EventFlags {
     /// consumer can tell the bytes `can` wrote from bytes produced
     /// afterwards (ADR-0016).
     ///
-    /// The file holds 32 raw bytes or 64 hex characters. The sandboxed
+    /// The file holds 32 raw bytes or 64 hex characters; `can keygen`
+    /// writes one and `can pubkey` prints the public key a consumer
+    /// trusts (ADR-0021). The sandboxed
     /// workload never sees it: it is read before the namespace is
     /// entered and never enters the child's environment.
     #[arg(long, value_name = "PATH")]
