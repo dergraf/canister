@@ -108,10 +108,15 @@ impl OutboundPolicy {
             return true;
         }
 
+        // `*.X` admits subdomains of X only; a bare `X` admits X and its
+        // subdomains — the reading `contracts.rs` `match_score` uses.
         let host = host.to_ascii_lowercase();
         self.allowed_domains
             .iter()
-            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+            .any(|domain| match domain.strip_prefix("*.") {
+                Some(suffix) => host.ends_with(&format!(".{suffix}")),
+                None => host == *domain || host.ends_with(&format!(".{domain}")),
+            })
     }
 
     pub fn allows_ip_literal(&self, ip: IpAddr) -> bool {
@@ -169,6 +174,21 @@ mod tests {
         assert!(policy.allows_host("hex.pm"));
         assert!(policy.allows_host("repo.hex.pm"));
         assert!(!policy.allows_host("google.com"));
+    }
+
+    #[test]
+    fn a_wildcard_block_allows_subdomains_but_not_the_apex() {
+        // The contract gate already reads `*.X` this way (`contracts.rs`
+        // `match_score`); the connect gate must agree, or a block accepted
+        // at one stage is refused at the other.
+        let net = can_policy::config::NetworkConfig::default();
+        let policy = OutboundPolicy::from_config(&net, &[host("*.Example.org")]);
+
+        assert!(policy.allows_host("a.example.org"));
+        assert!(policy.allows_host("deep.a.example.org"));
+        assert!(!policy.allows_host("example.org"));
+        assert!(!policy.allows_host("notexample.org"));
+        assert!(!policy.allows_host("example.org.evil.com"));
     }
 
     #[test]
