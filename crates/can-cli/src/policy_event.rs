@@ -122,6 +122,34 @@ mod tests {
         assert_eq!(implicit_hash, explicit_hash);
     }
 
+    fn with_provider_host(session_entropy_budget: Option<u64>) -> SandboxConfig {
+        let mut config = config();
+        config.hosts.push(can_policy::config::HostBlock {
+            domain: "api.anthropic.com".to_string(),
+            allow_credentials: vec!["anthropic_key".to_string()],
+            session_entropy_budget,
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn an_unset_per_host_entropy_budget_is_left_out_of_the_policy() {
+        // Policies that predate the field keep the hash they had.
+        let (policy, _) = canonical(&with_provider_host(None)).expect("canonical");
+        let host = &policy["host"][0];
+        assert_eq!(host["domain"], "api.anthropic.com");
+        assert!(host.get("session_entropy_budget").is_none(), "{host}");
+    }
+
+    #[test]
+    fn a_per_host_entropy_budget_is_in_the_policy_and_its_hash() {
+        let (policy, with) = canonical(&with_provider_host(Some(1 << 20))).expect("canonical");
+        let (_, without) = canonical(&with_provider_host(None)).expect("canonical");
+        assert_eq!(policy["host"][0]["session_entropy_budget"], 1 << 20);
+        assert_ne!(with, without);
+    }
+
     #[test]
     fn a_policy_change_changes_the_hash() {
         let mut changed = config();

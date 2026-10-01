@@ -185,6 +185,10 @@ impl SandboxDef {
         }
         // Validate syscall config (no mixing absolute and relative).
         self.syscalls.validate()?;
+        for host in &self.hosts {
+            host.validate()
+                .map_err(|e| ConfigError::Validation(format!("sandbox '{name}': {e}")))?;
+        }
         Ok(())
     }
 }

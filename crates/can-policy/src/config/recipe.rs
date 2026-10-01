@@ -178,6 +178,8 @@ impl RecipeFile {
         );
         for h in &mut self.hosts {
             h.allow_credentials.clear();
+            // A per-host entropy budget rides on credential scope.
+            h.session_entropy_budget = None;
         }
         if let Some(dlp) = self.network.dlp.as_mut() {
             dlp.fake_secrets.clear();
@@ -194,6 +196,11 @@ impl RecipeFile {
 
     /// Recipe-level validation that spans sections.
     fn validate(&self) -> Result<(), ConfigError> {
+        for host in &self.hosts {
+            host.validate()
+                .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        }
+
         // `egress = "direct"` deserializes (the runtime needs the variant)
         // but is not a thing a recipe may *ask* for — it disables DLP and
         // contract gates. Point the author at the quarantined knob.
