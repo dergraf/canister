@@ -211,6 +211,10 @@ pub fn setup_filesystem(
     //     have access to /dev/null on the host.
     mask_files(&sandbox_root, config)?;
 
+    // 5d. Place decoy files (tripwires, ADR-0019) after every real mount,
+    //     so a real grant always wins. Empty list (the default): no-op.
+    bind_mount_decoys(&sandbox_root, config, host_cwd);
+
     // 6. Mount a fresh /proc for PID namespace.
     mount_proc(&sandbox_root)?;
 
@@ -419,6 +423,74 @@ fn hide_denied(root: &Path, denied: &[PathBuf]) -> Result<(), OverlayError> {
         tracing::info!(path = %path.display(), "denied path hidden inside a mounted path");
     }
     Ok(())
+}
+
+/// Where a decoy may be placed. Placing one under a writable mount or the
+/// working directory would create its parent directories *on the host*
+/// (the mount is a live bind), and under a read-only mount `mkdir` fails;
+/// in both cases the path is the real grant's to fill, not the decoy's.
+#[derive(Debug, PartialEq, Eq)]
+enum DecoyPlacement {
+    Place,
+    UnderWritable,
+    UnderReadable,
+}
+
+fn decoy_placement(
+    target: &Path,
+    config: &FilesystemConfig,
+    host_cwd: Option<&Path>,
+) -> DecoyPlacement {
+    let under = |mount: &Path| target.starts_with(mount);
+
+    if config.write.iter().any(|w| under(w)) || host_cwd.is_some_and(under) {
+        DecoyPlacement::UnderWritable
+    } else if config
+        .read
+        .iter()
+        .any(|r| under(r) && !config.deny.iter().any(|d| r.starts_with(d)))
+    {
+        DecoyPlacement::UnderReadable
+    } else {
+        DecoyPlacement::Place
+    }
+}
+
+/// Bind-mount each materialised decoy read-only at its sandbox path, so
+/// that the host side can watch it (ADR-0019). Skips, with a log line,
+/// rather than fails: a tripwire that cannot be placed must not stop the
+/// run, and the CLI reports which decoys it watches.
+fn bind_mount_decoys(root: &Path, config: &FilesystemConfig, host_cwd: Option<&Path>) {
+    for decoy in &config.decoys {
+        let rel = decoy.target.strip_prefix("/").unwrap_or(&decoy.target);
+        let target = root.join(rel);
+
+        if std::fs::symlink_metadata(&target).is_ok() {
+            tracing::debug!(path = %decoy.target.display(), "a real path exists; decoy not placed");
+            continue;
+        }
+
+        match decoy_placement(&decoy.target, config, host_cwd) {
+            DecoyPlacement::Place => {}
+            placement => {
+                tracing::warn!(path = %decoy.target.display(), ?placement, "decoy not placed");
+                continue;
+            }
+        }
+
+        let placed = target
+            .parent()
+            .map_or(Ok(()), mkdir_p)
+            .and_then(|()| touch(&target))
+            .and_then(|()| bind_mount_ro(&decoy.source, &target));
+
+        match placed {
+            Ok(()) => tracing::info!(path = %decoy.target.display(), "decoy placed"),
+            Err(e) => {
+                tracing::warn!(path = %decoy.target.display(), error = %e, "decoy not placed")
+            }
+        }
+    }
 }
 
 /// Mask files inside the sandbox by bind-mounting `/dev/null` over them.
@@ -968,6 +1040,63 @@ mod tests {
         assert_eq!(
             denied_within_mounts(&config, None),
             paths(&["/home/dev/.ssh"])
+        );
+    }
+
+    fn placement(target: &str, config: &FilesystemConfig, cwd: Option<&str>) -> DecoyPlacement {
+        decoy_placement(Path::new(target), config, cwd.map(Path::new))
+    }
+
+    #[test]
+    fn a_decoy_goes_where_nothing_is_mounted() {
+        let config = config(&["/usr/lib"], &[], &[]);
+        assert_eq!(
+            placement("/home/dev/.ssh/id_ed25519", &config, Some("/work")),
+            DecoyPlacement::Place
+        );
+    }
+
+    #[test]
+    fn never_under_a_writable_path_or_the_working_directory_where_it_would_touch_the_host() {
+        let config = config(&[], &["/home/dev/.cache"], &[]);
+        assert_eq!(
+            placement("/home/dev/.cache/token", &config, None),
+            DecoyPlacement::UnderWritable
+        );
+        assert_eq!(
+            placement("/work/.env", &config, Some("/work")),
+            DecoyPlacement::UnderWritable
+        );
+    }
+
+    #[test]
+    fn never_under_a_readable_path() {
+        let config = config(&["/home/dev"], &[], &[]);
+        assert_eq!(
+            placement("/home/dev/.ssh/id_ed25519", &config, None),
+            DecoyPlacement::UnderReadable
+        );
+    }
+
+    #[test]
+    fn a_readable_path_that_is_denied_is_not_mounted_and_does_not_count() {
+        let config = config(&["/home/dev"], &[], &["/home"]);
+        assert_eq!(
+            placement("/home/dev/.ssh/id_ed25519", &config, None),
+            DecoyPlacement::Place
+        );
+    }
+
+    #[test]
+    fn a_decoy_respects_path_boundaries() {
+        let config = config(&["/home/dev"], &["/work"], &[]);
+        assert_eq!(
+            placement("/home/developer/.ssh/id_rsa", &config, Some("/work")),
+            DecoyPlacement::Place
+        );
+        assert_eq!(
+            placement("/workspace/.env", &config, Some("/work")),
+            DecoyPlacement::Place
         );
     }
 }
