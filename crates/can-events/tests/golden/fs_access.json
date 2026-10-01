@@ -1,0 +1,1 @@
+{"schema":1,"run_id":"r-golden","stream":"proxy","seq":0,"ts_ms":1760000000000,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","event":"fs_access","data":{"path":"/home/dev/.ssh/id_ed25519","operation":"open","mechanism":"decoy","count":3},"chain_hash":"52204ffd2e93d880c9b6e0c7991c81eb6c7ad1f4ed0738d935a009fc5d13e3ae"}

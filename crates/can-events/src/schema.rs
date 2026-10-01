@@ -43,6 +43,8 @@ pub enum Event {
     RunEnd(RunEnd),
     /// Closing signature over a stream's hash chain (ADR-0016).
     StreamSeal(StreamSeal),
+    /// The workload touched a filesystem tripwire (ADR-0019).
+    FsAccess(FsAccess),
 }
 
 impl Event {
@@ -61,6 +63,7 @@ impl Event {
             Self::Stats(_) => "stats",
             Self::RunEnd(_) => "run_end",
             Self::StreamSeal(_) => "stream_seal",
+            Self::FsAccess(_) => "fs_access",
         }
     }
 }
@@ -171,6 +174,39 @@ pub struct CanaryFire {
     pub allowed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+}
+
+/// What the workload did to a watched path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FsOperation {
+    Open,
+    Read,
+    Write,
+    List,
+}
+
+/// How a filesystem access was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FsMechanism {
+    /// A decoy file at the path, watched from outside the sandbox.
+    Decoy,
+}
+
+/// The workload touched a watched path (ADR-0019). Occurrences within a
+/// one-second window are coalesced into one event with their `count`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FsAccess {
+    /// The path as the workload sees it.
+    pub path: String,
+    pub operation: FsOperation,
+    pub mechanism: FsMechanism,
+    /// Occurrences coalesced into this event (at least 1).
+    pub count: u64,
+    /// The process, when the mechanism can tell (a decoy cannot).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
