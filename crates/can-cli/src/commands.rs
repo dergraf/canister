@@ -313,7 +313,7 @@ pub fn up(args: UpArgs<'_>) -> Result<i32> {
 
     let events = event_flags.init()?;
 
-    let opts = SandboxOpts {
+    let mut opts = SandboxOpts {
         command: cmd.clone(),
         args: args.to_vec(),
         config,
@@ -322,7 +322,7 @@ pub fn up(args: UpArgs<'_>) -> Result<i32> {
         events,
     };
 
-    let exit_code = run_sandbox(&opts, Some(&sandbox_name))?;
+    let exit_code = run_sandbox(&mut opts, Some(&sandbox_name))?;
 
     if monitor {
         print_monitor_exit_summary(exit_code, &opts.config);
@@ -571,7 +571,7 @@ pub fn run(
 
     let events = event_flags.init()?;
 
-    let opts = SandboxOpts {
+    let mut opts = SandboxOpts {
         command: cmd.clone(),
         args: args.to_vec(),
         config,
@@ -580,7 +580,7 @@ pub fn run(
         events,
     };
 
-    let exit_code = run_sandbox(&opts, None)?;
+    let exit_code = run_sandbox(&mut opts, None)?;
 
     if monitor {
         print_monitor_exit_summary(exit_code, &opts.config);
@@ -593,7 +593,7 @@ pub fn run(
 ///
 /// Emission is a no-op unless an event stream was installed, so this is
 /// the single launch path for both `can run` and `can up`.
-fn run_sandbox(opts: &SandboxOpts, sandbox_name: Option<&str>) -> Result<i32> {
+fn run_sandbox(opts: &mut SandboxOpts, sandbox_name: Option<&str>) -> Result<i32> {
     let mut command_line = vec![opts.command.clone()];
     command_line.extend(opts.args.iter().cloned());
 
@@ -616,9 +616,22 @@ fn run_sandbox(opts: &SandboxOpts, sandbox_name: Option<&str>) -> Result<i32> {
         },
     ));
 
+    // Tripwires (ADR-0019): the decoys are created and watched before the
+    // sandbox starts, and reported on before `run_end`.
+    let tripwires = crate::tripwire::Tripwires::arm(&opts.config.filesystem.decoy, |access| {
+        can_events::emit(can_events::Event::FsAccess(access))
+    })?
+    .map(|(tripwires, mounts)| {
+        opts.config.filesystem.decoys = mounts;
+        tripwires
+    });
+
     let started = std::time::Instant::now();
     let result = can_sandbox::run(opts);
     let duration_ms = started.elapsed().as_millis() as u64;
+    if let Some(tripwires) = tripwires {
+        tripwires.disarm();
+    }
 
     let (exit_code, error) = match &result {
         Ok(code) => (Some(*code), None),

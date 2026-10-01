@@ -275,6 +275,7 @@ dependencies = [
  "can-policy",
  "can-sandbox",
  "clap",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

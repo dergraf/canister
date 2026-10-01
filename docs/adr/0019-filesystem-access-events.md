@@ -1,7 +1,7 @@
 # ADR-0019: Filesystem Access Events
 
 ## Status
-Proposed
+Accepted (implemented 2026-10-01; the core change below was reviewed and approved)
 
 ## Date
 2026-10-01
@@ -195,10 +195,13 @@ first moves (SSH keys, cloud credentials, token stores). Option 2 is the right a
 only if complete coverage is later required and its cost is accepted; it is recorded
 here so that the trade-off does not have to be rediscovered.
 
-**This ADR is Proposed and not implemented**, because every sound option, including the
-chosen one, needs a change to the sandbox's mount setup: a denied path does not exist in
-the worker's mount namespace, and only `overlay.rs` can make it exist. That change is
-outside what may be altered without review, so it is specified here instead.
+Every sound option, including the chosen one, needs a change to the sandbox's mount
+setup: a denied path does not exist in the worker's mount namespace, and only
+`overlay.rs` can make it exist. The change below was reviewed and accepted, and is
+implemented as specified (`bind_mount_decoys`, `decoy_placement`).
+
+`count` is a lower bound: inotify itself merges identical consecutive events that have
+not been read yet, so a tight loop of opens may arrive as fewer events than it made.
 
 ### Minimal core change
 
@@ -303,12 +306,13 @@ ADR-0015's counters.
   `overlay.rs` change (mask the denied subpath after the binds).
 
 ## Follow-up Actions
-- [ ] Review and accept the `bind_mount_decoys` core change above.
-- [ ] Implement the recipe field, `tripwires.toml`, the CLI watcher, the `fs_access`
+- [x] Review and accept the `bind_mount_decoys` core change above.
+- [x] Implement the recipe field, `tripwires.toml`, the CLI watcher, the `fs_access`
       event (`schema.rs`, `docs/events-schema-v1.json`, golden file) and docs.
-- [ ] Integration test: `cat ~/.ssh/id_ed25519` inside the sandbox yields one
-      `fs_access` event; 1000 reads in a loop yield a bounded number of events whose
-      `count` sums to 1000.
-- [ ] Separately: enforce `deny` entries that lie below an allowed path.
+- [x] Integration test (`t_tripwires.sh`): opening a decoy yields an `fs_access` event
+      before `run_end`; a burst of 500 opens yields a bounded number of events (their
+      `count` is a lower bound, see above).
+- [x] Separately: enforce `deny` entries that lie below an allowed path (branch
+      `fix/deny-below-allowed-path`).
 - [ ] Separately: emit `process_exec` from the supervisor for supervised `execve`, as the
       schema documentation already claims.

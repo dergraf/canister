@@ -9,6 +9,7 @@ mod keys;
 mod policy_event;
 mod recipes;
 mod registry;
+mod tripwire;
 
 #[derive(Parser)]
 #[command(

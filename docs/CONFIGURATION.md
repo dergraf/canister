@@ -297,6 +297,7 @@ paths and essential system paths are bind-mounted read-only.
 | `read` | `string[]` | `[]` | Paths bind-mounted **read-only** into the sandbox |
 | `write` | `string[]` | `[]` | Paths bind-mounted **writable** — changes persist on the host |
 | `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** `read`/`write`) |
+| `decoy` | `string[]` | `[]` | Tripwires: an empty read-only decoy file is placed at each path, and any access to it is reported as an `fs_access` event (ADR-0019). Never replaces a path that `read`, `write` or the working directory provides. `recipes = ["tripwires"]` covers the usual credential locations. |
 
 Note: read access still matters — a *readable* credential file is exactly
 what the DLP layer exists to stop from leaving. `read` names the grant
