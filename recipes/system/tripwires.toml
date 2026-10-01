@@ -1,0 +1,33 @@
+# Canister recipe — filesystem tripwires.
+#
+# Places an empty, read-only decoy file at the usual credential
+# locations and reports every access to one as an `fs_access` event
+# (ADR-0019). The decoys hold nothing: they exist so that a dependency
+# or an agent going for credentials leaves a trace. A path the policy
+# really grants (`read`, `write`, the working directory) is never
+# replaced by a decoy.
+#
+#   recipes = ["tripwires"]
+
+[recipe]
+name = "tripwires"
+description = "Decoys at well-known credential paths; reports any access to them"
+version = "1"
+
+[filesystem]
+decoy = [
+    "$HOME/.ssh/id_rsa",
+    "$HOME/.ssh/id_ed25519",
+    "$HOME/.ssh/id_ecdsa",
+    "$HOME/.aws/credentials",
+    "$HOME/.config/gcloud/application_default_credentials.json",
+    "$HOME/.azure/accessTokens.json",
+    "$HOME/.kube/config",
+    "$HOME/.docker/config.json",
+    "$HOME/.netrc",
+    "$HOME/.npmrc",
+    "$HOME/.pypirc",
+    "$HOME/.git-credentials",
+    "$HOME/.config/gh/hosts.yml",
+    "/etc/shadow",
+]

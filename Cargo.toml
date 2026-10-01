@@ -36,7 +36,7 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Linux syscalls
-nix = { version = "0.29", features = ["sched", "mount", "user", "process", "signal", "fs", "net", "ioctl"] }
+nix = { version = "0.29", features = ["sched", "mount", "user", "process", "signal", "fs", "net", "ioctl", "inotify"] }
 
 # Network / IP parsing
 ipnet = "2"

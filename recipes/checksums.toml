@@ -59,5 +59,6 @@
 "system/generic-strict.toml" = "e20b986e5e757584e91c557127506cdf27dfac225d8a3a9b17a8ea23e2b98ac3"
 "system/gpg-public.toml" = "fe4cc2aee32317d8fd2bbb0fc09c37bef2cb32827989f2064ad205db7e1c25c5"
 "system/ssh-agent.toml" = "b904a1be1a159d2e82f1b3216f96964d8a79dd309439c2d7f32c0c638d2410bf"
+"system/tripwires.toml" = "6178f9b4a01b73157c9c10cff6f4a3544eff478c70edd6c0db01c8ce851a24c3"
 "vcs/gh.toml" = "a235ab24bf0a562c58becce66856f03805e21311ec4f29b7a08f960c10e5beb6"
 "vcs/git.toml" = "3fd5d37d9cab7ed1817a50d7d04befda1a49ae55afddd9042fb58ff9f2efd127"

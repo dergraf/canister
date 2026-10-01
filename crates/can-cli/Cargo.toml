@@ -16,6 +16,7 @@ can-policy.workspace = true
 can-net.workspace = true
 can-events.workspace = true
 can-log.workspace = true
+nix.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
