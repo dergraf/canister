@@ -34,7 +34,7 @@ pub use host::{
     ContractMode, EntropyBudgetWithoutCredentials, HostBlock, UpstreamParseError, UpstreamTarget,
     merge_host_blocks,
 };
-pub use network::{EgressMode, NetworkConfig};
+pub use network::{EgressMode, NetworkConfig, UndeclaredHosts};
 pub use process::{ExecMode, ExecPolicy, ProcessConfig};
 pub use proxy::ProxyConfig;
 pub use recipe::{RecipeFile, RecipeMeta};
