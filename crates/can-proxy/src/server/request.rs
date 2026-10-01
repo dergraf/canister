@@ -296,7 +296,11 @@ async fn run_request_stages(
     }
 
     // Stage 5: buffer + scan body.
-    let entropy_account = EntropyAccount::for_request(&original_uri, &parts.headers, None);
+    let budget_override = contracts
+        .lookup(host)
+        .and_then(can_policy::config::HostBlock::entropy_budget_override);
+    let entropy_account =
+        EntropyAccount::for_request(&original_uri, &parts.headers, budget_override);
     let req_body = match buffer_and_scan_body(
         parts.headers.clone(),
         body,

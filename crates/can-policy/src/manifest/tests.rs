@@ -334,3 +334,37 @@ allow_extra = ["statx"]
     let result = Manifest::parse(toml);
     assert!(result.is_err(), "mixing allow and allow_extra should fail");
 }
+
+#[test]
+fn a_manifest_per_host_entropy_budget_needs_credential_scope() {
+    let toml = r#"
+[sandbox.agent]
+recipes = ["base"]
+command = "agent"
+
+[[sandbox.agent.host]]
+domain = "api.provider.example"
+session_entropy_budget = 1048576
+"#;
+    let err = Manifest::parse(toml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("sandbox 'agent'"), "{msg}");
+    assert!(msg.contains("without allow_credentials"), "{msg}");
+}
+
+#[test]
+fn a_manifest_per_host_entropy_budget_with_credential_scope_parses() {
+    let toml = r#"
+[sandbox.agent]
+recipes = ["base"]
+command = "agent"
+
+[[sandbox.agent.host]]
+domain = "api.provider.example"
+allow_credentials = ["anthropic_key"]
+session_entropy_budget = 1048576
+"#;
+    let manifest = Manifest::parse(toml).unwrap();
+    let recipe: RecipeFile = manifest.get("agent").unwrap().into();
+    assert_eq!(recipe.hosts[0].entropy_budget_override(), Some(1_048_576));
+}

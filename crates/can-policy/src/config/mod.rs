@@ -30,7 +30,10 @@ pub use dlp::{DlpConfig, ExternalCanary, FakeSecret};
 pub use env::expand_env_vars;
 pub use error::ConfigError;
 pub use filesystem::{FilesystemConfig, PortMapping, PortProtocol};
-pub use host::{ContractMode, HostBlock, UpstreamParseError, UpstreamTarget, merge_host_blocks};
+pub use host::{
+    ContractMode, EntropyBudgetWithoutCredentials, HostBlock, UpstreamParseError, UpstreamTarget,
+    merge_host_blocks,
+};
 pub use network::{EgressMode, NetworkConfig};
 pub use process::{ExecMode, ExecPolicy, ProcessConfig};
 pub use proxy::ProxyConfig;

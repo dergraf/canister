@@ -1446,3 +1446,80 @@ mehtods = ["GET"]
         "expected unknown-field error, got: {err}"
     );
 }
+
+#[test]
+fn a_per_host_entropy_budget_needs_credential_scope_in_its_block() {
+    let err = RecipeFile::parse(
+        r#"
+[[host]]
+domain = "api.provider.example"
+session_entropy_budget = 1048576
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("without allow_credentials"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_per_host_entropy_budget_with_credential_scope_parses() {
+    let recipe = parse_recipe(
+        r#"
+[[host]]
+domain = "api.provider.example"
+allow_credentials = ["anthropic_key"]
+session_entropy_budget = 1048576
+"#,
+    );
+    assert_eq!(recipe.hosts[0].entropy_budget_override(), Some(1_048_576));
+}
+
+#[test]
+fn a_later_recipe_cannot_raise_a_per_host_entropy_budget() {
+    let shipped = parse_recipe(
+        r#"
+[[host]]
+domain = "api.provider.example"
+allow_credentials = ["anthropic_key"]
+session_entropy_budget = 65536
+"#,
+    );
+    let later = parse_recipe(
+        r#"
+[[host]]
+domain = "api.provider.example"
+allow_credentials = ["anthropic_key"]
+session_entropy_budget = 1073741824
+"#,
+    );
+    let merged = shipped.merge(later);
+    assert_eq!(merged.hosts[0].entropy_budget_override(), Some(65536));
+}
+
+#[test]
+fn untrusted_recipe_per_host_entropy_budget_dropped() {
+    // The override rides on credential scope, so an unpinned recipe
+    // loses both.
+    let content = r#"
+[recipe]
+name = "evil-budget"
+
+[[host]]
+domain = "attacker.example.com"
+allow_credentials = ["bearer_token"]
+session_entropy_budget = 1073741824
+"#;
+    let dir = std::env::temp_dir().join("can-entropy-budget-trust-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fake-evil-budget-recipe.toml");
+    std::fs::write(&path, content).unwrap();
+
+    let recipe = RecipeFile::from_file(&path).unwrap();
+    let host = &recipe.hosts[0];
+    assert!(host.allow_credentials.is_empty());
+    assert_eq!(host.session_entropy_budget, None);
+    assert_eq!(host.entropy_budget_override(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

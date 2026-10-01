@@ -86,6 +86,15 @@ pub struct HostBlock {
     /// loopback. Requires `[unsafe] host_loopback = true`.
     #[serde(default)]
     pub upstream: Option<String>,
+
+    /// Session entropy budget for this host, in place of
+    /// `[network.dlp] session_entropy_budget` (ADR-0020). Meant for a
+    /// provider the policy already trusts with a credential, so it
+    /// requires a non-empty `allow_credentials` in the same block.
+    /// `None` = the session default. Omitted from serialization when
+    /// unset, so policies that don't use it hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_entropy_budget: Option<u64>,
 }
 
 /// Where a `[[host]]` block's traffic is actually dialled.
@@ -94,6 +103,18 @@ pub enum UpstreamTarget {
     /// A port on the host's loopback interface, reached through the
     /// pasta gateway.
     Loopback(u16),
+}
+
+/// Error returned for a `session_entropy_budget` on a block without
+/// credential scope.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "[[host]] '{domain}' sets session_entropy_budget without allow_credentials; \
+     a per-host entropy budget is only for a destination the policy already trusts \
+     with a credential"
+)]
+pub struct EntropyBudgetWithoutCredentials {
+    pub domain: String,
 }
 
 /// Error returned for a malformed `upstream` value.
@@ -115,6 +136,9 @@ impl HostBlock {
     ///   shrink it).
     /// - `contract_mode` is last-Some-wins, matching the rest of the
     ///   `Option<T>` policy fields.
+    /// - `session_entropy_budget` takes the **min** of the two: a later
+    ///   recipe can tighten a host's budget but never raise one an earlier
+    ///   recipe set. It can still introduce one where none was set.
     pub fn merge(self, overlay: Self) -> Self {
         debug_assert_eq!(
             self.domain, overlay.domain,
@@ -132,7 +156,35 @@ impl HostBlock {
             allow_credentials: union_vecs(self.allow_credentials, overlay.allow_credentials),
             contract_mode: overlay.contract_mode.or(self.contract_mode),
             upstream: overlay.upstream.or(self.upstream),
+            session_entropy_budget: match (
+                self.session_entropy_budget,
+                overlay.session_entropy_budget,
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
         }
+    }
+
+    /// Reject a `session_entropy_budget` on a block that grants no
+    /// credential scope.
+    pub fn validate(&self) -> Result<(), EntropyBudgetWithoutCredentials> {
+        if self.session_entropy_budget.is_some() && self.allow_credentials.is_empty() {
+            return Err(EntropyBudgetWithoutCredentials {
+                domain: self.domain.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The session entropy budget this block sets for its host, if it is
+    /// allowed to set one. A block without credential scope never does,
+    /// however it was constructed.
+    pub fn entropy_budget_override(&self) -> Option<u64> {
+        if self.allow_credentials.is_empty() {
+            return None;
+        }
+        self.session_entropy_budget
     }
 
     /// Parse the `upstream` override. `None` means "dial the real
@@ -395,5 +447,97 @@ mod tests {
         assert_eq!(npm.methods, vec!["GET"]);
         let pypi = merged.iter().find(|h| h.domain == "pypi.org").unwrap();
         assert_eq!(pypi.methods, vec!["GET"]);
+    }
+
+    fn provider(budget: Option<u64>) -> HostBlock {
+        HostBlock {
+            domain: "api.provider.example".into(),
+            allow_credentials: vec!["anthropic_key".into()],
+            session_entropy_budget: budget,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_entropy_budget_parses() {
+        let hosts = parse(
+            r#"
+            [[host]]
+            domain = "api.anthropic.com"
+            allow_credentials = ["anthropic_key"]
+            session_entropy_budget = 1048576
+        "#,
+        );
+        assert_eq!(hosts[0].session_entropy_budget, Some(1_048_576));
+        assert_eq!(hosts[0].entropy_budget_override(), Some(1_048_576));
+        assert!(hosts[0].validate().is_ok());
+    }
+
+    #[test]
+    fn session_entropy_budget_defaults_to_none() {
+        let hosts = parse("[[host]]\ndomain = \"x\"\n");
+        assert_eq!(hosts[0].session_entropy_budget, None);
+        assert_eq!(hosts[0].entropy_budget_override(), None);
+    }
+
+    #[test]
+    fn session_entropy_budget_without_credentials_is_invalid() {
+        let block = HostBlock {
+            allow_credentials: Vec::new(),
+            ..provider(Some(4096))
+        };
+        assert_eq!(
+            block.validate(),
+            Err(EntropyBudgetWithoutCredentials {
+                domain: "api.provider.example".into()
+            })
+        );
+    }
+
+    #[test]
+    fn session_entropy_budget_without_credentials_is_never_honoured() {
+        // A block built in code skips `validate`; the override still needs
+        // credential scope to take effect.
+        let block = HostBlock {
+            allow_credentials: Vec::new(),
+            ..provider(Some(4096))
+        };
+        assert_eq!(block.entropy_budget_override(), None);
+    }
+
+    #[test]
+    fn merge_session_entropy_budget_takes_min() {
+        let low = provider(Some(64 * 1024));
+        let high = provider(Some(1024 * 1024));
+        assert_eq!(
+            low.clone().merge(high.clone()).session_entropy_budget,
+            Some(64 * 1024),
+            "a later recipe cannot raise an earlier budget"
+        );
+        assert_eq!(
+            high.merge(low).session_entropy_budget,
+            Some(64 * 1024),
+            "a later recipe can lower an earlier budget"
+        );
+    }
+
+    #[test]
+    fn merge_session_entropy_budget_keeps_the_only_value() {
+        assert_eq!(
+            provider(Some(4096))
+                .merge(provider(None))
+                .session_entropy_budget,
+            Some(4096)
+        );
+        assert_eq!(
+            provider(None)
+                .merge(provider(Some(4096)))
+                .session_entropy_budget,
+            Some(4096)
+        );
+        assert_eq!(
+            provider(None).merge(provider(None)).session_entropy_budget,
+            None
+        );
     }
 }
