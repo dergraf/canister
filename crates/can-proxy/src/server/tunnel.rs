@@ -20,8 +20,8 @@ use super::util::parse_host_from_authority;
 use crate::ca::DynamicCa;
 use crate::policy::OutboundPolicy;
 
-// 9 distinct args, all genuinely required: TLS materials, dial state,
-// gates, dlp ctx, capture ctx. Bundling into one struct just shifts the
+// 10 distinct args, all genuinely required: TLS materials, dial state,
+// gates, dlp ctx, capture ctx, sink pin. Bundling into one struct just shifts the
 // noise.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_tunnel(
@@ -34,6 +34,7 @@ pub(super) async fn handle_tunnel(
     limits: ProxyLimits,
     dlp: DlpCtx,
     capture: Option<CaptureCtx>,
+    tunnel_sunk: bool,
 ) -> Result<(), std::io::Error> {
     let host = parse_host_from_authority(&host_with_port);
     debug!("Establishing TLS tunnel for {}", host);
@@ -66,6 +67,7 @@ pub(super) async fn handle_tunnel(
                     limits.clone(),
                     Some(dlp.clone()),
                     capture.clone(),
+                    tunnel_sunk,
                 )
             }),
         )

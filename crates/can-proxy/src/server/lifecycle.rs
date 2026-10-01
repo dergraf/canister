@@ -235,6 +235,14 @@ impl ProxyServer {
             );
         }
 
+        if outbound_policy.sinks_undeclared() && dlp.is_none() {
+            tracing::warn!(
+                "undeclared_hosts = \"sink\" needs the DLP pipeline, which is off; \
+                 undeclared hosts will be refused instead (set `egress = \"proxy\"`)"
+            );
+            outbound_policy.undeclared_hosts = can_policy::config::UndeclaredHosts::Refuse;
+        }
+
         let capture = CaptureCtx::from_config(&config);
         if capture.is_some() && dlp.is_none() {
             tracing::warn!(

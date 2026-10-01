@@ -58,6 +58,10 @@ pub(super) enum ErrorKind {
         detail: String,
         patch: String,
     },
+    /// The request was for an undeclared host and was answered by the
+    /// sink (ADR-0018). Identical whatever the detectors found, so the
+    /// workload cannot use the sink to probe them.
+    Sinked,
 }
 
 impl<'a> ProxyError<'a> {
@@ -96,6 +100,10 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn bad_request(host: &'a str) -> Self {
         Self::new(ErrorKind::BadRequest, host)
+    }
+
+    pub(super) fn sinked(host: &'a str) -> Self {
+        Self::new(ErrorKind::Sinked, host)
     }
 
     /// Build a contract refusal from a [`crate::contracts::ContractViolation`].
@@ -233,6 +241,11 @@ impl<'a> ProxyError<'a> {
                 "Bad Request".to_string(),
                 "bad-request",
             ),
+            ErrorKind::Sinked => (
+                StatusCode::FORBIDDEN,
+                SINK_BODY.to_string(),
+                "undeclared-host-sink",
+            ),
             ErrorKind::ContractRefused {
                 reason,
                 detail,
@@ -278,6 +291,10 @@ impl<'a> ProxyError<'a> {
     }
 }
 
+/// Body of every sink answer. Fixed, so it carries nothing about the
+/// request or about what the detectors found.
+pub(super) const SINK_BODY: &str = "Forbidden: host not declared; request not forwarded";
+
 /// Map an error-kind string to its `'static str` form. We have a closed
 /// set of variants here so a `match` is simpler than runtime interning.
 fn static_str(kind: &str) -> &'static str {
@@ -289,6 +306,7 @@ fn static_str(kind: &str) -> &'static str {
         "upstream-error" => "upstream-error",
         "bad-request" => "bad-request",
         "contract-refused" => "contract-refused",
+        "undeclared-host-sink" => "undeclared-host-sink",
         _ => "proxy-error",
     }
 }
