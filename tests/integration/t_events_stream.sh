@@ -168,6 +168,19 @@ case "$HASH_A" in
 esac
 
 # ---------------------------------------------------------------------------
+begin_test "policy_resolved states the unsafe settings, even when none are on"
+UNSAFE_A=$(python3 - "$POLICY_A" <<'PYEOF'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    event = json.loads(line)
+    if event["event"] == "policy_resolved":
+        print(json.dumps(event["data"]["policy"].get("unsafe"), sort_keys=True))
+        break
+PYEOF
+)
+assert_eq '{"expose_ports": [], "extra_syscalls": [], "host_loopback": false, "reachable_ips": [], "seccomp_default_allow": false, "unfiltered_egress": false}' "$UNSAFE_A"
+
+# ---------------------------------------------------------------------------
 begin_test "a different policy produces a different hash"
 CONFIG_B=$(tmpconfig <<'EOF'
 [filesystem]
