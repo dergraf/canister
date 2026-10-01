@@ -766,7 +766,9 @@ fn generate_cli_reference(out_dir: &Path) -> Result<()> {
             }
 
             // Subcommands
-            let subcommands = ["run", "up", "check", "setup", "recipe", "init", "update"];
+            let subcommands = [
+                "run", "up", "check", "setup", "recipe", "init", "update", "keygen", "pubkey",
+            ];
             for cmd in &subcommands {
                 out.push_str(&format!("## `can {cmd}`\n\n"));
                 if let Ok(help) = get_help(&bin, &[cmd]) {

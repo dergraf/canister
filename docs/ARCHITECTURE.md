@@ -1219,6 +1219,21 @@ entered and never reaches the workload. A stream with no seal is
 *unsealed*, not invalid — a killed process never gets to sign, and
 crashing is not forgery. See ADR-0016.
 
+`can keygen <path>` writes a new key — the 32-byte seed as 64 hex
+characters, mode 0600 — and prints its public key; it refuses to
+replace an existing file without `--force`. `can pubkey <path>` prints
+the public key of any key file `--events-sign-key` accepts. Both print
+64 lowercase hex characters, exactly the `public_key` a `stream_seal`
+carries, so the line goes into a consumer's trusted keys verbatim. The
+seed itself is never printed (ADR-0021):
+
+```
+$ can keygen ci-seal.key
+d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+$ can pubkey ci-seal.key
+d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+```
+
 ---
 
 ## Mandatory Access Control (MAC)

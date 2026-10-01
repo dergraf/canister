@@ -36,6 +36,8 @@ EXPECTED_SUBCOMMANDS=(
     "recipe"
     "init"
     "update"
+    "keygen"
+    "pubkey"
     "help"
 )
 
@@ -70,7 +72,7 @@ assert_match "$RUN_STDOUT" '^can [0-9]+\.[0-9]+\.[0-9]+'
 
 # ---- Test 3: each subcommand --help works ----
 # Skip 'help' (it's the help command itself and behaves differently).
-HELPABLE=("up" "run" "check" "setup" "recipe" "init" "update")
+HELPABLE=("up" "run" "check" "setup" "recipe" "init" "update" "keygen" "pubkey")
 for cmd in "${HELPABLE[@]}"; do
     begin_test "can ${cmd} --help exits 0 and includes Usage:"
     run_can "$cmd" --help
