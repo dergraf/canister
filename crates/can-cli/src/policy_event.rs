@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 pub fn resolved(config: &SandboxConfig) -> SandboxConfig {
     let mut resolved = config.clone();
     resolved.network.egress = Some(resolved.network.egress());
+    resolved.network.undeclared_hosts = Some(resolved.network.undeclared_hosts());
     resolved.syscalls.seccomp_mode = Some(resolved.syscalls.seccomp_mode());
     resolved
 }
@@ -92,6 +93,10 @@ mod tests {
         let resolved = resolved(&bare);
 
         assert_eq!(resolved.network.egress, Some(bare.network.egress()));
+        assert_eq!(
+            resolved.network.undeclared_hosts,
+            Some(can_policy::config::UndeclaredHosts::Refuse)
+        );
         assert_eq!(
             resolved.syscalls.seccomp_mode,
             Some(bare.syscalls.seccomp_mode())
@@ -256,5 +261,18 @@ mod tests {
         let (policy, _) = canonical(&config()).expect("canonical");
 
         assert_eq!(policy["network"]["egress"], "proxy");
+    }
+
+    #[test]
+    fn the_rendered_policy_reports_how_undeclared_hosts_are_handled() {
+        let (default_policy, default_hash) = canonical(&config()).expect("canonical");
+        assert_eq!(default_policy["network"]["undeclared_hosts"], "refuse");
+
+        let mut sink = config();
+        sink.network.undeclared_hosts = Some(can_policy::config::UndeclaredHosts::Sink);
+        let (sink_policy, sink_hash) = canonical(&sink).expect("canonical");
+
+        assert_eq!(sink_policy["network"]["undeclared_hosts"], "sink");
+        assert_ne!(default_hash, sink_hash);
     }
 }
