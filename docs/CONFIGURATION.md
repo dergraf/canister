@@ -89,7 +89,7 @@ Each sandbox can include optional override sections that merge on top of the
 composed recipes. These use the same schema as recipe files:
 
 - `[sandbox.<name>.filesystem]` — `read`, `write`, `deny`
-- `[sandbox.<name>.network]` — `egress` (`none`/`proxy`), `contract_mode`
+- `[sandbox.<name>.network]` — `egress` (`none`/`proxy`), `contract_mode`, `undeclared_hosts`
 - `[[sandbox.<name>.host]]` — one or more per-destination contracts (see [`[[host]]`](#host) below)
 - `[sandbox.<name>.process]` — `max_pids`, `exec`, `env_passthrough`
 - `[sandbox.<name>.resources]` — `memory_mb`, `cpu_percent`
@@ -202,6 +202,7 @@ When multiple recipes are merged, each field type follows a specific strategy:
 | `Vec` fields (paths, domains, syscalls, env vars) | **Union** — deduplicated, order preserved | Two recipes allowing `/a` and `/b` → `["/a", "/b"]` |
 | `strict` (`Option<bool>`) | **OR** — any `Some(true)` wins, can never be loosened | Recipe A: `strict = true`, Recipe B: omitted → `true` |
 | `egress` (`Option<EgressMode>`) | **Last-Some-wins** — `None` preserves earlier value | Recipe A: `egress = "none"`, Recipe B: `egress = "proxy"` → `proxy` |
+| `undeclared_hosts` (`Option<UndeclaredHosts>`) | **Refuse-wins** — an explicit `refuse` in any layer stays; otherwise any `sink` wins | Recipe A: `undeclared_hosts = "refuse"`, Recipe B: `undeclared_hosts = "sink"` → `refuse` |
 | `[unsafe]` fields (bools / vecs) | **OR / union** — security-monotonic, a weakening in any layer stays | Recipe A: `host_loopback = true`, Recipe B: omitted → `true` |
 | Numeric (`max_pids`, `memory_mb`, `cpu_percent`) | **Last-Some-wins** | Recipe A: `max_pids = 64`, Recipe B: `max_pids = 128` → `128` |
 | `RecipeMeta` | **Overlay** — later recipe's metadata wins if present | — |
@@ -376,6 +377,7 @@ explicitly allowed.
 |-------|------|---------|-------------|
 | `egress` | `"proxy" \| "none"` | `"proxy"` | Outbound networking mode. Unfiltered/direct egress is `[unsafe] unfiltered_egress` (it disables DLP + contract gates). |
 | `contract_mode` | `"strict" \| "relaxed"` | `"strict"` | Default for hosts without a `[[host]]` block. `strict` refuses; `relaxed` allows + logs. |
+| `undeclared_hosts` | `"refuse" \| "sink"` | `"refuse"` | What the proxy does with a request for a host no `[[host]]` block declares. `refuse` turns it away at the connect gate; `sink` scans it with DLP and canaries and answers it locally. Neither forwards it. See [Undeclared hosts](#undeclared-hosts). |
 
 IP-literal egress (`reachable_ips`) and port forwarding (`expose_ports`)
 moved to [`[unsafe]`](#unsafe): both bypass the per-host contract and DLP
@@ -398,6 +400,53 @@ The effective egress mode determines isolation behavior:
 Specifying `[unsafe] expose_ports` automatically upgrades None mode to
 Filtered mode (port forwarding requires a functional network namespace
 with pasta).
+
+### Undeclared hosts
+
+By default a request for a host with no `[[host]]` block is refused at
+the proxy's connect gate (`502`, `x-canister-error: policy-blocked`). The
+event stream records that the workload tried to reach the host, but not
+what it was about to send: no body ever reaches the DLP and canary
+detectors.
+
+`undeclared_hosts = "sink"` answers that question without letting
+anything out:
+
+```toml
+[network]
+undeclared_hosts = "sink"
+```
+
+For a request to an undeclared host name, the proxy then
+
+1. accepts the `CONNECT` and terminates TLS with the sandbox CA, exactly
+   as it does for a declared host (plain HTTP is handled the same way,
+   without the TLS step);
+2. runs the request through the same DLP and canary detectors as a
+   declared host's request — headers, URI, body, trailers — emitting
+   `dlp_block` and `canary_fire` events as usual;
+3. answers it itself with `403`, `x-canister-error: undeclared-host-sink`
+   and a fixed body, whatever the detectors found;
+4. **never** resolves the name or opens a connection to it.
+
+Every request (and every accepted `CONNECT`) to an undeclared host emits
+`egress_request` with `decision: "blocked"` and `reason: "sink"`. With
+`--capture-exchanges`, the sunk request is captured like any other.
+
+Limits:
+
+- Only host *names* are sunk. An IP literal outside `reachable_ips` is
+  still refused at the connect gate.
+- The sink needs the DLP pipeline, which `egress = "proxy"` turns on.
+  Without it the proxy logs a warning and refuses as by default.
+- Under `contract_mode = "relaxed"` an undeclared host is allowed, not
+  sunk. The sink only replaces refusals.
+- Every request on a `CONNECT` tunnel the sink accepted is sunk, whatever
+  `Host` it names.
+
+When recipes are composed, an explicit `refuse` in any layer wins over
+`sink`, so a layer that pins the narrower behaviour cannot be widened by
+a later one. See [ADR-0018](adr/0018-undeclared-host-sink.md).
 
 **Domain matching:**
 

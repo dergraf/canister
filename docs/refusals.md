@@ -12,6 +12,7 @@ read the body.
 | DLP detection        | `451 …Legal Reasons`  | `dlp-blocked`             | A credential / canary fired the regex             |
 | Upstream timeout     | `504 Gateway Timeout` | `upstream-timeout`        | Upstream didn't respond in time                   |
 | Body too large       | `413 Payload Too Large` | `body-too-large`        | Body exceeded the streamed-body cap                |
+| Undeclared-host sink | `403 Forbidden`       | `undeclared-host-sink`    | Host has no `[[host]]` block and `[network] undeclared_hosts = "sink"`: the request was scanned, then answered locally, never forwarded |
 
 The two you'll see most often once a sandbox is running are
 **contract refusals** and **DLP detections**. They look superficially
