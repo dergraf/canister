@@ -113,7 +113,7 @@ mod tests {
             read: vec![PathBuf::from("/usr/lib"), PathBuf::from("/tmp/workspace")],
             write: vec![],
             deny: vec![],
-            mask: vec![],
+            ..FilesystemConfig::default()
         };
         assert_eq!(
             check_path(Path::new("/usr/lib/python3"), &config),
@@ -135,7 +135,7 @@ mod tests {
             read: vec![PathBuf::from("/etc")],
             write: vec![],
             deny: vec![PathBuf::from("/etc/shadow")],
-            mask: vec![],
+            ..FilesystemConfig::default()
         };
         assert_eq!(
             check_path(Path::new("/etc/hostname"), &config),
