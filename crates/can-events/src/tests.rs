@@ -79,16 +79,26 @@ fn envelope_has_expected_fields_and_order() {
     let stream = EventStream::with_writer("r-1", StreamId::Cli, Box::new(buf.clone()));
     stream.emit(&run_start());
 
+    // The envelope's field order is a contract (ADR-0010); the order of
+    // the keys inside `data` is not, so `data` is compared as a value.
     let line = buf.lines().remove(0);
     assert!(line.starts_with(r#"{"schema":1,"run_id":"r-1","stream":"cli","seq":0,"ts_ms":"#));
     assert!(line.contains(r#""event":"run_start""#));
-    assert!(line.contains(r#""data":{"can_version":"0.1.0""#));
     assert!(line.ends_with("\"}"), "chain_hash must be the last field");
 
     let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
     assert_eq!(parsed["schema"], 1);
     assert_eq!(parsed["stream"], "cli");
-    assert_eq!(parsed["data"]["sandbox"], "ci");
+    assert_eq!(
+        parsed["data"],
+        serde_json::json!({
+            "can_version": "0.1.0",
+            "command": ["python3", "agent.py"],
+            "sandbox": "ci",
+            "monitor": false,
+            "strict": true,
+        })
+    );
 }
 
 #[test]
