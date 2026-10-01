@@ -196,7 +196,8 @@ Per request, the proxy runs:
    - scoped    → BLOCK if destination not in home/extras
    - bearer    → BLOCK unless the destination's `[[host]]` block lists `"bearer_token"` in `allow_credentials`
    - generic   → WARN (BLOCK in --strict)
-5. Session entropy budget update; BLOCK if exceeded.
+5. Charge the body's not-yet-delivered high-entropy bytes to the
+   destination host's entropy budget; BLOCK if exceeded.
 6. Build response:
    - On allow: forward upstream with `update_content_length()` if body
      was buffered.
@@ -264,17 +265,50 @@ applies regardless of L7 protocol.
 
 ## Session Entropy Budget
 
-A sandbox session keeps a `SessionEntropyBudget` (default 8192 bytes).
-After each request scan, the count of high-entropy bytes (Shannon
-entropy > 4.0 in any 32-byte sliding window) is recorded against the
-budget. When the budget is exhausted, further requests are blocked.
+Each destination host has its own entropy budget for the sandbox session
+(default 8192 bytes, `[network.dlp] session_entropy_budget`). After a
+request body passes the pattern scan, its high-entropy bytes (32-byte
+windows with Shannon entropy above 4.0 bits) are charged to the budget of
+the host it is going to. When a request takes a host past its budget, it
+is blocked with `451`, `x-canister-error: dlp-blocked` and
+`x-canister-dlp-detector: entropy-budget`, and so is every later request that charges anything
+to that host. Other hosts are unaffected.
 
-This catches **slow exfiltration**: a credential split across many small
-requests, each individually below the per-request entropy threshold but
-collectively well above plausible legitimate traffic patterns.
+This catches **slow exfiltration**: a credential or an encrypted blob
+split across many small requests, each individually unremarkable but
+collectively well above plausible legitimate traffic to that host.
 
-The budget is per `ProxyServer` instance, which is one per sandbox
-session — it resets when the sandbox exits.
+**What is charged.** Only high-entropy windows the host has not already
+been sent in this session (ADR-0020). A tool loop resends the whole
+conversation on every turn; charging it again made the total grow with
+the square of the turn count. The proxy remembers keyed digests of every
+window a host received and charges a window only the first time. The
+record is scoped by host, request path and query, and credential headers
+(`Authorization`, `Cookie`, `x-api-key`, …), so the same bytes sent to
+another host, another endpoint or another account are charged again.
+A refused body is not remembered, repeats within one body are each
+charged, and a host's record is capped at about a million windows; past
+the cap, resent bytes are charged again.
+
+**Per-host budget.** A provider that legitimately receives a lot of
+high-entropy data — a reasoning model's signed thinking blocks add about
+1 KB per turn — can be given its own budget on its `[[host]]` block. It
+requires `allow_credentials` in the same block, so it is only available
+for a destination the policy already trusts with a credential:
+
+```toml
+[[host]]
+domain                 = "api.anthropic.com"
+allow_credentials      = ["anthropic_key"]
+session_entropy_budget = 1048576   # 1 MiB for this host only
+```
+
+**Scope.** Budgets are per proxy instance, which is one per sandbox
+session; they reset when the sandbox exits. Only bodies buffered for the
+full scan (up to `[proxy] max_buffered_body_bytes`, 8 MiB by default)
+are charged; larger bodies go through the streaming scan, which does not
+charge the budget. Under `--monitor` an over-budget request is logged and
+forwarded but not remembered, so a resend of it is charged again.
 
 ---
 
@@ -424,7 +458,7 @@ canary_tokens = true              # default when DLP is enabled
 max_decode_depth = 32             # encoding chain recursion cap
 decompress = true                 # gzip/deflate/brotli before scan
 dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
-session_entropy_budget = 8192     # cumulative high-entropy bytes/session
+session_entropy_budget = 8192     # high-entropy bytes per host per session
 
 # Env-var secrets to fake-and-swap (see Fake-Secret Swap above). Each
 # entry names the env var the real secret arrives in and the credential
@@ -449,7 +483,7 @@ auto-detected → explicit `-r` → manifest overrides), each field uses:
 | `max_decode_depth` | last-Some-wins | Numeric tuning |
 | `decompress` | last-Some-wins | |
 | `dns_entropy_threshold` | last-Some-wins | |
-| `session_entropy_budget` | last-Some-wins | |
+| `session_entropy_budget` | last-Some-wins | Session default; `[[host]] session_entropy_budget` takes the min |
 
 This guarantees a downstream recipe can never *disable* DLP that an
 upstream recipe enabled, and can never *shrink* the scope set.

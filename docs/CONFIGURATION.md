@@ -530,13 +530,16 @@ upstream = "loopback:4101"
 | `max_request_bytes` | `u64` | unset | Per-host request body cap. Applies after the global `max_streamed_body_bytes`. |
 | `allow_credentials` | `string[]` | `[]` | DLP detector ids whose verdicts on this host downgrade from `Block` to `Warn` (e.g. `["github_pat"]` means the worker may legitimately carry a github PAT in `Authorization` to this host). |
 | `contract_mode` | `"strict" \| "relaxed"` | inherit `[network] contract_mode` | Per-host override of the global default. Only affects the unknown-host decision once you're inside this block; field-level checks still run. |
+| `session_entropy_budget` | `u64` | unset | This host's session entropy budget, in place of `[network.dlp] session_entropy_budget`. For a provider that legitimately receives a lot of high-entropy data (a reasoning model's thinking blocks). Requires `allow_credentials` in the same block; dropped with it for untrusted recipes. See [ADR-0020](adr/0020-entropy-budget-for-multi-turn-agents.md). |
 | `upstream` | `string` | unset | Dial this host on the *host's* loopback instead of the real destination: `"loopback:<port>"`. TLS is terminated by the proxy as usual and the loopback hop is plain HTTP; the `Host` header keeps the original name. Requires `[network] allow_host_loopback = true`; a malformed value or a missing `allow_host_loopback` is refused at startup. See [ADR-0013](adr/0013-loopback-upstream-routing.md). |
 
 Multiple `[[host]]` entries with the same `domain` merge by:
-**union** on vec fields, **max** for `max_request_bytes`, **last-Some-wins**
-for `contract_mode` and `upstream`. A project recipe can extend (never silently
-restrict) a canister-shipped contract by writing another `[[host]]`
-with the same domain.
+**union** on vec fields, **max** for `max_request_bytes`, **min** for
+`session_entropy_budget`, **last-Some-wins** for `contract_mode` and
+`upstream`. A project recipe can extend (never silently restrict) a
+canister-shipped contract by writing another `[[host]]` with the same
+domain; the one exception is `session_entropy_budget`, which a later
+recipe can lower but never raise.
 
 ### Refusal behaviour
 
@@ -585,7 +588,7 @@ canary_tokens = true              # default when DLP is enabled
 max_decode_depth = 32             # base64/hex/percent recursion cap
 decompress = true                 # gzip/deflate/brotli before scan
 dns_entropy_threshold = 4.5       # Shannon entropy per DNS label
-session_entropy_budget = 8192     # cumulative high-entropy bytes/session
+session_entropy_budget = 8192     # high-entropy bytes per host per session
 
 # Env-var secrets to fake-and-swap: the sandbox runs with a fake value,
 # the proxy substitutes the real one only on egress to a host authorised
@@ -611,7 +614,7 @@ allow_credentials = ["github_pat"]
 | `max_decode_depth` | `usize` | `32` | Encoding chain recursion depth (base64 / hex / percent). |
 | `decompress` | `bool` | `true` | Inflate gzip / deflate / brotli bodies before scanning. |
 | `dns_entropy_threshold` | `f64` | `4.5` | Shannon entropy per DNS label above which the hostname is blocked. |
-| `session_entropy_budget` | `u64` | `8192` | Cumulative high-entropy bytes allowed across one sandbox session before further requests are blocked. |
+| `session_entropy_budget` | `u64` | `8192` | High-entropy bytes each destination host may be sent in one sandbox session before requests to it are blocked. Bytes a host was already sent are not charged again. Override per host with `[[host]] session_entropy_budget`. See [DLP](DLP.md#session-entropy-budget). |
 | `external_canaries` | `{ value, data_class, allowed_hosts }[]` | `[]` | Values planted in the workload's *input data* by an orchestrator, each tagged with the class of data it stands for and the destinations allowed to see it. Recognised on egress like generated canaries, but a hit on an allowed host is recorded (`canary_fire` with `allowed: true`) instead of blocked; any other host is a leak. Never injected into the sandbox environment. Also settable per run with `--canaries-file`. See [ADR-0012](adr/0012-external-tagged-canaries.md). |
 | `fake_secrets` | `{ env, credential }[]` | `[]` | Env-var secrets the sandbox never sees in cleartext: it receives a fake matching `credential`'s pattern, and the proxy swaps in the real host value only on egress to a host authorised for that credential. `credential` must be a detector with a generatable pattern (`github_pat`, `npm_token`, `openai_key`, `anthropic_key`, `slack_token`, `stripe_key`). Dropped for untrusted recipes, like `allow_credentials`. See [DLP](DLP.md#fake-secret-swap). |
 
