@@ -1523,3 +1523,52 @@ session_entropy_budget = 1073741824
     assert_eq!(host.entropy_budget_override(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn decoys_parse_expand_and_merge_as_a_union() {
+    unsafe { std::env::set_var("_CANISTER_TEST_DECOY_HOME", "/home/carol") };
+    let base: RecipeFile = toml::from_str(
+        r#"
+[filesystem]
+decoy = ["$_CANISTER_TEST_DECOY_HOME/.ssh/id_ed25519"]
+"#,
+    )
+    .unwrap();
+    let extra: RecipeFile = toml::from_str(
+        r#"
+[filesystem]
+decoy = ["$_CANISTER_TEST_DECOY_HOME/.aws/credentials", "$_CANISTER_TEST_DECOY_HOME/.ssh/id_ed25519"]
+"#,
+    )
+    .unwrap();
+
+    let config = base.merge(extra).into_sandbox_config().unwrap();
+    unsafe { std::env::remove_var("_CANISTER_TEST_DECOY_HOME") };
+
+    assert_eq!(
+        config.filesystem.decoy,
+        vec![
+            PathBuf::from("/home/carol/.ssh/id_ed25519"),
+            PathBuf::from("/home/carol/.aws/credentials"),
+        ]
+    );
+    assert!(config.filesystem.decoys.is_empty());
+}
+
+#[test]
+fn a_recipe_without_decoys_serializes_as_before() {
+    // Materialised decoys are `serde(skip)`, so they never serialize either.
+    let config: FilesystemConfig = toml::from_str("read = [\"/usr/lib\"]\n").unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+    assert!(
+        !serialized.contains("decoy"),
+        "an empty list must not change policy hashes"
+    );
+}
+
+#[test]
+fn decoys_cannot_be_materialised_from_a_recipe() {
+    let result: Result<FilesystemConfig, _> =
+        toml::from_str("decoys = [{source = \"/x\", target = \"/y\"}]\n");
+    assert!(result.is_err());
+}

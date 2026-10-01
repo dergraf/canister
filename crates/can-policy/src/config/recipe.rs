@@ -261,7 +261,8 @@ impl RecipeFile {
     /// - `seccomp_mode` → `AllowList`
     ///
     /// Expands environment variables (`$HOME`, `$USER`, etc.) in:
-    /// - `filesystem.allow` / `filesystem.allow_write` / `filesystem.deny`
+    /// - `filesystem.allow` / `filesystem.allow_write` / `filesystem.deny` /
+    ///   `filesystem.decoy`
     /// - `process.allow_execve`
     pub fn into_sandbox_config(self) -> Result<SandboxConfig, ConfigError> {
         Ok(SandboxConfig {
@@ -271,6 +272,8 @@ impl RecipeFile {
                 write: expand_paths(self.filesystem.write),
                 deny: expand_paths(self.filesystem.deny),
                 mask: self.filesystem.mask,
+                decoy: expand_paths(self.filesystem.decoy),
+                decoys: Vec::new(),
             },
             // Fold the [unsafe] block back into the runtime network config:
             // these knobs live in [unsafe] for authoring visibility but the

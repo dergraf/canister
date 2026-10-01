@@ -39,6 +39,29 @@ pub struct FilesystemConfig {
     /// expected in recipe TOML files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask: Vec<PathBuf>,
+
+    /// Tripwires: paths where an empty decoy file is placed, read-only,
+    /// so that any access to it is reported as an `fs_access` event
+    /// (ADR-0019). Meant for well-known credential locations
+    /// (`$HOME/.ssh/id_ed25519`, `$HOME/.aws/credentials`). A real grant
+    /// always wins: a decoy is never placed where a `read` or `write`
+    /// path, or the working directory, already provides something.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoy: Vec<PathBuf>,
+
+    /// The decoys the CLI materialised on the host for this run, and
+    /// where each appears in the sandbox. Set programmatically, never
+    /// read from a recipe.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub decoys: Vec<DecoyMount>,
+}
+
+/// A host decoy file and the sandbox path it is mounted at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoyMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
 }
 
 impl FilesystemConfig {
@@ -48,6 +71,8 @@ impl FilesystemConfig {
             write: union_vecs(self.write, overlay.write),
             deny: union_vecs(self.deny, overlay.deny),
             mask: union_vecs(self.mask, overlay.mask),
+            decoy: union_vecs(self.decoy, overlay.decoy),
+            decoys: Vec::new(),
         }
     }
 }
