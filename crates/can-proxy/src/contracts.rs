@@ -104,6 +104,12 @@ impl ContractTable {
             .unwrap_or(self.default_mode)
     }
 
+    /// Whether `check` would refuse `host` as [`ContractViolation::UnknownHost`]
+    /// — no block matches and the global mode is `Strict`.
+    pub fn refuses_as_unknown(&self, host: &str) -> bool {
+        self.default_mode == ContractMode::Strict && self.lookup(host).is_none()
+    }
+
     /// Check a request shape against the resolved contract. Returns
     /// `Some(violation)` if the request must be refused, `None`
     /// otherwise.
@@ -238,6 +244,20 @@ mod tests {
     fn unknown_host_relaxed_allows() {
         let t = ContractTable::new(vec![block("github.com")], ContractMode::Relaxed);
         assert!(t.check("evil.example.com", &shape("GET", "/")).is_none());
+    }
+
+    #[test]
+    fn refuses_as_unknown_agrees_with_check() {
+        let strict = ContractTable::new(vec![block("github.com")], ContractMode::Strict);
+        assert!(strict.refuses_as_unknown("evil.example.com"));
+        assert!(!strict.refuses_as_unknown("github.com"));
+        assert!(!strict.refuses_as_unknown("api.github.com"));
+
+        let relaxed = ContractTable::new(vec![block("github.com")], ContractMode::Relaxed);
+        assert!(!relaxed.refuses_as_unknown("evil.example.com"));
+
+        let empty = ContractTable::new(Vec::new(), ContractMode::Strict);
+        assert!(empty.refuses_as_unknown("anything.example"));
     }
 
     #[test]

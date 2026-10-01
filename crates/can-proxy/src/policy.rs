@@ -22,6 +22,10 @@ pub struct OutboundPolicy {
     /// instead of the real destination (`[[host]] upstream =
     /// "loopback:<port>"`, ADR-0013). Keyed by lower-cased domain.
     pub loopback_upstreams: HashMap<String, u16>,
+    /// What happens to a request for a host no `[[host]]` block declares
+    /// (ADR-0018). `ProxyServer::new` forces `Refuse` when DLP is off,
+    /// because the sink exists to scan and has nothing to scan with.
+    pub undeclared_hosts: can_policy::config::UndeclaredHosts,
 }
 
 impl Default for OutboundPolicy {
@@ -45,6 +49,7 @@ impl Default for OutboundPolicy {
             enforce_ip_policy: false,
             host_loopback_target: None,
             loopback_upstreams: HashMap::new(),
+            undeclared_hosts: can_policy::config::UndeclaredHosts::Refuse,
         }
     }
 }
@@ -64,6 +69,7 @@ impl OutboundPolicy {
                 .map(|h| h.domain.to_ascii_lowercase())
                 .collect(),
             enforce_ip_policy: !network.allow_ips.is_empty(),
+            undeclared_hosts: network.undeclared_hosts(),
             ..Self::default()
         };
 
@@ -88,6 +94,11 @@ impl OutboundPolicy {
         }
 
         policy
+    }
+
+    /// Whether undeclared hosts go to the sink instead of being refused.
+    pub fn sinks_undeclared(&self) -> bool {
+        self.undeclared_hosts == can_policy::config::UndeclaredHosts::Sink
     }
 
     /// The host-loopback port this host is routed to, if any.
@@ -189,6 +200,30 @@ mod tests {
         assert!(!policy.allows_host("example.org"));
         assert!(!policy.allows_host("notexample.org"));
         assert!(!policy.allows_host("example.org.evil.com"));
+    }
+
+    #[test]
+    fn undeclared_hosts_are_refused_by_default() {
+        let net = can_policy::config::NetworkConfig::default();
+        let policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
+
+        assert!(!policy.sinks_undeclared());
+        assert!(!OutboundPolicy::default().sinks_undeclared());
+    }
+
+    #[test]
+    fn undeclared_hosts_sink_is_read_from_network_config() {
+        let net = can_policy::config::NetworkConfig {
+            undeclared_hosts: Some(can_policy::config::UndeclaredHosts::Sink),
+            ..Default::default()
+        };
+        let policy = OutboundPolicy::from_config(&net, &[host("hex.pm")]);
+
+        assert!(policy.sinks_undeclared());
+        assert!(
+            !policy.allows_host("google.com"),
+            "the sink does not widen what may be dialled"
+        );
     }
 
     #[test]

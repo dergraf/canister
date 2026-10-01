@@ -77,6 +77,7 @@ pub(super) async fn handle_proxy_request(
                 limits,
                 Some(ctx),
                 capture,
+                false,
             )
             .await
         }
@@ -128,12 +129,20 @@ async fn handle_connect(
     // and performs a TLS handshake for an arbitrary destination — leaking
     // SNI to the proxy, costing cert-generation work, and (pre-fix) then
     // happily forwarding the request upstream regardless of allow lists.
-    if !host_allowed_by_outbound_policy(&host_name_only, &outbound_policy) {
-        crate::events::egress_blocked(&host_name_only, "CONNECT", "", "policy");
-        return Ok(
-            ProxyError::policy_blocked(&host_name_only, host_is_ip(&host_name_only))
-                .into_response(),
-        );
+    //
+    // The one exception is the undeclared-host sink (ADR-0018): it needs
+    // the TLS handshake to see the request, and the tunnel it gets is
+    // pinned to the sink, so nothing on it is ever forwarded.
+    let tunnel_sunk = !host_allowed_by_outbound_policy(&host_name_only, &outbound_policy);
+    if tunnel_sunk {
+        if dlp.is_none() || !super::sink::takes(&host_name_only, &outbound_policy, &contracts) {
+            crate::events::egress_blocked(&host_name_only, "CONNECT", "", "policy");
+            return Ok(
+                ProxyError::policy_blocked(&host_name_only, host_is_ip(&host_name_only))
+                    .into_response(),
+            );
+        }
+        crate::events::egress_blocked(&host_name_only, "CONNECT", "", crate::events::SINK_REASON);
     }
 
     let dlp_for_tunnel = dlp.clone();
@@ -152,6 +161,7 @@ async fn handle_connect(
                         limits.clone(),
                         ctx,
                         capture.clone(),
+                        tunnel_sunk,
                     )
                     .await
                     {
@@ -183,6 +193,10 @@ async fn handle_connect(
 /// Wraps the stage pipeline so that every proxied request produces
 /// exactly one `egress_request` event, classified from the response the
 /// pipeline returned.
+///
+/// `tunnel_sunk` is set for requests inside a CONNECT tunnel that the
+/// undeclared-host sink accepted: every request on it is sunk, whatever
+/// host it names.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_inner_request(
     req: Request<hyper::body::Incoming>,
@@ -193,6 +207,7 @@ pub(super) async fn handle_inner_request(
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
     capture: Option<CaptureCtx>,
+    tunnel_sunk: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let host = extract_host(&req);
     let method = req.method().to_string();
@@ -210,6 +225,7 @@ pub(super) async fn handle_inner_request(
         limits,
         dlp,
         recorder.as_mut(),
+        tunnel_sunk,
     )
     .await?;
 
@@ -238,8 +254,18 @@ async fn run_request_stages(
     limits: ProxyLimits,
     dlp: Option<DlpCtx>,
     mut recorder: Option<&mut ExchangeRecorder>,
+    tunnel_sunk: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     debug!("Intercepting request: {} {}", req.method(), req.uri());
+
+    // Stage 0: undeclared-host sink (ADR-0018). Scans, answers locally,
+    // never forwards. Requires DLP: without a scanner there is nothing
+    // for the sink to do, and `ProxyServer::new` turns it off.
+    if let Some(ctx) = dlp.as_ref() {
+        if tunnel_sunk || super::sink::takes(host, &outbound_policy, &contracts) {
+            return Ok(super::sink::answer(req, host, &limits, ctx, recorder).await);
+        }
+    }
 
     // Stage 1: policy gate (connect permission).
     if let Some(resp) = gate_by_policy(host, &outbound_policy) {
@@ -418,7 +444,7 @@ fn gate_by_contract(
     Some(ProxyError::contract_refused(host, violation).into_response())
 }
 
-fn gate_by_dns_entropy(host: &str, ctx: &DlpCtx) -> Option<Response<ProxyBody>> {
+pub(super) fn gate_by_dns_entropy(host: &str, ctx: &DlpCtx) -> Option<Response<ProxyBody>> {
     if !dns_label_entropy(host, ctx.dns_entropy_threshold) {
         return None;
     }
@@ -434,7 +460,7 @@ fn gate_by_dns_entropy(host: &str, ctx: &DlpCtx) -> Option<Response<ProxyBody>> 
     }
 }
 
-fn scan_headers_and_uri(
+pub(super) fn scan_headers_and_uri(
     ctx: &DlpCtx,
     parts: &hyper::http::request::Parts,
     original_uri: &hyper::Uri,
@@ -453,7 +479,7 @@ fn scan_headers_and_uri(
     enforce_request_verdicts(ctx, &uri_verdicts, host)
 }
 
-enum BodyOutcome {
+pub(super) enum BodyOutcome {
     Ready {
         body: BoxBody<Bytes, hyper::Error>,
         /// New content length (after re-buffering). `None` when the body
@@ -466,7 +492,7 @@ enum BodyOutcome {
     Refused(Response<ProxyBody>),
 }
 
-async fn buffer_and_scan_body(
+pub(super) async fn buffer_and_scan_body(
     headers: hyper::HeaderMap,
     body: hyper::body::Incoming,
     dlp: Option<&DlpCtx>,

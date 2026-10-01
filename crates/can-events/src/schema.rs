@@ -126,7 +126,9 @@ pub struct EgressRequest {
     pub path: String,
     pub decision: Decision,
     /// Machine-readable reason for a block (`policy`, `contract`, `dlp`,
-    /// `dns-entropy`, …). Absent when allowed.
+    /// `dns-entropy`, …). `sink` marks a request (or CONNECT) to an
+    /// undeclared host that the proxy scanned and answered itself without
+    /// forwarding (ADR-0018). Absent when allowed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

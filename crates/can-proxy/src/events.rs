@@ -106,6 +106,7 @@ pub(crate) fn egress_request<B>(
         Some("upstream-error") => (Decision::Allowed, Some("upstream-error".to_string())),
         Some("policy-blocked") => (Decision::Blocked, Some("policy".to_string())),
         Some("contract-refused") => (Decision::Blocked, Some("contract".to_string())),
+        Some("undeclared-host-sink") => (Decision::Blocked, Some(SINK_REASON.to_string())),
         Some("dlp-blocked") => (
             Decision::Blocked,
             Some(detector.unwrap_or("dlp").to_string()),
@@ -117,8 +118,12 @@ pub(crate) fn egress_request<B>(
     emit_egress(host, method, path, decision, reason);
 }
 
+/// `egress_request.reason` for a request (or CONNECT) to an undeclared
+/// host that the sink answered locally (ADR-0018).
+pub(crate) const SINK_REASON: &str = "sink";
+
 /// Emit `egress_request` for a refusal raised before there is a response
-/// to classify — currently the CONNECT policy gate.
+/// to classify — the CONNECT policy gate, and a CONNECT the sink accepted.
 pub(crate) fn egress_blocked(host: &str, method: &str, path: &str, reason: &str) {
     crate::server::stats::record_request(Decision::Blocked, 0);
     emit_egress(

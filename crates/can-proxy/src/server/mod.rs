@@ -12,6 +12,7 @@
 //! - `passthrough` — non-MITM forwarding paths.
 //! - `tunnel` — TLS MITM tunnel.
 //! - `upstream` — connect + forward upstream (http/https/h2c).
+//! - `sink` — undeclared-host sink: scan, answer locally, never forward (ADR-0018).
 //! - `stats` — cumulative counters and latency histogram (ADR-0015).
 //! - `stream_scan` — R17 chunked body scan.
 //! - `response_scan` — R8 response-direction canary scan.
@@ -31,6 +32,7 @@ mod request;
 mod response_scan;
 mod responses;
 mod secret_swap;
+mod sink;
 pub(crate) mod stats;
 mod stream_scan;
 mod tunnel;
