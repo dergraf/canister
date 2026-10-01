@@ -17,7 +17,7 @@ pub mod unescape;
 
 pub use canary::{CanarySet, generate_fake};
 pub use detectors::{DetectorAction, DetectorId, PatternSet};
-pub use entropy::{PerHostEntropyBudget, SessionEntropyBudget};
+pub use entropy::{EntropyCharge, EntropyDestination, PerHostEntropyBudget, SessionEntropyBudget};
 pub use error::DlpError;
 pub use extract::{Extracted, Extractor, StringSource};
 pub use redact::redact;

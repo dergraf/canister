@@ -20,6 +20,7 @@ use can_dlp::entropy::dns_label_entropy;
 use super::capture::{CaptureCtx, ExchangeRecorder};
 use super::dlp_ctx::DlpCtx;
 use super::dlp_enforce::enforce_request_verdicts;
+use super::entropy_account::EntropyAccount;
 use super::limits::ProxyLimits;
 use super::passthrough::{handle_http_passthrough, handle_passthrough};
 use super::response_scan::scan_response;
@@ -295,12 +296,14 @@ async fn run_request_stages(
     }
 
     // Stage 5: buffer + scan body.
+    let entropy_account = EntropyAccount::for_request(&original_uri, &parts.headers, None);
     let req_body = match buffer_and_scan_body(
         parts.headers.clone(),
         body,
         dlp.as_ref(),
         &limits,
         host,
+        &entropy_account,
         recorder.is_some(),
     )
     .await
@@ -465,6 +468,7 @@ async fn buffer_and_scan_body(
     dlp: Option<&DlpCtx>,
     limits: &ProxyLimits,
     host: &str,
+    entropy_account: &EntropyAccount,
     capturing: bool,
 ) -> BodyOutcome {
     let Some(ctx) = dlp else {
@@ -517,7 +521,11 @@ async fn buffer_and_scan_body(
         }
         if ctx
             .scanner
-            .check_entropy_budget(&bytes, host, &ctx.entropy_budget)
+            .check_entropy_budget(
+                &bytes,
+                &entropy_account.destination(host),
+                &ctx.entropy_budget,
+            )
             .is_some()
             && !ctx.monitor
         {

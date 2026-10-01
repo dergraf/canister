@@ -23,6 +23,7 @@ mod canaries;
 mod capture;
 mod dlp_ctx;
 mod dlp_enforce;
+mod entropy_account;
 mod lifecycle;
 mod limits;
 mod passthrough;
