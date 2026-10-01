@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::decode::decode_layers;
 use crate::decompress::decompress;
 use crate::detectors::{DetectorAction, DetectorId, Finding, PatternSet};
-use crate::entropy::{PerHostEntropyBudget, high_entropy_byte_count};
+use crate::entropy::{EntropyDestination, PerHostEntropyBudget};
 use crate::error::DlpError;
 use crate::extract::{Extracted, Extractor, StringSource};
 use crate::scopes::DlpScopes;
@@ -344,20 +344,22 @@ impl DlpScanner {
         }
     }
 
+    /// Charge `body` to its destination's session entropy budget. Only
+    /// high-entropy bytes the destination has not been sent before count.
     pub fn check_entropy_budget(
         &self,
         body: &[u8],
-        host: &str,
+        dest: &EntropyDestination<'_>,
         budget: &PerHostEntropyBudget,
     ) -> Option<DlpError> {
-        let high_bytes = high_entropy_byte_count(body, 32, 4.0);
-        if high_bytes > 0 && !budget.record(host, high_bytes) {
-            return Some(DlpError::EntropyBudgetExceeded {
-                used: budget.used(host),
-                budget: budget.budget(),
-            });
+        let charge = budget.charge(dest, body);
+        if charge.within_budget() {
+            return None;
         }
-        None
+        Some(DlpError::EntropyBudgetExceeded {
+            used: charge.used,
+            budget: charge.budget,
+        })
     }
 
     fn scan_text(
@@ -690,15 +692,47 @@ mod tests {
         }));
     }
 
+    fn dest(host: &str) -> EntropyDestination<'_> {
+        EntropyDestination {
+            host,
+            scope: "/",
+            budget_override: None,
+        }
+    }
+
     #[test]
     fn entropy_budget_check() {
         let s = scanner();
         let budget = PerHostEntropyBudget::new(100);
         let high_entropy: Vec<u8> = (0..=255).cycle().take(256).collect();
-        let result = s.check_entropy_budget(&high_entropy, "evil.example.com", &budget);
-        // Might or might not exceed depending on window calculations,
-        // but shouldn't panic
-        let _ = result;
+        let result = s.check_entropy_budget(&high_entropy, &dest("evil.example.com"), &budget);
+        assert!(matches!(
+            result,
+            Some(DlpError::EntropyBudgetExceeded {
+                used: 256,
+                budget: 100
+            })
+        ));
+    }
+
+    #[test]
+    fn entropy_budget_reports_the_override_it_was_held_against() {
+        let s = scanner();
+        let budget = PerHostEntropyBudget::new(100);
+        let blob: Vec<u8> = (0..=255).cycle().take(256).collect();
+        let generous = EntropyDestination {
+            budget_override: Some(1_000),
+            ..dest("api.provider.example")
+        };
+        assert!(s.check_entropy_budget(&blob, &generous, &budget).is_none());
+        let stingy = EntropyDestination {
+            budget_override: Some(10),
+            ..dest("other.provider.example")
+        };
+        assert!(matches!(
+            s.check_entropy_budget(&blob, &stingy, &budget),
+            Some(DlpError::EntropyBudgetExceeded { budget: 10, .. })
+        ));
     }
 
     #[test]
@@ -708,11 +742,11 @@ mod tests {
         let s = scanner();
         let budget = PerHostEntropyBudget::new(50);
         let blob: Vec<u8> = (0..=255).cycle().take(1024).collect();
-        let _ = s.check_entropy_budget(&blob, "noisy.example.com", &budget);
+        let _ = s.check_entropy_budget(&blob, &dest("noisy.example.com"), &budget);
         // Even after noisy.example.com is exhausted, a fresh budget exists
         // for a different destination.
         assert!(
-            s.check_entropy_budget(b"hello", "clean.example.com", &budget)
+            s.check_entropy_budget(b"hello", &dest("clean.example.com"), &budget)
                 .is_none()
         );
     }
