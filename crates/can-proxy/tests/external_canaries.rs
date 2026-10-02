@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 static STREAM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const AHV_CANARY: &str = "CNRY-7Q2X-AHV";
+const IBAN_CANARY: &str = "CNRY-4K8P-IBAN";
 
 struct SocketReader {
     handle: std::thread::JoinHandle<Vec<String>>,
@@ -84,6 +85,18 @@ async fn start_upstream() -> SocketAddr {
 /// `medcodes.mock.internal` resolve to the same loopback listener through
 /// the proxy's IP allow-list.
 async fn start_proxy(monitor: bool, allowed_hosts: &[&str]) -> SocketAddr {
+    start_proxy_with(
+        monitor,
+        vec![ExternalCanary {
+            value: AHV_CANARY.to_string(),
+            data_class: "ahv".to_string(),
+            allowed_hosts: allowed_hosts.iter().map(|h| h.to_string()).collect(),
+        }],
+    )
+    .await
+}
+
+async fn start_proxy_with(monitor: bool, canaries: Vec<ExternalCanary>) -> SocketAddr {
     let ca = Arc::new(DynamicCa::generate().expect("ca"));
     let network = NetworkConfig {
         egress: Some(EgressMode::ProxyOnly),
@@ -98,11 +111,7 @@ async fn start_proxy(monitor: bool, allowed_hosts: &[&str]) -> SocketAddr {
         .with_network(network)
         .with_hosts(hosts)
         .with_monitor(monitor)
-        .with_external_canaries(vec![ExternalCanary {
-            value: AHV_CANARY.to_string(),
-            data_class: "ahv".to_string(),
-            allowed_hosts: allowed_hosts.iter().map(|h| h.to_string()).collect(),
-        }]);
+        .with_external_canaries(canaries);
     let proxy = ProxyServer::new(config).expect("proxy");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -217,6 +226,55 @@ async fn a_destination_outside_the_allow_list_is_blocked() {
     let egress = events_of(&events, "egress_request");
     assert_eq!(egress[0]["data"]["decision"], "blocked");
     assert_eq!(egress[0]["data"]["reason"], "canary_token");
+}
+
+// One JSON string can carry several classes of data. A class this
+// destination may see must not hide one it may not, whatever their order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allowed_canary_does_not_hide_a_forbidden_one_in_the_same_string() {
+    let _guard = STREAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("events.sock");
+    let reader = SocketReader::listen(&socket_path);
+    install_stream(&socket_path);
+
+    let upstream = start_upstream().await;
+    let proxy_addr = start_proxy_with(
+        false,
+        vec![
+            ExternalCanary {
+                value: AHV_CANARY.to_string(),
+                data_class: "ahv".to_string(),
+                allowed_hosts: vec!["127.0.0.1".to_string()],
+            },
+            ExternalCanary {
+                value: IBAN_CANARY.to_string(),
+                data_class: "iban_ch".to_string(),
+                allowed_hosts: vec!["claims.mock.internal".to_string()],
+            },
+        ],
+    )
+    .await;
+
+    let record = format!("ahv {AHV_CANARY}, iban {IBAN_CANARY}");
+    let response = client(proxy_addr)
+        .post(format!("http://127.0.0.1:{}/messages", upstream.port()))
+        .body(serde_json::json!({ "content": record }).to_string())
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(response.status(), 451, "the forbidden class is refused");
+
+    let events = reader.finish();
+    let fires = events_of(&events, "canary_fire");
+    assert!(
+        fires
+            .iter()
+            .any(|f| f["data"]["data_class"] == "iban_ch" && f["data"]["allowed"] == false),
+        "the forbidden class is reported: {fires:?}"
+    );
+    assert_eq!(events_of(&events, "dlp_block").len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
