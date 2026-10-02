@@ -27,7 +27,7 @@
           <span class="brand-cursor">_</span>
         </h1>
         <p class="brand-tag">// unprivileged Linux sandboxes — namespaces, seccomp, L7 egress proxy with DLP</p>
-        <p class="tagline">Run any command inside layered isolation: <em>user / mount / pid / net namespaces</em>, a 187-syscall seccomp allow list, USER_NOTIF supervisor for argument-level filtering, capability dropping, cgroups v2 limits, /proc hardening, and an inline egress proxy that contracts every outbound HTTP call.</p>
+        <p class="tagline">Run any command inside layered isolation: <em>user / mount / pid / net namespaces</em>, a ~187-syscall seccomp allow list with static argument gates, capability dropping, cgroups v2 limits, /proc hardening, and an inline egress proxy that contracts every outbound HTTP call. Opt-in: a signed event stream of what the command did.</p>
 
         <div class="terminal-window install-window" aria-label="Install command">
           <div class="terminal-titlebar">
@@ -47,7 +47,7 @@
 
         <ul class="feature-strip" aria-label="Capabilities">
           <li>seccomp BPF</li>
-          <li>USER_NOTIF supervisor</li>
+          <li>event stream</li>
           <li>cgroups v2</li>
           <li>L7 egress proxy</li>
           <li>DLP scanner</li>
