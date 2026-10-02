@@ -369,13 +369,16 @@ impl DlpScanner {
         source: Option<&StringSource>,
         verdicts: &mut Vec<ScanVerdict>,
     ) {
-        let mut seen_detectors: Vec<crate::detectors::DetectorId> = Vec::new();
+        // Keyed by value as well as detector: every canary shares one
+        // detector, and each is classified against its own destinations.
+        let mut seen: Vec<(crate::detectors::DetectorId, String)> = Vec::new();
         let mut scan_pass = |scanner: &Self, input: &str| {
             for finding in scanner.patterns.scan(input) {
-                if seen_detectors.contains(&finding.detector) {
+                let key = (finding.detector, finding.matched_text.clone());
+                if seen.contains(&key) {
                     continue;
                 }
-                seen_detectors.push(finding.detector);
+                seen.push(key);
                 let verdict = scanner.evaluate_finding(&finding, destination_host, source);
                 verdicts.push(verdict);
             }
@@ -589,6 +592,44 @@ mod tests {
         let verdicts = s.scan_headers(&headers, "evil.com");
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].action, DetectorAction::Block);
+    }
+
+    #[test]
+    fn every_canary_in_one_string_gets_its_own_verdict() {
+        let first = "CNRY-FIRST-0001".to_string();
+        let second = "CNRY-SECOND-0002".to_string();
+        let s = DlpScanner::new(
+            vec![first.clone(), second.clone()],
+            &HashMap::new(),
+            32,
+            true,
+            false,
+        )
+        .unwrap();
+        let headers = vec![("X-Record".to_string(), format!("{first} and {second}"))];
+        let verdicts = s.scan_headers(&headers, "example.com");
+        let canaries: Vec<&str> = verdicts
+            .iter()
+            .filter(|v| v.detector == DetectorId::new("canary_token"))
+            .map(|v| v.matched_text.as_str())
+            .collect();
+        assert!(canaries.contains(&first.as_str()), "{canaries:?}");
+        assert!(canaries.contains(&second.as_str()), "{canaries:?}");
+    }
+
+    #[test]
+    fn the_same_canary_twice_in_one_string_is_one_verdict() {
+        let canary = "CNRY-TWICE-0003".to_string();
+        let s = DlpScanner::new(vec![canary.clone()], &HashMap::new(), 32, true, false).unwrap();
+        let headers = vec![("X-Record".to_string(), format!("{canary} {canary}"))];
+        let verdicts = s.scan_headers(&headers, "example.com");
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| v.detector == DetectorId::new("canary_token"))
+                .count(),
+            1
+        );
     }
 
     #[test]

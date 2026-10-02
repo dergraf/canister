@@ -48,7 +48,9 @@ pub struct StreamingScanner<'a> {
     patterns: &'a PatternSet,
     canaries: &'a [Vec<u8>],
     overlap: Vec<u8>,
-    seen_detectors: HashSet<DetectorId>,
+    /// Keyed by value as well as detector: every canary shares one
+    /// detector, and each is classified against its own destinations.
+    seen: HashSet<(DetectorId, String)>,
     overlap_bytes: usize,
     max_decode_depth: usize,
 }
@@ -77,14 +79,14 @@ impl<'a> StreamingScanner<'a> {
             patterns,
             canaries,
             overlap: Vec::new(),
-            seen_detectors: HashSet::new(),
+            seen: HashSet::new(),
             overlap_bytes,
             max_decode_depth,
         }
     }
 
-    /// Feed the next chunk. Returns any *new* findings — detectors that
-    /// have already fired this stream are not repeated. The scanner
+    /// Feed the next chunk. Returns any *new* findings — a detector and
+    /// value that already fired this stream are not repeated. The scanner
     /// internally prepends the last `overlap_bytes` bytes of the previous
     /// chunk so a signature spanning the boundary is still caught.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<StreamingFinding> {
@@ -128,20 +130,24 @@ impl<'a> StreamingScanner<'a> {
     fn scan_layer(&mut self, buf: &[u8], out: &mut Vec<StreamingFinding>) {
         let canary_id = DetectorId::new(crate::ids::CANARY_TOKEN);
         for canary in self.canaries.iter() {
-            if !canary.is_empty()
-                && buf.windows(canary.len()).any(|w| w == canary.as_slice())
-                && self.seen_detectors.insert(canary_id)
-            {
+            if canary.is_empty() || !buf.windows(canary.len()).any(|w| w == canary.as_slice()) {
+                continue;
+            }
+            let matched_text = String::from_utf8_lossy(canary).into_owned();
+            if self.seen.insert((canary_id, matched_text.clone())) {
                 out.push(StreamingFinding {
                     detector: canary_id,
-                    matched_text: String::from_utf8_lossy(canary).into_owned(),
+                    matched_text,
                 });
             }
         }
 
         if let Ok(text) = std::str::from_utf8(buf) {
             for finding in self.patterns.scan(text) {
-                if self.seen_detectors.insert(finding.detector) {
+                if self
+                    .seen
+                    .insert((finding.detector, finding.matched_text.clone()))
+                {
                     out.push(StreamingFinding {
                         detector: finding.detector,
                         matched_text: finding.matched_text,
@@ -155,6 +161,47 @@ impl<'a> StreamingScanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canary_texts(findings: &[StreamingFinding]) -> Vec<String> {
+        findings
+            .iter()
+            .filter(|f| f.detector.as_str() == crate::ids::CANARY_TOKEN)
+            .map(|f| f.matched_text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn streaming_reports_every_canary_in_one_chunk() {
+        let ps = PatternSet::new().unwrap();
+        let canaries = vec![b"CNRY-FIRST-0001".to_vec(), b"CNRY-SECOND-0002".to_vec()];
+        let mut s = StreamingScanner::new(&ps, &canaries, 32);
+        let found = canary_texts(&s.feed(b"CNRY-FIRST-0001 then CNRY-SECOND-0002"));
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn streaming_reports_a_second_canary_in_a_later_chunk() {
+        let ps = PatternSet::new().unwrap();
+        let canaries = vec![b"CNRY-FIRST-0001".to_vec(), b"CNRY-SECOND-0002".to_vec()];
+        let mut s = StreamingScanner::with_overlap(&ps, &canaries, 8, 32);
+        assert_eq!(
+            canary_texts(&s.feed(b"CNRY-FIRST-0001 ........")),
+            vec!["CNRY-FIRST-0001"]
+        );
+        assert_eq!(
+            canary_texts(&s.feed(b"................ CNRY-SECOND-0002")),
+            vec!["CNRY-SECOND-0002"]
+        );
+    }
+
+    #[test]
+    fn streaming_reports_a_canary_once_per_stream() {
+        let ps = PatternSet::new().unwrap();
+        let canaries = vec![b"CNRY-FIRST-0001".to_vec()];
+        let mut s = StreamingScanner::with_overlap(&ps, &canaries, 8, 32);
+        assert_eq!(canary_texts(&s.feed(b"CNRY-FIRST-0001 ........")).len(), 1);
+        assert!(canary_texts(&s.feed(b"................ CNRY-FIRST-0001")).is_empty());
+    }
 
     #[test]
     fn streaming_finds_token_in_single_chunk() {
