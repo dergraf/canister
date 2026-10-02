@@ -18,6 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A binary must report the version its release is named after.
+      - name: Tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}; bump the version first"
+            exit 1
+          fi
+
       - name: Setup toolchain
         run: rustup show
 
@@ -68,7 +77,15 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
+      # A release drafted or published by hand before the tag push keeps
+      # its notes; the binaries are attached to it.
+      - name: Publish the binaries
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" artifacts/canister-* --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/canister-* --clobber
+          else
+            gh release create "$TAG" artifacts/canister-* --generate-notes
+          fi
