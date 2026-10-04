@@ -1241,6 +1241,42 @@ $ can pubkey ci-seal.key
 d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
 
+#### Keys in CI
+
+A seal is only worth what keeping its seed from the workload is worth. In a CI
+job the workload is the untrusted code under test, and the job is the trusted
+party that signs on its behalf:
+
+1. **Generate once, outside CI.** `can keygen ci-seal.key` on a trusted machine.
+   Store the seed (the file's one line) as a CI secret, and put the printed public
+   key wherever the evidence is verified. The public key is not a secret.
+2. **Write the seed to a file outside the working directory**, with mode 0600, in
+   the step that runs `can`: on GitHub Actions under `$RUNNER_TEMP`, elsewhere under a
+   fresh `mktemp -d`. The working directory is mounted into the sandbox (writable,
+   unless `workdir = "read"`, ADR-0024); a directory beside it and the host's `/tmp`
+   are not.
+3. **Pass the path, never the value**: `--events-sign-key "$RUNNER_TEMP/seal.key"`.
+   `can` reads it before entering any namespace and does not put it in the
+   workload's environment. Do not export the seed as a variable the workload's
+   `env_passthrough` could name.
+4. **Keep it out of anything the recipes mount.** A recipe that grants `read` on
+   `$HOME` or a parent of the key's directory makes the file visible; `deny` its
+   directory (`deny = ["$RUNNER_TEMP"]`) if a recipe has to read broadly.
+5. **Remove it when the step ends** (`rm -f`), and rotate it by generating a new
+   key and adding its public key before removing the old one, so evidence signed
+   with either still verifies during the switch.
+
+```yaml
+- name: Run under can
+  env:
+    SEAL_KEY: ${{ secrets.CAN_SEAL_KEY }}
+  run: |
+    key="$RUNNER_TEMP/seal.key"
+    (umask 077 && printf '%s\n' "$SEAL_KEY" > "$key")
+    can run --events-file events.jsonl --events-sign-key "$key" -- ./agent
+    rm -f "$key"
+```
+
 ---
 
 ## Mandatory Access Control (MAC)
