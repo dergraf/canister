@@ -104,4 +104,20 @@ assert_contains "$RUN_STDOUT" "NO_SECRET_DIR"
 assert_not_contains "$RUN_STDOUT" "TOP-SECRET"
 rm -rf "${DENY_DIR}"
 
+# ---- A relative write path is under the working directory ----
+begin_test "a relative write path is the project's own directory"
+REL_WORK=$(mktemp -d)
+mkdir -p "$REL_WORK/out"
+REL_RECIPE=$(tmpconfig <<'TOML'
+[filesystem]
+write = ["out"]
+TOML
+)
+_TMPFILES+=("$REL_RECIPE")
+pushd "$REL_WORK" >/dev/null || exit 1
+run_can recipe show --recipe "$REL_RECIPE"
+popd >/dev/null || exit 1
+assert_contains "$RUN_STDOUT" "\"$REL_WORK/out\""
+rm -rf "$REL_WORK"
+
 summary

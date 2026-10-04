@@ -1572,3 +1572,26 @@ fn decoys_cannot_be_materialised_from_a_recipe() {
         toml::from_str("decoys = [{source = \"/x\", target = \"/y\"}]\n");
     assert!(result.is_err());
 }
+
+#[test]
+fn relative_filesystem_paths_are_under_the_working_directory() {
+    use super::recipe::absolutize;
+    let cwd = std::path::Path::new("/work/project");
+
+    assert_eq!(
+        absolutize("notes".into(), Some(cwd)),
+        std::path::PathBuf::from("/work/project/notes")
+    );
+    assert_eq!(
+        absolutize("./notes/today".into(), Some(cwd)),
+        std::path::PathBuf::from("/work/project/notes/today")
+    );
+    assert_eq!(
+        absolutize("/var/cache/app".into(), Some(cwd)),
+        std::path::PathBuf::from("/var/cache/app")
+    );
+    assert_eq!(
+        absolutize("notes".into(), None),
+        std::path::PathBuf::from("notes")
+    );
+}
