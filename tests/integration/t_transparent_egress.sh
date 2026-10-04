@@ -9,6 +9,8 @@
 #   3. ... and over plain HTTP (by Host)
 #   4. An undeclared host it reaches directly is sunk, and the request it
 #      carried is recorded
+#   5. A client that also ignores SSL_CERT_FILE rejects the sandbox CA; the
+#      attempt is recorded with its host instead of vanishing
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -92,5 +94,23 @@ for line in open(sys.argv[1], encoding="utf-8"):
 PY
 )
 assert_contains "$SUNK" "collector.attacker.example/in"
+
+begin_test "a client that rejects the sandbox CA is recorded, not lost"
+run_can run --recipe "$TRANSPARENT" --events-file "$WORK/rejected.jsonl" \
+    -- env -i PATH=/usr/bin:/bin python3 -c 'import ssl, urllib.request
+try:
+    urllib.request.urlopen("https://mock.example/x", timeout=10, context=ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt"))
+except Exception as e:
+    print("failed:", type(e).__name__)'
+REJECTED=$(python3 - "$WORK/rejected.jsonl" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    e = json.loads(line)
+    if e["event"] == "egress_request" and e["data"].get("reason") == "client_rejected_ca":
+        print(e["data"]["host"])
+PY
+)
+assert_contains "$RUN_STDOUT" "failed:"
+assert_eq "mock.example" "$REJECTED"
 
 summary

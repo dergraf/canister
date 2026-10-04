@@ -420,7 +420,9 @@ where the proxy also listens on 443 (routing by TLS SNI) and 80 (by `Host`).
 The request takes the same path a proxied one does: contracts, DLP, canaries,
 the undeclared-host sink and capture. The stub resolves nothing upstream.
 Ports other than 80 and 443 are not covered, IPv6 lookups get no answer, and
-the workload cannot serve on 80 or 443 on loopback itself.
+the workload cannot serve on 80 or 443 on loopback itself. A client that also
+ignores `SSL_CERT_FILE` rejects the sandbox CA; the attempt is then recorded as
+`egress_request` with `reason: client_rejected_ca`.
 
 ### Undeclared hosts
 
