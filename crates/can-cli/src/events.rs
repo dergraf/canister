@@ -40,6 +40,12 @@ pub struct EventFlags {
     #[arg(long, value_name = "BYTES", default_value_t = CaptureConfig::DEFAULT_MAX_BYTES)]
     pub capture_max_bytes: usize,
 
+    /// Offer upstreams only encodings that zlib decodes (gzip, deflate,
+    /// identity), so captured responses stay readable to any consumer
+    /// (ADR-0023). The captured request keeps what the workload asked for.
+    #[arg(long)]
+    pub capture_readable_encodings: bool,
+
     /// How often the proxy emits a cumulative `stats` event, in
     /// milliseconds (ADR-0015). `0` disables periodic stats; a final
     /// snapshot is still emitted when the run ends.
@@ -73,6 +79,7 @@ impl Default for EventFlags {
             run_id: None,
             capture_exchanges: false,
             capture_max_bytes: CaptureConfig::DEFAULT_MAX_BYTES,
+            capture_readable_encodings: false,
             stats_interval_ms: DEFAULT_STATS_INTERVAL_MS,
             events_sign_key: None,
         }
@@ -100,6 +107,11 @@ impl EventFlags {
             if self.capture_exchanges {
                 anyhow::bail!("--capture-exchanges requires --events-socket or --events-file");
             }
+            if self.capture_readable_encodings {
+                anyhow::bail!(
+                    "--capture-readable-encodings requires --events-socket or --events-file"
+                );
+            }
             if self.events_sign_key.is_some() {
                 anyhow::bail!("--events-sign-key requires --events-socket or --events-file");
             }
@@ -109,6 +121,9 @@ impl EventFlags {
         if self.capture_max_bytes == 0 {
             anyhow::bail!("--capture-max-bytes must be greater than zero");
         }
+        if self.capture_readable_encodings && !self.capture_exchanges {
+            anyhow::bail!("--capture-readable-encodings requires --capture-exchanges");
+        }
 
         let config = EventConfig {
             target,
@@ -116,6 +131,7 @@ impl EventFlags {
             capture: CaptureConfig {
                 exchanges: self.capture_exchanges,
                 max_bytes: self.capture_max_bytes,
+                readable_encodings: self.capture_readable_encodings,
             },
             stats_interval_ms: Some(self.stats_interval_ms).filter(|ms| *ms > 0),
             seal_key: self
@@ -206,6 +222,28 @@ mod tests {
     }
 
     #[test]
+    fn readable_encodings_need_a_capture_to_be_readable_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flags = EventFlags {
+            events_file: Some(dir.path().join("events.jsonl")),
+            capture_readable_encodings: true,
+            ..EventFlags::default()
+        };
+        let err = flags.init().expect_err("must be rejected");
+        assert!(err.to_string().contains("requires --capture-exchanges"));
+
+        let flags = EventFlags {
+            events_file: Some(dir.path().join("events.jsonl")),
+            capture_exchanges: true,
+            capture_readable_encodings: true,
+            ..EventFlags::default()
+        };
+        let config = flags.init().expect("init").expect("config");
+        can_events::uninstall();
+        assert!(config.capture.readable_encodings);
+    }
+
+    #[test]
     fn a_zero_stats_interval_disables_periodic_stats() {
         let dir = tempfile::tempdir().expect("tempdir");
         let flags = EventFlags {
@@ -236,6 +274,7 @@ mod tests {
 
         assert!(config.capture.exchanges);
         assert_eq!(config.capture.max_bytes, 4096);
+        assert!(!config.capture.readable_encodings, "off unless asked for");
         assert_eq!(config.stats_interval_ms, Some(DEFAULT_STATS_INTERVAL_MS));
     }
 

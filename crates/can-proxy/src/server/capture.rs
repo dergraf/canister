@@ -13,6 +13,11 @@
 //!
 //! Bodies are capped at `--capture-max-bytes` per direction and flagged
 //! with `truncated` when cut.
+//!
+//! With `--capture-readable-encodings` (ADR-0023) the forwarded request's
+//! `Accept-Encoding` is narrowed to what zlib decodes, after the request
+//! was captured, so the capture shows what the workload asked for and
+//! the response comes back in an encoding any consumer can read.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -47,6 +52,36 @@ pub(super) struct CaptureCtx {
     /// Fake and real secret values, longest first so an overlapping pair
     /// cannot leave a fragment behind.
     secrets: Arc<Vec<String>>,
+    /// Narrow `Accept-Encoding` on forwarded requests (ADR-0023).
+    readable_encodings: bool,
+}
+
+/// Content codings a consumer can decode with zlib alone.
+const READABLE_ENCODINGS: &[&str] = &["gzip", "x-gzip", "deflate", "identity"];
+
+/// An `Accept-Encoding` value narrowed to [`READABLE_ENCODINGS`], keeping
+/// each kept coding's parameters; `identity` when none is left. A
+/// wildcard is dropped, since it could select any coding.
+pub(super) fn readable_accept_encoding(offered: &str) -> String {
+    let kept: Vec<String> = offered
+        .split(',')
+        .filter_map(|item| {
+            let mut parts = item.split(';').map(str::trim);
+            let coding = parts.next()?.to_ascii_lowercase();
+            READABLE_ENCODINGS.contains(&coding.as_str()).then(|| {
+                std::iter::once(coding)
+                    .chain(parts.map(|param| param.replace(' ', "")))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+        })
+        .collect();
+
+    if kept.is_empty() {
+        "identity".to_string()
+    } else {
+        kept.join(", ")
+    }
 }
 
 impl CaptureCtx {
@@ -70,7 +105,27 @@ impl CaptureCtx {
         Some(Self {
             max_bytes: capture.max_bytes,
             secrets: Arc::new(secrets),
+            readable_encodings: capture.readable_encodings,
         })
+    }
+
+    /// Narrow the request's `Accept-Encoding` when asked to. A request
+    /// without one already asks for `identity`.
+    pub(super) fn narrow_accept_encoding(&self, headers: &mut HeaderMap) {
+        if !self.readable_encodings {
+            return;
+        }
+        let Some(offered) = headers
+            .get(hyper::header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return;
+        };
+        if let Ok(narrowed) =
+            hyper::header::HeaderValue::from_str(&readable_accept_encoding(offered))
+        {
+            headers.insert(hyper::header::ACCEPT_ENCODING, narrowed);
+        }
     }
 
     /// Header pairs with credential headers and secret values redacted.
