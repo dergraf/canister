@@ -436,6 +436,27 @@ fn setup_parent_network(
                     std::process::exit(1);
                 }
 
+                // Transparent egress (ADR-0027): the proxy also answers on
+                // 443, 80 and as the resolver, in the worker netns, for a
+                // workload that ignores the proxy settings. Asked for and
+                // not possible is fatal: going without would hide exactly
+                // the traffic it exists to show.
+                let transparent_sockets = if config.network.transparent() {
+                    match bind_transparent_sockets() {
+                        Ok(sockets) => Some(sockets),
+                        Err(e) => {
+                            tracing::error!(
+                                "proxy process: transparent egress needs 127.0.0.1:443, :80 and \
+                                 :53 in the sandbox: {}",
+                                e
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Move into our OWN, fresh network namespace for outbound.
                 // The listener fd above stays bound in the worker netns and
                 // remains accept()-able; new outbound sockets use this netns.
@@ -530,7 +551,28 @@ fn setup_parent_network(
                             std::process::exit(1);
                         }
                     };
-                    if let Err(e) = server.run(listener).await {
+                    let served = match transparent_sockets {
+                        None => server.run(listener).await,
+                        Some((tls, http, dns)) => match (
+                            tokio::net::TcpListener::from_std(tls),
+                            tokio::net::TcpListener::from_std(http),
+                            tokio::net::UdpSocket::from_std(dns),
+                        ) {
+                            (Ok(tls), Ok(http), Ok(dns)) => {
+                                server
+                                    .run_transparent(
+                                        listener,
+                                        can_proxy::server::TransparentListeners { tls, http, dns },
+                                    )
+                                    .await
+                            }
+                            _ => {
+                                tracing::error!("proxy process: transparent sockets unusable");
+                                std::process::exit(1);
+                            }
+                        },
+                    };
+                    if let Err(e) = served {
                         tracing::error!("proxy process: proxy server run error: {}", e);
                     }
                 });
@@ -558,7 +600,13 @@ fn setup_parent_network(
                 };
                 let (pasta_child, addr) = can_net::pasta::start(&pasta_config)?;
                 state.pasta_child = Some(pasta_child);
-                dns_addr = addr;
+                // With transparent egress the worker resolves through the
+                // proxy's stub, which answers every name with the proxy.
+                dns_addr = if config.network.transparent() {
+                    can_proxy::dns_stub::ANSWER.to_string()
+                } else {
+                    addr
+                };
 
                 // Release the proxy to start serving now that pasta is up.
                 let mut go_file = std::fs::File::from(go_tx);
@@ -1526,6 +1574,29 @@ fn mount_supervisor_proc() {
     } else {
         tracing::debug!("mounted supervisor /proc (owned by user namespace)");
     }
+}
+
+/// The sockets transparent egress serves on in the worker netns (ADR-0027):
+/// TLS on 443, plain HTTP on 80, the stub resolver on 53, all on loopback
+/// and non-blocking for the proxy's runtime.
+fn bind_transparent_sockets() -> std::io::Result<(
+    std::net::TcpListener,
+    std::net::TcpListener,
+    std::net::UdpSocket,
+)> {
+    // The worker netns is the sandbox's own: lowering its privileged-port
+    // floor touches nothing outside it, and lets the proxy bind 80 and 443
+    // there without a capability the join may not carry.
+    if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0") {
+        tracing::debug!(error = %e, "could not lower the sandbox's privileged-port floor");
+    }
+    let tls = std::net::TcpListener::bind("127.0.0.1:443")?;
+    let http = std::net::TcpListener::bind("127.0.0.1:80")?;
+    let dns = std::net::UdpSocket::bind("127.0.0.1:53")?;
+    tls.set_nonblocking(true)?;
+    http.set_nonblocking(true)?;
+    dns.set_nonblocking(true)?;
+    Ok((tls, http, dns))
 }
 
 /// Write `/etc/resolv.conf` in the supervisor's mount namespace.

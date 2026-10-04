@@ -34,6 +34,13 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub undeclared_hosts: Option<UndeclaredHosts>,
 
+    /// Route a workload that ignores `HTTP_PROXY` through the proxy anyway
+    /// (ADR-0027): names resolve to the proxy, which serves ports 443 (by
+    /// TLS SNI) and 80 (by `Host`) in the workload's network namespace.
+    /// Rendered in the resolved policy only when on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent: Option<bool>,
+
     /// Allowed IP addresses / CIDRs (runtime-resolved). IP-literal egress
     /// carries no service identity and bypasses the per-host contract and
     /// DLP gates, so it is authored under `[unsafe] reachable_ips`.
@@ -72,6 +79,7 @@ impl NetworkConfig {
                 self.undeclared_hosts,
                 overlay.undeclared_hosts,
             ),
+            transparent: merge_transparent(self.transparent, overlay.transparent),
             allow_ips: union_vecs(self.allow_ips, overlay.allow_ips),
             ports: union_vecs(self.ports, overlay.ports),
             allow_host_loopback: self.allow_host_loopback || overlay.allow_host_loopback,
@@ -88,6 +96,11 @@ impl NetworkConfig {
     pub fn undeclared_hosts(&self) -> UndeclaredHosts {
         self.undeclared_hosts.unwrap_or_default()
     }
+
+    /// Whether egress is routed transparently (off unless set).
+    pub fn transparent(&self) -> bool {
+        self.transparent.unwrap_or(false)
+    }
 }
 
 /// Handling of a request whose host no `[[host]]` block declares
@@ -102,6 +115,17 @@ pub enum UndeclaredHosts {
     /// Terminate TLS with the sandbox CA, scan the request with the DLP
     /// and canary detectors, then answer it locally. Never forwarded.
     Sink,
+}
+
+/// Any layer turning transparent egress on wins: it changes nothing about
+/// what may leave, only that a workload ignoring the proxy settings is
+/// still seen.
+fn merge_transparent(base: Option<bool>, overlay: Option<bool>) -> Option<bool> {
+    match (base, overlay) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (None, None) => None,
+    }
 }
 
 /// An explicit `refuse` in any layer wins over `sink`: `refuse` is the
@@ -211,5 +235,36 @@ mod tests {
                 "{base:?} merged with {overlay:?}"
             );
         }
+    }
+
+    #[test]
+    fn transparent_egress_is_off_unless_a_layer_turns_it_on() {
+        assert!(!network("").transparent());
+        assert!(network("transparent = true").transparent());
+
+        let merged = |a: Option<bool>, b: Option<bool>| {
+            NetworkConfig {
+                transparent: a,
+                ..Default::default()
+            }
+            .merge(NetworkConfig {
+                transparent: b,
+                ..Default::default()
+            })
+            .transparent
+        };
+        assert_eq!(merged(None, None), None);
+        assert_eq!(merged(Some(true), Some(false)), Some(true));
+        assert_eq!(merged(Some(false), Some(true)), Some(true));
+        assert_eq!(merged(Some(false), None), Some(false));
+    }
+
+    #[test]
+    fn transparent_egress_is_rendered_only_when_on() {
+        let off = toml::to_string(&network("")).expect("serialize");
+        let on = toml::to_string(&network("transparent = true")).expect("serialize");
+
+        assert!(!off.contains("transparent"), "{off}");
+        assert!(on.contains("transparent = true"), "{on}");
     }
 }

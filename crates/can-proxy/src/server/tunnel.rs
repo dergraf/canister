@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 
@@ -24,8 +24,8 @@ use crate::policy::OutboundPolicy;
 // gates, dlp ctx, capture ctx, sink pin. Bundling into one struct just shifts the
 // noise.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_tunnel(
-    upgraded: Upgraded,
+pub(super) async fn handle_tunnel<T>(
+    io: T,
     host_with_port: String,
     ca: Arc<DynamicCa>,
     dns_cache: can_net::dns_cache::DnsCache,
@@ -35,28 +35,65 @@ pub(super) async fn handle_tunnel(
     dlp: DlpCtx,
     capture: Option<CaptureCtx>,
     tunnel_sunk: bool,
-) -> Result<(), std::io::Error> {
+) -> Result<(), std::io::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let host = parse_host_from_authority(&host_with_port);
     debug!("Establishing TLS tunnel for {}", host);
 
+    let tls_acceptor = TlsAcceptor::from(server_config(&ca, &host)?);
+    let tls_stream = tls_acceptor.accept(io).await?;
+
+    serve_tls(
+        tls_stream,
+        dns_cache,
+        outbound_policy,
+        contracts,
+        limits,
+        dlp,
+        capture,
+        tunnel_sunk,
+    )
+    .await
+}
+
+/// A TLS server configuration presenting a certificate for `host`, signed
+/// by the sandbox CA.
+pub(super) fn server_config(
+    ca: &DynamicCa,
+    host: &str,
+) -> Result<Arc<ServerConfig>, std::io::Error> {
     let (cert, key) = ca
-        .generate_server_cert(&host)
+        .generate_server_cert(host)
         .map_err(|e| std::io::Error::other(format!("Failed to generate cert: {}", e)))?;
 
-    let server_config = ServerConfig::builder()
+    ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map(Arc::new)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
 
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-
-    let io = TokioIo::new(upgraded);
-    let tls_stream = tls_acceptor.accept(io).await?;
-    let tls_io = TokioIo::new(tls_stream);
-
+/// Serve the HTTP requests on an established TLS connection through the
+/// DLP-aware pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn serve_tls<T>(
+    tls_stream: tokio_rustls::server::TlsStream<T>,
+    dns_cache: can_net::dns_cache::DnsCache,
+    outbound_policy: OutboundPolicy,
+    contracts: Arc<crate::contracts::ContractTable>,
+    limits: ProxyLimits,
+    dlp: DlpCtx,
+    capture: Option<CaptureCtx>,
+    tunnel_sunk: bool,
+) -> Result<(), std::io::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     http1::Builder::new()
         .serve_connection(
-            tls_io,
+            TokioIo::new(tls_stream),
             service_fn(move |req| {
                 handle_inner_request(
                     req,
@@ -72,7 +109,5 @@ pub(super) async fn handle_tunnel(
             }),
         )
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    Ok(())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
