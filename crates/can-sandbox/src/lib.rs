@@ -107,7 +107,8 @@ pub(crate) fn to_cstring(s: &str) -> Result<CString, SandboxError> {
 /// critical for sandboxing: the kernel follows symlinks during execve, and
 /// every intermediate target must exist inside the sandbox. By canonicalizing
 /// upfront we avoid having to replicate multi-hop symlink chains (common
-/// with Nix/home-manager) inside the isolated filesystem.
+/// with Nix/home-manager) inside the isolated filesystem. The program still
+/// sees the command as written in `argv[0]` (see [`exec_argv`]).
 pub fn resolve_command(cmd: &str) -> Result<std::path::PathBuf, SandboxError> {
     let cwd = std::env::current_dir().ok();
     resolve_command_in(cmd, cwd.as_deref(), std::env::var("PATH").ok().as_deref())
@@ -142,6 +143,20 @@ pub(crate) fn resolve_command_in(
     found.canonicalize().map_err(|e| {
         SandboxError::InvalidCommand(format!("cannot resolve {}: {e}", found.display()))
     })
+}
+
+/// The `argv` a sandboxed command is executed with: the command as
+/// written, then its arguments.
+///
+/// `execve` gets the canonical path, but `argv[0]` stays what the caller
+/// wrote. Programs read it: a Python virtualenv finds its `pyvenv.cfg`
+/// next to `argv[0]`, and multi-call binaries such as busybox dispatch on
+/// its name. Both break if they see the symlink's target instead.
+pub(crate) fn exec_argv(command: &str, args: &[String]) -> Result<Vec<CString>, SandboxError> {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(to_cstring)
+        .collect()
 }
 
 #[cfg(test)]
@@ -229,5 +244,22 @@ mod tests {
             .expect_err("nothing to find");
 
         assert!(error.to_string().contains("no-such-tool"));
+    }
+
+    #[test]
+    fn argv_zero_is_the_command_as_written_not_its_resolved_target() {
+        let argv = exec_argv("venv/bin/python", &["-c".to_string(), "pass".to_string()])
+            .expect("valid argv");
+
+        let argv: Vec<&str> = argv
+            .iter()
+            .map(|arg| arg.to_str().expect("utf-8"))
+            .collect();
+        assert_eq!(argv, ["venv/bin/python", "-c", "pass"]);
+    }
+
+    #[test]
+    fn argv_refuses_an_interior_nul() {
+        assert!(exec_argv("tool", &["a\0b".to_string()]).is_err());
     }
 }

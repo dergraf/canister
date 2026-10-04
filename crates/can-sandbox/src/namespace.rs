@@ -17,7 +17,8 @@ use can_policy::SandboxConfig;
 use can_policy::config::EgressMode;
 
 use crate::{
-    SandboxOpts, cgroups, notifier, overlay, process, resolve_command, seccomp, to_cstring,
+    SandboxOpts, cgroups, exec_argv, notifier, overlay, process, resolve_command, seccomp,
+    to_cstring,
 };
 
 /// Errors specific to namespace operations.
@@ -102,12 +103,8 @@ pub fn spawn_sandboxed(opts: &SandboxOpts) -> Result<i32, NamespaceError> {
     let cmd = to_cstring(command_path.to_str().unwrap_or(&opts.command))
         .map_err(|_| NamespaceError::Exec(nix::Error::EINVAL))?;
 
-    let mut argv: Vec<CString> = vec![cmd.clone()];
-    for arg in &opts.args {
-        argv.push(
-            CString::new(arg.as_bytes()).map_err(|_| NamespaceError::Exec(nix::Error::EINVAL))?,
-        );
-    }
+    let argv = exec_argv(&opts.command, &opts.args)
+        .map_err(|_| NamespaceError::Exec(nix::Error::EINVAL))?;
 
     // Determine network isolation mode from policy.
     let net_mode = NetworkMode::from_config(&opts.config.network, opts.config.hosts.len());
