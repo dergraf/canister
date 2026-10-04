@@ -149,6 +149,48 @@ The output shows the merged result of `base.toml` + auto-detected recipes +
 manifest recipes + manifest overrides, including filesystem paths, network
 domains, syscall overrides, and resource limits.
 
+### Recipe sources and `canister.lock`
+
+A project can compose recipes from repositories other than the official one,
+and pin every recipe it composes (ADR-0026):
+
+```toml
+[sources]
+team  = { git = "https://git.example/team/canister-recipes", tag = "2026.1" }
+local = { path = "recipes" }            # relative to canister.toml
+
+[sandbox.ci]
+recipes = ["python", "team/internal-api", "local/agent"]
+command = "python3 agent.py"
+```
+
+A sandbox names a source's recipe as `<source>/<recipe>`: by stem, found
+recursively in the source, or by path within it (`team/services/api`). A git
+source needs a `tag` or a `rev`.
+
+`can lock` writes `canister.lock` next to `canister.toml`: the revision each
+git source's tag points to, and the SHA-256 of every recipe any sandbox
+composes, library recipes included. Commit it with `canister.toml` and review
+a change to it the same way. `can lock --update` resolves tags afresh; without
+it, existing pins are kept unless `canister.toml` names another repository
+or tag.
+
+With a lock, `can up`:
+
+- builds each git source from its pinned revision, checked out once into
+  `$XDG_CACHE_HOME/canister/sources` and never fetched again; a tag that now
+  points elsewhere is refused;
+- refuses a recipe whose content no longer matches its pin, or that the lock
+  does not name;
+- lets a recipe the lock pins carry credential scope (`allow_credentials`,
+  `fake_secrets`), as an official recipe can. An organisation's recipe for its
+  own service can then carry its credential swap instead of every project
+  restating it. Recipes passed with `--recipe` stay untrusted.
+
+A git source without a lock is refused; a project with only library recipes
+and no lock behaves as before. `canister.lock` is masked inside the sandbox,
+like `canister.toml`.
+
 ### Composition Order (`can up`)
 
 ```

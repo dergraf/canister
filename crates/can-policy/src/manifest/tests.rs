@@ -368,3 +368,56 @@ session_entropy_budget = 1048576
     let recipe: RecipeFile = manifest.get("agent").unwrap().into();
     assert_eq!(recipe.hosts[0].entropy_budget_override(), Some(1_048_576));
 }
+
+// --- [sources] (ADR-0026) ---
+
+const SANDBOX: &str = "\n[sandbox.ci]\nrecipes = [\"team/internal-api\"]\ncommand = \"agent\"\n";
+
+#[test]
+fn sources_parse_git_and_path_entries() {
+    let manifest = Manifest::parse(&format!(
+        "[sources]\nteam = {{ git = \"https://git.example/recipes\", tag = \"v1\" }}\nlocal = {{ path = \"recipes\" }}\n{SANDBOX}"
+    ))
+    .expect("parses");
+
+    assert_eq!(manifest.sources["team"].tag.as_deref(), Some("v1"));
+    assert_eq!(
+        manifest.sources["local"].path.as_deref(),
+        Some(std::path::Path::new("recipes"))
+    );
+}
+
+#[test]
+fn a_source_recipe_is_split_only_for_declared_sources() {
+    let manifest = Manifest::parse(&format!(
+        "[sources]\nteam = {{ path = \"recipes\" }}\n{SANDBOX}"
+    ))
+    .expect("parses");
+
+    assert_eq!(
+        manifest.source_recipe("team/internal-api"),
+        Some(("team", "internal-api"))
+    );
+    assert_eq!(manifest.source_recipe("elixir"), None);
+    assert_eq!(manifest.source_recipe("./local.toml"), None);
+    assert_eq!(manifest.source_recipe("other/x"), None);
+    assert_eq!(manifest.source_recipe("team/"), None);
+}
+
+#[test]
+fn malformed_sources_are_refused_with_the_reason() {
+    for (spec, expected) in [
+        ("{ git = \"u\" }", "needs a `tag` or a `rev`"),
+        ("{ git = \"u\", tag = \"v1\", path = \"p\" }", "not both"),
+        ("{ }", "needs `git`"),
+        (
+            "{ path = \"p\", tag = \"v1\" }",
+            "only apply to a git source",
+        ),
+    ] {
+        let error = Manifest::parse(&format!("[sources]\nteam = {spec}\n{SANDBOX}"))
+            .expect_err(spec)
+            .to_string();
+        assert!(error.contains(expected), "{spec}: {error}");
+    }
+}

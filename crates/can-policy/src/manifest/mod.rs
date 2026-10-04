@@ -20,7 +20,7 @@
 //! command = "mix test"
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -38,11 +38,58 @@ use crate::config::{
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// Recipe repositories by name (ADR-0026). A sandbox names a recipe
+    /// from one as `<source>/<recipe>`; `canister.lock` pins each to a
+    /// revision.
+    #[serde(default)]
+    pub sources: BTreeMap<String, SourceSpec>,
+
     /// Named sandbox definitions.
     ///
     /// Each key is a sandbox name (e.g., "dev", "test", "ci").
     /// Order is preserved by the TOML parser for determining the default.
     pub sandbox: HashMap<String, SandboxDef>,
+}
+
+/// Where a source's recipes come from: a git repository pinned by a tag
+/// or a revision, or a directory relative to `canister.toml`.
+///
+/// ```toml
+/// [sources]
+/// team = { git = "https://git.example/team/canister-recipes", tag = "2026.1" }
+/// local = { path = "recipes" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpec {
+    #[serde(default)]
+    pub git: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+impl SourceSpec {
+    fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        let invalid = |why: &str| Err(ConfigError::Validation(format!("source '{name}': {why}")));
+        match (&self.git, &self.path) {
+            (Some(_), Some(_)) => invalid("either `git` or `path`, not both"),
+            (None, None) => invalid("needs `git` (with a `tag` or `rev`) or `path`"),
+            (Some(_), None) if self.tag.is_none() && self.rev.is_none() => invalid(
+                "a git source needs a `tag` or a `rev`, so a sandbox is built from a known version",
+            ),
+            (None, Some(_)) if self.tag.is_some() || self.rev.is_some() => {
+                invalid("`tag` and `rev` only apply to a git source")
+            }
+            _ if name.is_empty() || name.contains('/') => {
+                invalid("a source name is one word, without `/`")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// A named sandbox definition within the manifest.
@@ -137,6 +184,9 @@ impl Manifest {
                 "canister.toml must define at least one [sandbox.<name>] section".to_string(),
             ));
         }
+        for (name, source) in &self.sources {
+            source.validate(name)?;
+        }
         for (name, def) in &self.sandbox {
             def.validate(name)?;
         }
@@ -146,6 +196,15 @@ impl Manifest {
     /// Get a sandbox definition by name.
     pub fn get(&self, name: &str) -> Option<&SandboxDef> {
         self.sandbox.get(name)
+    }
+
+    /// Split a recipe name into a declared source and the recipe within
+    /// it: `team/internal-api` when `team` is a source; `None` for a
+    /// library recipe or a path.
+    pub fn source_recipe<'a>(&self, recipe: &'a str) -> Option<(&str, &'a str)> {
+        let (source, rest) = recipe.split_once('/')?;
+        let (name, _spec) = self.sources.get_key_value(source)?;
+        (!rest.is_empty()).then_some((name.as_str(), rest))
     }
 
     /// Return all sandbox names (sorted for deterministic output).

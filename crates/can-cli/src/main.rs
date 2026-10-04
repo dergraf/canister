@@ -9,6 +9,7 @@ mod keys;
 mod policy_event;
 mod recipes;
 mod registry;
+mod sources;
 mod tripwire;
 
 #[derive(Parser)]
@@ -141,6 +142,19 @@ enum Commands {
         ///   sudo can setup --pasta-path $(which pasta)
         #[arg(long)]
         pasta_path: Option<String>,
+    },
+
+    /// Pin the recipes canister.toml's sandboxes compose (ADR-0026).
+    ///
+    /// Writes canister.lock next to canister.toml: each git source's
+    /// revision and each recipe's SHA-256. With a lock, `can up` refuses a
+    /// recipe that changed or that the lock does not name, and a recipe
+    /// the lock pins keeps its credential scope.
+    Lock {
+        /// Resolve git sources' tags afresh instead of keeping the pinned
+        /// revisions.
+        #[arg(long)]
+        update: bool,
     },
 
     /// Generate an Ed25519 key for --events-sign-key (ADR-0021).
@@ -323,6 +337,7 @@ fn main() -> ExitCode {
             force,
             pasta_path,
         } => commands::setup(remove, force, pasta_path.as_deref()),
+        Commands::Lock { update } => sources::lock(update),
         Commands::Keygen { path, force } => keys::keygen(&path, force),
         Commands::Pubkey { path } => keys::pubkey(&path),
         Commands::Recipe { action } => match action {
