@@ -53,6 +53,7 @@ fn all_events() -> Vec<(&'static str, Event)> {
                 can_version: "0.1.0".to_string(),
                 command: vec!["python3".to_string(), "agent/main.py".to_string()],
                 sandbox: Some("ci".to_string()),
+                working_dir: Some("/work/project".to_string()),
                 monitor: false,
                 strict: true,
             }),

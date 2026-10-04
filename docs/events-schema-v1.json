@@ -830,6 +830,13 @@
         },
         "strict": {
           "type": "boolean"
+        },
+        "working_dir": {
+          "description": "Absolute path of the working directory the workload runs in (ADR-0025). Paths under it in the resolved policy differ between checkouts; a consumer comparing runs relativizes them against this.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

@@ -97,6 +97,11 @@ pub struct RunStart {
     /// Sandbox name from `canister.toml`, when the run came from `can up`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<String>,
+    /// Absolute path of the working directory the workload runs in
+    /// (ADR-0025). Paths under it in the resolved policy differ between
+    /// checkouts; a consumer comparing runs relativizes them against this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     pub monitor: bool,
     pub strict: bool,
 }
