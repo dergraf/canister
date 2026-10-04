@@ -266,6 +266,28 @@ impl ProxyServer {
         })
     }
 
+    /// [`run`](Self::run), and also serve transparent egress on
+    /// `listeners` (ADR-0027).
+    pub async fn run_transparent(
+        &self,
+        listener: tokio::net::TcpListener,
+        listeners: super::transparent::TransparentListeners,
+    ) -> Result<(), ProxyError> {
+        super::transparent::spawn(
+            listeners,
+            super::transparent::Shared {
+                ca: self.ca.clone(),
+                dns_cache: self.dns_cache.clone(),
+                outbound_policy: self.outbound_policy.clone(),
+                contracts: self.contracts.clone(),
+                limits: self.limits.clone(),
+                dlp: self.dlp.clone(),
+                capture: self.capture.clone(),
+            },
+        );
+        self.run(listener).await
+    }
+
     pub async fn run(&self, listener: tokio::net::TcpListener) -> Result<(), ProxyError> {
         info!("Proxy server listening on {}", listener.local_addr()?);
 
