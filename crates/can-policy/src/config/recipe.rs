@@ -339,10 +339,33 @@ impl RecipeFile {
 }
 
 fn expand_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let cwd = std::env::current_dir().ok();
     paths
         .into_iter()
-        .map(|p| PathBuf::from(expand_env_vars(&p.to_string_lossy())))
+        .map(|p| {
+            absolutize(
+                PathBuf::from(expand_env_vars(&p.to_string_lossy())),
+                cwd.as_deref(),
+            )
+        })
         .collect()
+}
+
+/// A relative path in a recipe means "under the working directory", the
+/// directory `can` mounts as the workload's own: mounting `notes` at
+/// `/notes` instead, or comparing it with the absolute working directory,
+/// would silently grant or withhold the wrong thing.
+pub(crate) fn absolutize(path: PathBuf, cwd: Option<&Path>) -> PathBuf {
+    match cwd {
+        Some(cwd) if path.is_relative() => {
+            let joined = cwd.join(&path);
+            joined
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect()
+        }
+        _ => path,
+    }
 }
 
 /// Env-expand the paths inside an explicit-allow exec policy; modes pass
