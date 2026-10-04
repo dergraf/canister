@@ -472,14 +472,14 @@ fn setup_parent_network(
                 drop(go_file);
 
                 // host.canister.local target — the address pasta was told
-                // to map to the host's loopback. A dedicated one: mapping
-                // the gateway instead would take the sandbox's resolver
-                // and default route with it.
-                let host_loopback_target = if config.network.allow_host_loopback {
-                    Some(std::net::IpAddr::V4(can_net::pasta::HOST_LOOPBACK_ADDR))
-                } else {
-                    None
-                };
+                // to map to the host's loopback: a dedicated one where
+                // pasta can be told, the gateway on a pasta too old for it.
+                let host_loopback_target = can_net::pasta::host_loopback_target(
+                    config.network.allow_host_loopback,
+                    can_net::pasta::supports_host_loopback_mapping(),
+                    can_net::pasta::detect_default_gateway(),
+                )
+                .map(std::net::IpAddr::V4);
 
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()

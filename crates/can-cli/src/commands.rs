@@ -700,6 +700,13 @@ pub fn check() -> Result<i32> {
     // Check network tooling.
     if can_net::pasta::is_available() {
         println!("  pasta:           available");
+        if !can_net::pasta::supports_host_loopback_mapping() {
+            println!(
+                "                   too old for --map-host-loopback: with [unsafe] host_loopback \
+                 the host is reached through the gateway, at the cost of DNS and egress \
+                 (pasta 2025_09_19 or newer keeps both)"
+            );
+        }
     } else {
         println!("  pasta:           NOT FOUND (needed for filtered network mode)");
         println!("                   Install with: sudo apt install passt");

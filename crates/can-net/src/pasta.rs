@@ -451,6 +451,31 @@ fn build_port_spec(ports: &[PortMapping], protocol: PortProtocol) -> Option<Stri
 /// own choosing carries no such second job.
 pub const HOST_LOOPBACK_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 1, 1);
 
+/// Whether this pasta can map the host's loopback to an address of our
+/// choosing (`--map-host-loopback`).
+pub fn supports_host_loopback_mapping() -> bool {
+    pasta_supports_option("--map-host-loopback")
+}
+
+/// Where the proxy reaches the host's loopback when `[unsafe]
+/// host_loopback` is on: the address [`host_loopback_args`] had pasta map.
+///
+/// A pasta with `--map-host-loopback` maps [`HOST_LOOPBACK_ADDR`]. An older
+/// one cannot be told an address and maps the default gateway instead, its
+/// built-in behaviour, so that is where the host's loopback is; `None`
+/// when there is no gateway to stand in for it.
+pub fn host_loopback_target(
+    allow: bool,
+    supports_map: bool,
+    gateway: Option<std::net::Ipv4Addr>,
+) -> Option<std::net::Ipv4Addr> {
+    match (allow, supports_map) {
+        (false, _) => None,
+        (true, true) => Some(HOST_LOOPBACK_ADDR),
+        (true, false) => gateway,
+    }
+}
+
 /// The pasta flags that decide whether — and how — the sandbox can reach
 /// services on the host's loopback.
 ///
@@ -483,9 +508,10 @@ fn host_loopback_args(allow: bool, supports_no_map_gw: bool, supports_map: bool)
 
         (true, _, false) => {
             tracing::warn!(
-                "[unsafe] host_loopback is on but this pasta has no --map-host-loopback, so the \
-                 gateway must be remapped to reach the host — DNS and outbound egress through \
-                 that address will not work. Upgrade pasta to keep both."
+                "[unsafe] host_loopback is on but this pasta has no --map-host-loopback: the host's \
+                 loopback is reached through the default gateway, which pasta remaps to it, so \
+                 DNS and outbound egress through that address will not work. Upgrade pasta \
+                 (2025_09_19 or newer) to keep both."
             );
             Vec::new()
         }
@@ -565,6 +591,23 @@ mod tests {
         // sandbox reaches the host — at the cost of egress. Warned, not
         // silently chosen.
         assert!(host_loopback_args(true, true, false).is_empty());
+    }
+
+    #[test]
+    fn the_host_loopback_target_is_what_pasta_was_told_to_map() {
+        let gateway = Some(std::net::Ipv4Addr::new(10, 0, 2, 2));
+
+        assert_eq!(host_loopback_target(false, true, gateway), None);
+        assert_eq!(
+            host_loopback_target(true, true, gateway),
+            Some(HOST_LOOPBACK_ADDR)
+        );
+        assert_eq!(
+            host_loopback_target(true, false, gateway),
+            gateway,
+            "an old pasta maps the gateway to the host's loopback, so the proxy dials that"
+        );
+        assert_eq!(host_loopback_target(true, false, None), None);
     }
 
     #[test]
