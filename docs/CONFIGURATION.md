@@ -402,6 +402,26 @@ Specifying `[unsafe] expose_ports` automatically upgrades None mode to
 Filtered mode (port forwarding requires a functional network namespace
 with pasta).
 
+### Transparent egress
+
+A client that ignores `HTTP_PROXY`/`HTTPS_PROXY` (a stdio MCP server started
+with a minimal environment, a tool that never reads them) cannot connect
+under `egress = "proxy"`, and no event says it tried.
+`transparent = true` routes it through the proxy anyway (ADR-0027):
+
+```toml
+[network]
+egress = "proxy"
+transparent = true
+```
+
+In the workload's network namespace every name then resolves to `127.0.0.1`,
+where the proxy also listens on 443 (routing by TLS SNI) and 80 (by `Host`).
+The request takes the same path a proxied one does: contracts, DLP, canaries,
+the undeclared-host sink and capture. The stub resolves nothing upstream.
+Ports other than 80 and 443 are not covered, IPv6 lookups get no answer, and
+the workload cannot serve on 80 or 443 on loopback itself.
+
 ### Undeclared hosts
 
 By default a request for a host with no `[[host]]` block is refused at

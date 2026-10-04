@@ -35,6 +35,7 @@ use super::util::{
 use crate::ca::DynamicCa;
 use crate::egress;
 use crate::policy::OutboundPolicy;
+use hyper_util::rt::TokioIo;
 
 /// Top-level dispatch: CONNECT → tunnel-or-passthrough; WebSocket → 501;
 /// everything else → inner handler.
@@ -133,17 +134,18 @@ async fn handle_connect(
     // The one exception is the undeclared-host sink (ADR-0018): it needs
     // the TLS handshake to see the request, and the tunnel it gets is
     // pinned to the sink, so nothing on it is ever forwarded.
-    let tunnel_sunk = !host_allowed_by_outbound_policy(&host_name_only, &outbound_policy);
-    if tunnel_sunk {
-        if dlp.is_none() || !super::sink::takes(&host_name_only, &outbound_policy, &contracts) {
-            crate::events::egress_blocked(&host_name_only, "CONNECT", "", "policy");
-            return Ok(
-                ProxyError::policy_blocked(&host_name_only, host_is_ip(&host_name_only))
-                    .into_response(),
-            );
-        }
-        crate::events::egress_blocked(&host_name_only, "CONNECT", "", crate::events::SINK_REASON);
-    }
+    let tunnel_sunk =
+        match tunnel_gate(&host_name_only, &outbound_policy, &contracts, dlp.is_some()) {
+            TunnelGate::Open => false,
+            TunnelGate::Sunk => true,
+            TunnelGate::Refused => {
+                return Ok(ProxyError::policy_blocked(
+                    &host_name_only,
+                    host_is_ip(&host_name_only),
+                )
+                .into_response());
+            }
+        };
 
     let dlp_for_tunnel = dlp.clone();
     let contracts_for_tunnel = contracts.clone();
@@ -152,7 +154,7 @@ async fn handle_connect(
             Ok(upgraded) => {
                 if let Some(ctx) = dlp_for_tunnel {
                     if let Err(e) = handle_tunnel(
-                        upgraded,
+                        TokioIo::new(upgraded),
                         host_name_only,
                         ca,
                         dns_cache.clone(),
@@ -185,6 +187,42 @@ async fn handle_connect(
     let mut resp = Response::new(empty_body());
     *resp.status_mut() = StatusCode::OK;
     Ok(resp)
+}
+
+/// What may happen to a tunnel to `host`, decided before any TLS work.
+pub(super) enum TunnelGate {
+    /// A declared host: terminate TLS and run the request pipeline.
+    Open,
+    /// An undeclared host the sink takes (ADR-0018): terminate TLS to see
+    /// the request, answer it locally, never forward it.
+    Sunk,
+    /// Turned away; the attempt is recorded.
+    Refused,
+}
+
+/// The connect gate, for a `CONNECT` and for a transparent TLS connection
+/// alike (ADR-0027), with its `egress_request` event.
+///
+/// Refusing before the TLS MITM means no fake server certificate is minted
+/// and no handshake run for an arbitrary destination. The one exception is
+/// the undeclared-host sink: it needs the handshake to see the request,
+/// and the tunnel it gets is pinned to the sink.
+pub(super) fn tunnel_gate(
+    host: &str,
+    outbound_policy: &OutboundPolicy,
+    contracts: &crate::contracts::ContractTable,
+    dlp_on: bool,
+) -> TunnelGate {
+    if host_allowed_by_outbound_policy(host, outbound_policy) {
+        return TunnelGate::Open;
+    }
+    if dlp_on && super::sink::takes(host, outbound_policy, contracts) {
+        crate::events::egress_blocked(host, "CONNECT", "", crate::events::SINK_REASON);
+        TunnelGate::Sunk
+    } else {
+        crate::events::egress_blocked(host, "CONNECT", "", "policy");
+        TunnelGate::Refused
+    }
 }
 
 /// Inner-request handling, after TLS termination (or from plain HTTP
