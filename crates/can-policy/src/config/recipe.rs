@@ -270,6 +270,7 @@ impl RecipeFile {
             filesystem: FilesystemConfig {
                 read: expand_paths(self.filesystem.read),
                 write: expand_paths(self.filesystem.write),
+                workdir: self.filesystem.workdir,
                 deny: expand_paths(self.filesystem.deny),
                 mask: self.filesystem.mask,
                 decoy: expand_paths(self.filesystem.decoy),
