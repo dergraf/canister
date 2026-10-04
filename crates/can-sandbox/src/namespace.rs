@@ -1359,7 +1359,12 @@ fn enter_pid_namespace_supervised(
     match unsafe { nix::unistd::fork() }.map_err(process::ProcessError::PidFork)? {
         nix::unistd::ForkResult::Parent { child } => {
             // Intermediate process (old PID namespace): wait for PID 1 child.
-            // Drop all supervisor-related fds.
+            // Drop all supervisor-related fds. With a supervisor, its stream
+            // belongs to PID 1, which seals it; this copy of the connection
+            // goes without writing, so the seal is the stream's only one.
+            if supervisor_context.is_some() {
+                can_events::uninstall();
+            }
             drop(supervisor_context);
 
             // Forward signals to PID 1 child so that killing the parent
@@ -1440,6 +1445,11 @@ fn enter_pid_namespace_supervised(
                                         &policy,
                                         worker,
                                     );
+                                    // The supervisor's defined end: the worker
+                                    // is gone, nothing more can be observed.
+                                    // A seal here, even over no events, says
+                                    // the stream is complete (ADR-0016).
+                                    can_events::seal();
                                     std::process::exit(code);
                                 }
                                 Err(e) => {
@@ -1450,6 +1460,7 @@ fn enter_pid_namespace_supervised(
                                     let _ =
                                         nix::sys::signal::kill(worker, nix::sys::signal::SIGKILL);
                                     let _ = waitpid(worker, None);
+                                    can_events::seal();
                                     std::process::exit(126);
                                 }
                             }
