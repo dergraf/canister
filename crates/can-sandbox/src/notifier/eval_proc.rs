@@ -76,6 +76,23 @@ pub(super) fn is_exec_path_allowed(canonical: &Path, policy: &NotifierPolicy) ->
     false
 }
 
+/// The `process_exec` event for an exec the supervisor decided on: the
+/// supervised half of what the schema's `process_exec` promises (the
+/// sandbox entrypoint is the CLI's).
+fn exec_event(pid: u32, path: &Path, allowed: bool, reason: Option<&str>) -> can_events::Event {
+    can_events::Event::ProcessExec(can_events::schema::ProcessExec {
+        path: path.display().to_string(),
+        argv: Vec::new(),
+        pid: Some(pid),
+        decision: if allowed {
+            can_events::schema::Decision::Allowed
+        } else {
+            can_events::schema::Decision::Blocked
+        },
+        reason: reason.map(str::to_string),
+    })
+}
+
 /// Evaluate an `execve()` syscall.
 ///
 /// `execve(pathname, argv, envp)`: `args[0]` = pointer to pathname.
@@ -109,9 +126,11 @@ pub(super) fn evaluate_execve(
 
     if is_exec_path_allowed(&canonical, policy) {
         tracing::debug!(pid, path = %canonical.display(), "execve: allowed");
+        can_events::emit(exec_event(pid, &canonical, true, None));
         Verdict::Allow
     } else {
         tracing::warn!(pid, path = %canonical.display(), "execve: denied by policy");
+        can_events::emit(exec_event(pid, &canonical, false, Some("exec_policy")));
         Verdict::Deny(libc::EACCES as u32)
     }
 }
@@ -142,6 +161,7 @@ pub(super) fn evaluate_execveat(
             pid,
             "execveat: AT_EMPTY_PATH used (potential fileless execution), denying"
         );
+        can_events::emit(exec_event(pid, Path::new(""), false, Some("fileless_exec")));
         return Verdict::Deny(libc::EACCES as u32);
     }
 
@@ -163,9 +183,37 @@ pub(super) fn evaluate_execveat(
 
     if is_exec_path_allowed(&canonical, policy) {
         tracing::debug!(pid, path = %canonical.display(), "execveat: allowed");
+        can_events::emit(exec_event(pid, &canonical, true, None));
         Verdict::Allow
     } else {
         tracing::warn!(pid, path = %canonical.display(), "execveat: denied by policy");
+        can_events::emit(exec_event(pid, &canonical, false, Some("exec_policy")));
         Verdict::Deny(libc::EACCES as u32)
+    }
+}
+
+#[cfg(test)]
+mod exec_event_tests {
+    use super::*;
+
+    #[test]
+    fn an_allowed_exec_names_the_path_and_the_process() {
+        let event = exec_event(42, Path::new("/usr/bin/curl"), true, None);
+        let json = serde_json::to_value(&event).expect("serializes");
+
+        assert_eq!(json["event"], "process_exec");
+        assert_eq!(json["data"]["path"], "/usr/bin/curl");
+        assert_eq!(json["data"]["pid"], 42);
+        assert_eq!(json["data"]["decision"], "allowed");
+        assert!(json["data"].get("reason").is_none());
+    }
+
+    #[test]
+    fn a_denied_exec_says_why() {
+        let event = exec_event(7, Path::new("/tmp/x"), false, Some("exec_policy"));
+        let json = serde_json::to_value(&event).expect("serializes");
+
+        assert_eq!(json["data"]["decision"], "blocked");
+        assert_eq!(json["data"]["reason"], "exec_policy");
     }
 }
