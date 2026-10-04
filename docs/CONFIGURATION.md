@@ -296,6 +296,7 @@ paths and essential system paths are bind-mounted read-only.
 |-------|------|---------|-------------|
 | `read` | `string[]` | `[]` | Paths bind-mounted **read-only** into the sandbox |
 | `write` | `string[]` | `[]` | Paths bind-mounted **writable** — changes persist on the host |
+| `workdir` | `"write"` \| `"read"` | `"write"` | How the working directory is mounted. `read` mounts it read-only: only `write` entries are writable, including ones inside it. An explicit `read` in any recipe wins when recipes are composed (ADR-0024). |
 | `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** `read`/`write`) |
 | `decoy` | `string[]` | `[]` | Tripwires: an empty read-only decoy file is placed at each path, and any access to it is reported as an `fs_access` event (ADR-0019). Never replaces a path that `read`, `write` or the working directory provides. `recipes = ["tripwires"]` covers the usual credential locations. |
 
@@ -311,6 +312,9 @@ honestly; `write` is the one that persists to the host.
   directory appears empty and unreadable, a file reads as empty. A denied
   path that is a symlink inside a mounted path is refused at startup — deny
   its target instead.
+- The working directory is mounted writable unless `workdir = "read"`; a
+  `write` entry naming it (or a parent) makes it writable either way. The
+  resolved policy (`can recipe show`, `policy_resolved`) states which.
 - Paths are matched by prefix: allowing `/usr/lib` also allows `/usr/lib/python3`.
 - Essential paths are defined in `recipes/base.toml` (embedded in the binary,
   overridable on disk) and always bind-mounted: `/bin`, `/sbin`, `/usr/bin`,

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::unistd::pivot_root;
 
-use can_policy::config::FilesystemConfig;
+use can_policy::config::{FilesystemConfig, WorkdirAccess};
 
 /// Errors from filesystem setup.
 #[derive(Debug, thiserror::Error)]
@@ -122,8 +122,8 @@ fn is_permission_error(err: nix::Error) -> bool {
 ///
 /// Creates a tmpfs root, bind-mounts allowed paths (which now include
 /// essential OS paths from base.toml), mounts /proc, and does pivot_root.
-/// If `host_cwd` is provided, it is bind-mounted writable into the sandbox
-/// and the process chdir's there after pivot_root.
+/// If `host_cwd` is provided, it is bind-mounted into the sandbox (writable
+/// unless `workdir = "read"`) and the process chdir's there after pivot_root.
 ///
 /// Returns `Err` if mount operations are blocked (e.g., by AppArmor).
 pub fn setup_filesystem(
@@ -181,8 +181,10 @@ pub fn setup_filesystem(
     let sandbox_tmp = sandbox_root.join("tmp");
     mount_tmpfs(&sandbox_tmp, writable_noexec)?;
 
-    // 5b. Bind-mount the host CWD writable so the sandboxed process
-    //     can read and write project files (e.g., `mix new`, `cargo build`).
+    // 5b. Bind-mount the host CWD so the sandboxed process can read and
+    //     write project files (e.g., `mix new`, `cargo build`). With
+    //     `workdir = "read"` (ADR-0024) it is read-only, and the `write`
+    //     entries inside it are mounted again over it so they stay writable.
     if let Some(cwd) = host_cwd {
         let rel = cwd.strip_prefix("/").unwrap_or(cwd);
         let target = sandbox_root.join(rel);
@@ -190,12 +192,21 @@ pub fn setup_filesystem(
             mkdir_p(parent)?;
         }
         mkdir_p(&target)?;
-        bind_mount_rw(cwd, &target, writable_noexec)?;
+        let writable = workdir_writable(config, cwd);
+        if writable {
+            bind_mount_rw(cwd, &target, writable_noexec)?;
+        } else {
+            bind_mount_ro(cwd, &target)?;
+            for source in writable_within(config, cwd) {
+                bind_mount_writable(&sandbox_root, &source, config, writable_noexec)?;
+            }
+        }
         tracing::info!(
             source = %cwd.display(),
             target = %target.display(),
+            writable,
             noexec = writable_noexec,
-            "CWD bind-mounted writable"
+            "CWD bind-mounted"
         );
     }
 
@@ -316,35 +327,64 @@ fn bind_mount_writable_paths(
     noexec: bool,
 ) -> Result<(), OverlayError> {
     for source in &config.write {
-        if !source.exists() {
-            tracing::warn!(path = %source.display(), "writable path not found, skipping");
-            continue;
-        }
-
-        // Check if this path is denied.
-        let denied = config.deny.iter().any(|d| source.starts_with(d));
-        if denied {
-            tracing::warn!(path = %source.display(), "writable path is also in deny list, skipping");
-            continue;
-        }
-
-        let rel = source.strip_prefix("/").unwrap_or(source);
-        let target = root.join(rel);
-
-        if let Some(parent) = target.parent() {
-            mkdir_p(parent)?;
-        }
-
-        if source.is_dir() {
-            mkdir_p(&target)?;
-        } else {
-            touch(&target)?;
-        }
-
-        bind_mount_rw(source, &target, noexec)?;
-        tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
+        bind_mount_writable(root, source, config, noexec)?;
     }
     Ok(())
+}
+
+/// Mount one `write` entry writable, skipping one that does not exist or
+/// that a `deny` entry covers.
+fn bind_mount_writable(
+    root: &Path,
+    source: &Path,
+    config: &FilesystemConfig,
+    noexec: bool,
+) -> Result<(), OverlayError> {
+    if !source.exists() {
+        tracing::warn!(path = %source.display(), "writable path not found, skipping");
+        return Ok(());
+    }
+
+    let denied = config.deny.iter().any(|d| source.starts_with(d));
+    if denied {
+        tracing::warn!(path = %source.display(), "writable path is also in deny list, skipping");
+        return Ok(());
+    }
+
+    let rel = source.strip_prefix("/").unwrap_or(source);
+    let target = root.join(rel);
+
+    if let Some(parent) = target.parent() {
+        mkdir_p(parent)?;
+    }
+
+    if source.is_dir() {
+        mkdir_p(&target)?;
+    } else {
+        touch(&target)?;
+    }
+
+    bind_mount_rw(source, &target, noexec)?;
+    tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
+    Ok(())
+}
+
+/// Whether the working directory is mounted writable: unless
+/// `workdir = "read"` (ADR-0024), or a `write` entry covers it anyway.
+fn workdir_writable(config: &FilesystemConfig, cwd: &Path) -> bool {
+    config.workdir() == WorkdirAccess::Write || config.write.iter().any(|w| cwd.starts_with(w))
+}
+
+/// The `write` entries strictly inside a read-only working directory:
+/// mounted before it, they would be hidden by it, so they are mounted
+/// again on top.
+fn writable_within(config: &FilesystemConfig, cwd: &Path) -> Vec<PathBuf> {
+    config
+        .write
+        .iter()
+        .filter(|w| w.starts_with(cwd) && w.as_path() != cwd)
+        .cloned()
+        .collect()
 }
 
 /// Deny entries that lie strictly inside a path that will be mounted: a
@@ -988,6 +1028,54 @@ mod tests {
 
     fn paths(list: &[&str]) -> Vec<PathBuf> {
         list.iter().map(PathBuf::from).collect()
+    }
+
+    fn read_only_workdir(write: &[&str]) -> FilesystemConfig {
+        FilesystemConfig {
+            workdir: Some(can_policy::config::WorkdirAccess::Read),
+            ..config(&[], write, &[])
+        }
+    }
+
+    #[test]
+    fn the_working_directory_is_writable_by_default() {
+        assert!(workdir_writable(
+            &config(&[], &[], &[]),
+            Path::new("/work/project")
+        ));
+    }
+
+    #[test]
+    fn a_read_only_working_directory_stays_read_only() {
+        assert!(!workdir_writable(
+            &read_only_workdir(&[]),
+            Path::new("/work/project")
+        ));
+    }
+
+    #[test]
+    fn a_write_entry_covering_the_working_directory_makes_it_writable() {
+        for write in ["/work/project", "/work"] {
+            assert!(
+                workdir_writable(&read_only_workdir(&[write]), Path::new("/work/project")),
+                "{write}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_entries_inside_a_read_only_working_directory_are_mounted_again() {
+        let config = read_only_workdir(&["/work/project/notes", "/var/cache/app", "/work/project"]);
+
+        assert_eq!(
+            writable_within(&config, Path::new("/work/project")),
+            paths(&["/work/project/notes"]),
+            "only what lies strictly inside it, and only what the read-only mount would hide"
+        );
+        assert_eq!(
+            writable_within(&config, Path::new("/elsewhere")),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]
