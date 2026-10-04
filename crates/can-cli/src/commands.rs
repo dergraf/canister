@@ -601,6 +601,9 @@ fn run_sandbox(opts: &mut SandboxOpts, sandbox_name: Option<&str>) -> Result<i32
         can_version: env!("CARGO_PKG_VERSION").to_string(),
         command: command_line.clone(),
         sandbox: sandbox_name.map(str::to_string),
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string()),
         monitor: opts.monitor,
         strict: opts.strict,
     }));

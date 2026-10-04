@@ -58,6 +58,7 @@ fn run_start() -> Event {
         can_version: "0.1.0".to_string(),
         command: vec!["python3".to_string(), "agent.py".to_string()],
         sandbox: Some("ci".to_string()),
+        working_dir: None,
         monitor: false,
         strict: true,
     })
@@ -425,4 +426,11 @@ fn global_emit_is_a_no_op_until_installed() {
     let lines = buf.lines();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("b.example"));
+}
+
+#[test]
+fn a_run_start_from_before_working_dir_still_parses() {
+    let old = r#"{"can_version":"0.2.1","command":["agent"],"monitor":false,"strict":false}"#;
+    let parsed: RunStart = serde_json::from_str(old).expect("older run_start parses");
+    assert_eq!(parsed.working_dir, None);
 }

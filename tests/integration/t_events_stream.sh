@@ -135,6 +135,25 @@ PYEOF
 assert_eq "3" "$EXIT_CODE" "run_end exit_code"
 
 # ---------------------------------------------------------------------------
+begin_test "run_start records the working directory"
+WORKDIR_RUN=$(mktemp -d)
+EVENTS_FILE_CWD="${EVENTS_DIR}/cwd.jsonl"
+(cd "$WORKDIR_RUN" && run_can run --recipe "$CONFIG" \
+    --events-file "$EVENTS_FILE_CWD" --run-id r-cwd -- /bin/true)
+
+RECORDED_DIR=$(python3 - "$EVENTS_FILE_CWD" <<'PYEOF'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    event = json.loads(line)
+    if event["event"] == "run_start":
+        print(event["data"].get("working_dir", "missing"))
+        break
+PYEOF
+)
+assert_eq "$WORKDIR_RUN" "$RECORDED_DIR" "run_start working_dir"
+rm -rf "$WORKDIR_RUN"
+
+# ---------------------------------------------------------------------------
 begin_test "policy_resolved carries a hash that is stable across identical runs"
 POLICY_A="${EVENTS_DIR}/policy_a.jsonl"
 POLICY_B="${EVENTS_DIR}/policy_b.jsonl"
