@@ -21,6 +21,11 @@ use super::tunnel::{serve_tls, server_config};
 use crate::ca::DynamicCa;
 use crate::policy::OutboundPolicy;
 
+/// `egress_request.reason` for a transparent TLS connection whose client
+/// aborted the handshake, typically because it does not trust the sandbox
+/// CA (it read neither `SSL_CERT_FILE` nor the proxy settings).
+pub const CLIENT_REJECTED_CA: &str = "client_rejected_ca";
+
 /// The sockets transparent egress serves, bound in the workload's network
 /// namespace: TLS on 443, plain HTTP on 80, the stub resolver on 53.
 pub struct TransparentListeners {
@@ -88,7 +93,16 @@ async fn tls_connection(tcp: TcpStream, shared: Shared) {
 
     let result = async {
         let config = server_config(&shared.ca, &host)?;
-        let tls = start.into_stream(config).await?;
+        // A client reaching the proxy without its proxy settings may well
+        // lack the CA they would have brought (`SSL_CERT_FILE`) and abort
+        // the handshake. The attempt is then recorded, not lost.
+        let tls = match start.into_stream(config).await {
+            Ok(tls) => tls,
+            Err(e) => {
+                crate::events::egress_blocked(&host, "CONNECT", "", CLIENT_REJECTED_CA);
+                return Err(e);
+            }
+        };
         serve_tls(
             tls,
             shared.dns_cache,
