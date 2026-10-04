@@ -7,6 +7,8 @@
 #   1. A signed run seals each stream that emitted events, the syscall
 #      supervisor's included
 #   2. Each stream has exactly one seal, and it is the stream's last event
+#   3. With an exec allow-list, the supervisor reports each exec it decided
+#      on as process_exec, allowed or blocked, before its seal
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -48,5 +50,38 @@ if echo "$REPORT" | grep -qv ':1:seal-last$'; then
 else
     pass
 fi
+
+SH_PATH=$(readlink -f "$(command -v sh)")
+TRUE_PATH=$(readlink -f "$(command -v true)")
+EXEC_RECIPE=$(tmpconfig <<TOML
+[process]
+exec = ["$SH_PATH", "$(command -v sh)", "$TRUE_PATH", "$(command -v true)"]
+TOML
+)
+_TMPFILES+=("$EXEC_RECIPE")
+EXEC_EVENTS="$WORK/exec.jsonl"
+
+run_can run --recipe "$EXEC_RECIPE" --events-file "$EXEC_EVENTS" \
+    --events-sign-key "$WORK/seal.key" --run-id r-exec \
+    -- sh -c "$TRUE_PATH; /bin/ls >/dev/null 2>&1; echo ran"
+
+SUPERVISED=$(python3 - "$EXEC_EVENTS" <<'PY'
+import json, sys
+events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+supervisor = [e for e in events if e["stream"] == "supervisor"]
+execs = [(e["data"]["path"].rsplit("/", 1)[-1], e["data"]["decision"]) for e in supervisor if e["event"] == "process_exec"]
+print(" ".join(f"{name}:{decision}" for name, decision in execs))
+print("sealed-last" if supervisor and supervisor[-1]["event"] == "stream_seal" else "unsealed")
+PY
+)
+
+begin_test "the supervisor reports an exec it allowed"
+assert_contains "$SUPERVISED" "true:allowed"
+
+begin_test "the supervisor reports an exec it blocked"
+assert_contains "$SUPERVISED" "ls:blocked"
+
+begin_test "the supervisor's exec events come before its seal"
+assert_contains "$SUPERVISED" "sealed-last"
 
 summary
