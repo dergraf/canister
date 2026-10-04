@@ -36,6 +36,10 @@ certificate and takes the same path a `CONNECT` takes; on 80 it routes plain HTT
 **Cons**:
 - Only ports 443 and 80. A client dialling another port still fails unseen.
 - The workload cannot serve on 80 or 443 on loopback itself while it is on.
+- A client that ignores the proxy settings often also ignores `SSL_CERT_FILE`
+  (Python's `httpx` uses `certifi`'s own bundle), so it rejects the sandbox CA and no
+  request is ever made. The attempt is recorded (`reason: client_rejected_ca`, with the
+  host from SNI); what it would have sent is not.
 - `AAAA` gets no answer, so a client insisting on IPv6 fails.
 **Estimated effort**: Medium.
 
@@ -66,7 +70,8 @@ moves to its own, as it does for its main listener, after lowering that namespac
 `ip_unprivileged_port_start` to 0 (the namespace is the sandbox's own). If it cannot bind
 them, the run stops: transparent egress was asked for, and going without would hide
 exactly the traffic it exists to show. The worker's `resolv.conf` names the stub. A
-transparent TLS connection without SNI is refused and recorded (`reason: no_sni`). The
+transparent TLS connection without SNI is refused and recorded (`reason: no_sni`); one
+whose client aborts the handshake is recorded as `reason: client_rejected_ca`. The
 connect gate is shared with `CONNECT`, so a refused or sunk transparent attempt records
 the same `egress_request` events. `transparent` is rendered in the resolved policy only
 when on; any layer turning it on wins when recipes compose, since it changes what is
