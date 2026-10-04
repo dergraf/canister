@@ -24,6 +24,13 @@ pub struct FilesystemConfig {
     #[serde(default)]
     pub write: Vec<PathBuf>,
 
+    /// Whether the working directory is mounted writable (ADR-0024).
+    /// `write` (default) lets the sandboxed process change project files;
+    /// `read` mounts it read-only, so only `write` entries are writable,
+    /// including ones inside the working directory.
+    #[serde(default)]
+    pub workdir: Option<WorkdirAccess>,
+
     /// Paths explicitly denied (checked before `read` and `write`).
     #[serde(default)]
     pub deny: Vec<PathBuf>,
@@ -57,6 +64,34 @@ pub struct FilesystemConfig {
     pub decoys: Vec<DecoyMount>,
 }
 
+/// How the working directory is mounted into the sandbox (ADR-0024).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkdirAccess {
+    /// Writable: changes to project files persist on the host.
+    #[default]
+    Write,
+    /// Read-only: only `write` entries are writable.
+    Read,
+}
+
+/// An explicit `read` in any layer wins: it is the narrower access, so a
+/// layer that pins it cannot be widened by a later one.
+fn merge_workdir(
+    base: Option<WorkdirAccess>,
+    overlay: Option<WorkdirAccess>,
+) -> Option<WorkdirAccess> {
+    match (base, overlay) {
+        (Some(WorkdirAccess::Read), _) | (_, Some(WorkdirAccess::Read)) => {
+            Some(WorkdirAccess::Read)
+        }
+        (Some(WorkdirAccess::Write), _) | (_, Some(WorkdirAccess::Write)) => {
+            Some(WorkdirAccess::Write)
+        }
+        (None, None) => None,
+    }
+}
+
 /// A host decoy file and the sandbox path it is mounted at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecoyMount {
@@ -65,10 +100,16 @@ pub struct DecoyMount {
 }
 
 impl FilesystemConfig {
+    /// Resolved working-directory access (writable if unset).
+    pub fn workdir(&self) -> WorkdirAccess {
+        self.workdir.unwrap_or_default()
+    }
+
     pub fn merge(self, overlay: Self) -> Self {
         Self {
             read: union_vecs(self.read, overlay.read),
             write: union_vecs(self.write, overlay.write),
+            workdir: merge_workdir(self.workdir, overlay.workdir),
             deny: union_vecs(self.deny, overlay.deny),
             mask: union_vecs(self.mask, overlay.mask),
             decoy: union_vecs(self.decoy, overlay.decoy),
@@ -205,6 +246,61 @@ impl PortMapping {
                 })
             }
             _ => Err(format!("invalid port mapping: {s}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filesystem(toml_src: &str) -> FilesystemConfig {
+        toml::from_str(toml_src).expect("filesystem config parses")
+    }
+
+    #[test]
+    fn workdir_defaults_to_writable() {
+        let config = filesystem("");
+        assert_eq!(config.workdir, None);
+        assert_eq!(config.workdir(), WorkdirAccess::Write);
+    }
+
+    #[test]
+    fn workdir_parses_both_modes_and_nothing_else() {
+        assert_eq!(
+            filesystem("workdir = \"read\"").workdir(),
+            WorkdirAccess::Read
+        );
+        assert_eq!(
+            filesystem("workdir = \"write\"").workdir(),
+            WorkdirAccess::Write
+        );
+        assert!(toml::from_str::<FilesystemConfig>("workdir = \"none\"").is_err());
+        assert!(toml::from_str::<FilesystemConfig>("workdir = false").is_err());
+    }
+
+    #[test]
+    fn workdir_merge_table() {
+        use WorkdirAccess::{Read, Write};
+        let cases = [
+            (None, None, None),
+            (None, Some(Write), Some(Write)),
+            (Some(Write), None, Some(Write)),
+            (None, Some(Read), Some(Read)),
+            (Some(Read), None, Some(Read)),
+            (Some(Read), Some(Write), Some(Read)),
+            (Some(Write), Some(Read), Some(Read)),
+        ];
+        for (base, overlay, expected) in cases {
+            let merged = FilesystemConfig {
+                workdir: base,
+                ..Default::default()
+            }
+            .merge(FilesystemConfig {
+                workdir: overlay,
+                ..Default::default()
+            });
+            assert_eq!(merged.workdir, expected, "{base:?} merged with {overlay:?}");
         }
     }
 }

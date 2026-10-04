@@ -17,6 +17,7 @@ pub fn resolved(config: &SandboxConfig) -> SandboxConfig {
     let mut resolved = config.clone();
     resolved.network.egress = Some(resolved.network.egress());
     resolved.network.undeclared_hosts = Some(resolved.network.undeclared_hosts());
+    resolved.filesystem.workdir = Some(resolved.filesystem.workdir());
     resolved.syscalls.seccomp_mode = Some(resolved.syscalls.seccomp_mode());
     resolved
 }
@@ -274,5 +275,18 @@ mod tests {
 
         assert_eq!(sink_policy["network"]["undeclared_hosts"], "sink");
         assert_ne!(default_hash, sink_hash);
+    }
+
+    #[test]
+    fn the_rendered_policy_says_whether_the_working_directory_is_writable() {
+        let (default_policy, default_hash) = canonical(&config()).expect("canonical");
+        assert_eq!(default_policy["filesystem"]["workdir"], "write");
+
+        let mut read_only = config();
+        read_only.filesystem.workdir = Some(can_policy::config::WorkdirAccess::Read);
+        let (read_policy, read_hash) = canonical(&read_only).expect("canonical");
+
+        assert_eq!(read_policy["filesystem"]["workdir"], "read");
+        assert_ne!(default_hash, read_hash);
     }
 }

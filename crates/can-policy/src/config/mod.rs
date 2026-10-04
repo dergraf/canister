@@ -29,7 +29,7 @@ mod unsafe_config;
 pub use dlp::{DlpConfig, ExternalCanary, FakeSecret};
 pub use env::expand_env_vars;
 pub use error::ConfigError;
-pub use filesystem::{DecoyMount, FilesystemConfig, PortMapping, PortProtocol};
+pub use filesystem::{DecoyMount, FilesystemConfig, PortMapping, PortProtocol, WorkdirAccess};
 pub use host::{
     ContractMode, EntropyBudgetWithoutCredentials, HostBlock, UpstreamParseError, UpstreamTarget,
     merge_host_blocks,
