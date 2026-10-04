@@ -370,6 +370,11 @@ async fn run_request_stages(
         super::secret_swap::swap_in_headers(&ctx.swaps, &ctx.scanner, host, &mut parts.headers);
     }
 
+    // After the capture above, so it records what the workload offered.
+    if let Some(recorder) = recorder.as_deref() {
+        recorder.ctx().narrow_accept_encoding(&mut parts.headers);
+    }
+
     let mut upstream_req = Request::from_parts(parts, req_body);
     if original_scheme == "h2c" {
         egress::sanitize_h2c_headers(&mut upstream_req);

@@ -91,6 +91,9 @@ pub struct CaptureConfig {
     pub exchanges: bool,
     /// Per-body cap; larger bodies are truncated and flagged.
     pub max_bytes: usize,
+    /// Offer upstreams only encodings any consumer can decode with zlib
+    /// (ADR-0023), so captured responses stay readable.
+    pub readable_encodings: bool,
 }
 
 impl CaptureConfig {
@@ -102,6 +105,7 @@ impl Default for CaptureConfig {
         Self {
             exchanges: false,
             max_bytes: Self::DEFAULT_MAX_BYTES,
+            readable_encodings: false,
         }
     }
 }

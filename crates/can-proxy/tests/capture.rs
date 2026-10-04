@@ -69,6 +69,19 @@ async fn start_upstream() -> SocketAddr {
             let io = hyper_util::rt::TokioIo::new(stream);
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    if req.uri().path() == "/accept-encoding" {
+                        let offered = req
+                            .headers()
+                            .get("accept-encoding")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("(none)")
+                            .to_string();
+                        return Ok::<_, hyper::Error>(Response::new(
+                            Full::new(hyper::body::Bytes::from(offered))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        ));
+                    }
                     let streaming = req.uri().path() == "/stream";
                     let split_secret = req.uri().path() == "/split-secret";
                     let bytes = req.into_body().collect().await.expect("body").to_bytes();
@@ -202,6 +215,7 @@ async fn capture_records_exchanges_without_ever_leaking_a_real_secret() {
     let capture = can_events::CaptureConfig {
         exchanges: true,
         max_bytes: 64 * 1024,
+        readable_encodings: false,
     };
     install_stream(&socket_path, capture.clone());
 
@@ -291,6 +305,7 @@ async fn streamed_responses_keep_their_chunk_boundaries() {
     let capture = can_events::CaptureConfig {
         exchanges: true,
         max_bytes: 64 * 1024,
+        readable_encodings: false,
     };
     install_stream(&socket_path, capture.clone());
 
@@ -356,6 +371,7 @@ async fn bodies_over_the_cap_are_truncated_and_flagged() {
     let capture = can_events::CaptureConfig {
         exchanges: true,
         max_bytes: 16,
+        readable_encodings: false,
     };
     install_stream(&socket_path, capture.clone());
 
@@ -432,6 +448,7 @@ async fn a_secret_split_across_frames_does_not_survive_in_the_chunks() {
     let capture = can_events::CaptureConfig {
         exchanges: true,
         max_bytes: 64 * 1024,
+        readable_encodings: false,
     };
     install_stream(&socket_path, capture.clone());
 
@@ -478,5 +495,57 @@ async fn a_secret_split_across_frames_does_not_survive_in_the_chunks() {
     assert!(
         !rejoined.contains(REAL_SECRET),
         "chunks rejoin into the credential: {rejoined}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn readable_encodings_narrow_what_the_upstream_is_offered_but_not_the_capture() {
+    let _guard = STREAM_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("events.sock");
+    let reader = SocketReader::listen(&socket_path);
+
+    let capture = can_events::CaptureConfig {
+        exchanges: true,
+        max_bytes: 64 * 1024,
+        readable_encodings: true,
+    };
+    install_stream(&socket_path, capture.clone());
+
+    let upstream = start_upstream().await;
+    let proxy_addr = start_proxy(capture).await;
+
+    let seen = client(proxy_addr)
+        .get(format!(
+            "http://127.0.0.1:{}/accept-encoding",
+            upstream.port()
+        ))
+        .header("accept-encoding", "gzip, deflate, br, zstd")
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+
+    assert_eq!(
+        seen, "gzip, deflate",
+        "the upstream is offered only what zlib decodes"
+    );
+
+    let (events, _raw) = reader.finish();
+    let captured = exchanges(&events);
+    let request_headers = captured[0]["data"]["request"]["headers"]
+        .as_array()
+        .expect("headers");
+    let recorded = request_headers
+        .iter()
+        .find(|pair| pair[0] == "accept-encoding")
+        .map(|pair| pair[1].as_str().expect("value"));
+
+    assert_eq!(
+        recorded,
+        Some("gzip, deflate, br, zstd"),
+        "the capture records what the workload asked for"
     );
 }
