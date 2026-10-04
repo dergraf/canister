@@ -123,15 +123,29 @@ fn load_recipes(recipe_args: &[String], _command: Option<&str>) -> Result<Sandbo
 /// credential scope in them is dropped exactly as it is for any other
 /// unpinned recipe, and has to come from the manifest, which the project
 /// controls (ADR-0017).
-fn load_manifest_recipes(def: &SandboxDef, extra_recipes: &[String]) -> Result<SandboxConfig> {
+///
+/// With a `canister.lock`, every manifest recipe must match its pin, and a
+/// pinned recipe keeps its credential scope: the lock is as reviewed as the
+/// manifest (ADR-0026).
+fn load_manifest_recipes(
+    def: &SandboxDef,
+    extra_recipes: &[String],
+    resolver: &crate::sources::Resolver<'_>,
+    lock: Option<&can_policy::Lockfile>,
+) -> Result<SandboxConfig> {
     // 1. Start with base.toml.
     let mut merged = resolve_base().context("loading base.toml")?;
     tracing::debug!("loaded base.toml (essential OS mounts)");
 
     // 2. Merge recipes listed in the manifest.
     for recipe_name in &def.recipes {
-        let path = resolve_recipe_path(recipe_name)?;
-        let recipe = RecipeFile::from_file(&path)
+        let path = resolver.resolve(recipe_name)?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading recipe: {}", path.display()))?;
+        if let Some(lock) = lock {
+            lock.check(recipe_name, &content)?;
+        }
+        let recipe = RecipeFile::from_content(&path, &content, lock.is_some())
             .with_context(|| format!("loading recipe: {}", path.display()))?;
 
         tracing::info!(
@@ -254,12 +268,19 @@ pub fn up(args: UpArgs<'_>) -> Result<i32> {
     }
     println!();
 
-    // Compose recipes.
-    let mut config = load_manifest_recipes(def, extra_recipes)?;
+    // Compose recipes, pinned by canister.lock when there is one.
+    let manifest_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let lock = crate::sources::read_lock(manifest_dir)?;
+    let resolver = crate::sources::Resolver::locked(&manifest, manifest_dir, lock.as_ref())?;
+    let mut config = load_manifest_recipes(def, extra_recipes, &resolver, lock.as_ref())?;
 
     // Auto-mask canister.toml so the sandboxed process cannot read the
     // security policy. This is the core anti-detection mechanism.
     config.filesystem.mask.push(manifest_path.clone());
+    let lock_path = manifest_dir.join(can_policy::LOCK_FILENAME);
+    if lock_path.is_file() {
+        config.filesystem.mask.push(lock_path);
+    }
 
     // Auto-mask .canister/ directory so local recipes are not visible
     // inside the sandbox.
@@ -1097,6 +1118,144 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// Compose `def` with no `[sources]` and no lock, as before ADR-0026.
+    fn compose(def: &SandboxDef, extra: &[String]) -> Result<SandboxConfig> {
+        let manifest = Manifest::parse("[sandbox.ci]\nrecipes = [\"x\"]\ncommand = \"true\"\n")
+            .expect("manifest");
+        let resolver = crate::sources::Resolver::locked(&manifest, Path::new("."), None)?;
+        load_manifest_recipes(def, extra, &resolver, None)
+    }
+
+    /// A project whose recipe `local/internal` grants credential scope.
+    fn project_with_internal_recipe(dir: &Path) -> Manifest {
+        std::fs::create_dir_all(dir.join("recipes")).expect("recipes dir");
+        std::fs::write(
+            dir.join("recipes/internal.toml"),
+            "[[host]]\ndomain = \"internal.example\"\nallow_credentials = [\"internal_token\"]\n",
+        )
+        .expect("recipe");
+        Manifest::parse(
+            "[sources]\nlocal = { path = \"recipes\" }\n\n[sandbox.ci]\nrecipes = [\"local/internal\"]\ncommand = \"true\"\n",
+        )
+        .expect("manifest")
+    }
+
+    fn internal_scope(config: &SandboxConfig) -> Vec<String> {
+        config
+            .hosts
+            .iter()
+            .find(|host| host.domain == "internal.example")
+            .map(|host| host.allow_credentials.clone())
+            .unwrap_or_default()
+    }
+
+    /// ADR-0026: a recipe the project's lock pins is as reviewed as the
+    /// manifest, so an organisation's own recipe can carry its credential
+    /// swap instead of every project restating it.
+    #[test]
+    fn a_recipe_pinned_by_the_lock_keeps_its_credential_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = project_with_internal_recipe(dir.path());
+        let mut lock = can_policy::Lockfile::new();
+        let content =
+            std::fs::read_to_string(dir.path().join("recipes/internal.toml")).expect("read");
+        lock.recipes.insert(
+            "local/internal".to_string(),
+            can_policy::lock::digest(&content),
+        );
+        let resolver =
+            crate::sources::Resolver::locked(&manifest, dir.path(), Some(&lock)).expect("resolver");
+
+        let config =
+            load_manifest_recipes(manifest.get("ci").expect("ci"), &[], &resolver, Some(&lock))
+                .expect("compose");
+
+        assert_eq!(internal_scope(&config), vec!["internal_token".to_string()]);
+    }
+
+    #[test]
+    fn without_a_lock_the_same_recipe_loses_its_credential_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = project_with_internal_recipe(dir.path());
+        let resolver =
+            crate::sources::Resolver::locked(&manifest, dir.path(), None).expect("resolver");
+
+        let config = load_manifest_recipes(manifest.get("ci").expect("ci"), &[], &resolver, None)
+            .expect("compose");
+
+        assert!(internal_scope(&config).is_empty());
+    }
+
+    #[test]
+    fn a_recipe_that_changed_since_it_was_locked_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = project_with_internal_recipe(dir.path());
+        let mut lock = can_policy::Lockfile::new();
+        lock.recipes.insert(
+            "local/internal".to_string(),
+            can_policy::lock::digest("something else"),
+        );
+        let resolver =
+            crate::sources::Resolver::locked(&manifest, dir.path(), Some(&lock)).expect("resolver");
+
+        let error =
+            load_manifest_recipes(manifest.get("ci").expect("ci"), &[], &resolver, Some(&lock))
+                .expect_err("changed recipe");
+
+        assert!(format!("{error:#}").contains("changed since it was locked"));
+    }
+
+    #[test]
+    fn a_recipe_the_lock_does_not_name_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = project_with_internal_recipe(dir.path());
+        let lock = can_policy::Lockfile::new();
+        let resolver =
+            crate::sources::Resolver::locked(&manifest, dir.path(), Some(&lock)).expect("resolver");
+
+        let error =
+            load_manifest_recipes(manifest.get("ci").expect("ci"), &[], &resolver, Some(&lock))
+                .expect_err("unlocked recipe");
+
+        assert!(format!("{error:#}").contains("not in canister.lock"));
+    }
+
+    /// The generated `--recipe` overlay stays untrusted with a lock, too.
+    #[test]
+    fn an_extra_recipe_cannot_grant_credential_scope_even_with_a_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = project_with_internal_recipe(dir.path());
+        let content =
+            std::fs::read_to_string(dir.path().join("recipes/internal.toml")).expect("read");
+        let mut lock = can_policy::Lockfile::new();
+        lock.recipes.insert(
+            "local/internal".to_string(),
+            can_policy::lock::digest(&content),
+        );
+        let overlay = write_recipe(
+            dir.path(),
+            "overlay.toml",
+            "[[host]]\ndomain = \"api.example\"\nallow_credentials = [\"anthropic_key\"]\n",
+        );
+        let resolver =
+            crate::sources::Resolver::locked(&manifest, dir.path(), Some(&lock)).expect("resolver");
+
+        let config = load_manifest_recipes(
+            manifest.get("ci").expect("ci"),
+            &[overlay],
+            &resolver,
+            Some(&lock),
+        )
+        .expect("compose");
+
+        let api = config
+            .hosts
+            .iter()
+            .find(|h| h.domain == "api.example")
+            .expect("host");
+        assert!(api.allow_credentials.is_empty());
+    }
+
     fn sandbox_def() -> SandboxDef {
         SandboxDef {
             description: None,
@@ -1132,7 +1291,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let config = load_manifest_recipes(&def, &[overlay]).expect("compose");
+        let config = compose(&def, &[overlay]).expect("compose");
 
         let host = config
             .hosts
@@ -1160,7 +1319,7 @@ mod tests {
             "[[host]]\ndomain = \"api.example\"\nallow_credentials = [\"anthropic_key\"]\n",
         );
 
-        let config = load_manifest_recipes(&sandbox_def(), &[overlay]).expect("compose");
+        let config = compose(&sandbox_def(), &[overlay]).expect("compose");
 
         let host = config
             .hosts
@@ -1185,7 +1344,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let config = load_manifest_recipes(&def, &[]).expect("compose");
+        let config = compose(&def, &[]).expect("compose");
 
         let host = config
             .hosts

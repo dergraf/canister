@@ -126,12 +126,22 @@ impl RecipeFile {
     /// `can pull` against the canonical repo.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(ConfigError::ReadFile)?;
-        let mut recipe = Self::parse(&content)?;
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        recipe.drop_untrusted_scopes(filename, &content);
+        Self::from_content(path, &content, false)
+    }
+
+    /// Build a recipe from content already read from `path`. `pinned`
+    /// says the project's `canister.lock` pins exactly this content
+    /// (ADR-0026): such a recipe is as reviewed as the manifest that chose
+    /// it, so it keeps its credential scope like an official one.
+    pub fn from_content(path: &Path, content: &str, pinned: bool) -> Result<Self, ConfigError> {
+        let mut recipe = Self::parse(content)?;
+        if !pinned {
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            recipe.drop_untrusted_scopes(filename, content);
+        }
         Ok(recipe)
     }
 
