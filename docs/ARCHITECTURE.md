@@ -1175,6 +1175,7 @@ what weakened its sandbox (ADR-0022).
 | `--run-id <id>` | Stamped on every event (generated when omitted). |
 | `--capture-exchanges` | Add an `exchange` event per HTTP exchange (ADR-0011). |
 | `--capture-max-bytes <n>` | Per-body capture cap, default 1 MiB. |
+| `--capture-readable-encodings` | Offer upstreams only `gzip`, `deflate` or `identity`, so captured responses decode with zlib (ADR-0023). |
 | `--stats-interval-ms <ms>` | Cumulative `stats` cadence, default 5000, `0` to disable (ADR-0015). |
 | `--canaries-file <path>` | External, tagged canaries for this run (ADR-0012). |
 | `--events-sign-key <path>` | Sign each stream's closing seal with this Ed25519 key (ADR-0016). |

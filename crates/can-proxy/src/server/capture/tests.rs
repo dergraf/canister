@@ -11,6 +11,7 @@ fn ctx_with_secrets(secrets: &[&str]) -> CaptureCtx {
     CaptureCtx {
         max_bytes: 1024,
         secrets: Arc::new(values),
+        readable_encodings: false,
     }
 }
 
@@ -103,7 +104,7 @@ fn a_secret_in_the_url_is_removed() {
 fn bodies_over_the_cap_are_truncated_and_flagged() {
     let ctx = CaptureCtx {
         max_bytes: 8,
-        secrets: Arc::new(Vec::new()),
+        ..ctx_with_secrets(&[])
     };
     let body = vec![b'a'; 100];
 
@@ -118,7 +119,7 @@ fn bodies_over_the_cap_are_truncated_and_flagged() {
 fn a_body_exactly_at_the_cap_is_not_truncated() {
     let ctx = CaptureCtx {
         max_bytes: 8,
-        secrets: Arc::new(Vec::new()),
+        ..ctx_with_secrets(&[])
     };
 
     let captured = ctx.body(&[b'a'; 8]);
@@ -131,7 +132,7 @@ fn a_body_exactly_at_the_cap_is_not_truncated() {
 fn one_byte_over_the_cap_is_truncated() {
     let ctx = CaptureCtx {
         max_bytes: 8,
-        secrets: Arc::new(Vec::new()),
+        ..ctx_with_secrets(&[])
     };
 
     let captured = ctx.body(&[b'a'; 9]);
@@ -179,4 +180,52 @@ fn replace_all_handles_needles_longer_than_the_haystack() {
     assert_eq!(replace_all(b"ab", b"abcdef", b"x"), b"ab".to_vec());
     assert_eq!(replace_all(b"abc", b"", b"x"), b"abc".to_vec());
     assert_eq!(replace_all(b"aaa", b"a", b"bb"), b"bbbbbb".to_vec());
+}
+
+#[test]
+fn readable_encodings_keep_what_zlib_decodes_and_drop_the_rest() {
+    for (offered, sent) in [
+        ("gzip, deflate, br", "gzip, deflate"),
+        ("gzip, deflate, br, zstd", "gzip, deflate"),
+        ("br", "identity"),
+        ("br;q=1.0, gzip;q=0.5", "gzip;q=0.5"),
+        ("gzip;q=1.0, *;q=0.1", "gzip;q=1.0"),
+        (" GZip ; q=0.8 ,x-gzip", "gzip;q=0.8, x-gzip"),
+        ("identity", "identity"),
+        ("", "identity"),
+    ] {
+        assert_eq!(
+            readable_accept_encoding(offered),
+            sent,
+            "offered: {offered:?}"
+        );
+    }
+}
+
+#[test]
+fn narrowing_is_off_unless_asked_for() {
+    let mut map = headers(&[("accept-encoding", "gzip, br")]);
+    ctx_with_secrets(&[]).narrow_accept_encoding(&mut map);
+    assert_eq!(map["accept-encoding"], "gzip, br");
+
+    let ctx = CaptureCtx {
+        readable_encodings: true,
+        ..ctx_with_secrets(&[])
+    };
+    ctx.narrow_accept_encoding(&mut map);
+    assert_eq!(map["accept-encoding"], "gzip");
+}
+
+#[test]
+fn a_request_without_accept_encoding_is_left_alone() {
+    let ctx = CaptureCtx {
+        readable_encodings: true,
+        ..ctx_with_secrets(&[])
+    };
+    let mut map = HeaderMap::new();
+    ctx.narrow_accept_encoding(&mut map);
+    assert!(
+        map.get("accept-encoding").is_none(),
+        "no header already means identity"
+    );
 }
