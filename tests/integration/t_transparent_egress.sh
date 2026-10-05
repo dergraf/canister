@@ -99,7 +99,7 @@ begin_test "a client that rejects the sandbox CA is recorded, not lost"
 run_can run --recipe "$TRANSPARENT" --events-file "$WORK/rejected.jsonl" \
     -- env -i PATH=/usr/bin:/bin python3 -c 'import ssl, urllib.request
 try:
-    urllib.request.urlopen("https://mock.example/x", timeout=10, context=ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt"))
+    urllib.request.urlopen("https://mock.example/x", timeout=10, context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
 except Exception as e:
     print("failed:", type(e).__name__)'
 REJECTED=$(python3 - "$WORK/rejected.jsonl" <<'PY'
