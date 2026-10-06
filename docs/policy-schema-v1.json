@@ -1,0 +1,824 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PolicyDocument",
+  "description": "The shape of the resolved policy: the `policy` of `policy_resolved` and of `can run --print-policy`. Published as `docs/policy-schema-v1.json` (ADR-0033); a test checks that every resolved policy reads and writes back through it unchanged.",
+  "type": "object",
+  "required": [
+    "unsafe"
+  ],
+  "properties": {
+    "filesystem": {
+      "description": "Filesystem access policy.",
+      "default": {
+        "deny": [],
+        "read": [],
+        "workdir": null,
+        "write": []
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/FilesystemConfig"
+        }
+      ]
+    },
+    "host": {
+      "description": "Per-destination egress contracts (see `HostBlock`).",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/HostBlock"
+      }
+    },
+    "network": {
+      "description": "Network access policy.",
+      "default": {
+        "contract_mode": null,
+        "dlp": null,
+        "egress": null,
+        "undeclared_hosts": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/NetworkConfig"
+        }
+      ]
+    },
+    "process": {
+      "description": "Process and environment restrictions.",
+      "default": {
+        "env": {},
+        "env_passthrough": [],
+        "exec": null,
+        "max_pids": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProcessConfig"
+        }
+      ]
+    },
+    "proxy": {
+      "description": "L7 Proxy and interception configuration.",
+      "default": {
+        "max_buffered_body_bytes": null,
+        "max_streamed_body_bytes": null,
+        "upstream_request_timeout_ms": null,
+        "upstream_scheme": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProxyConfig"
+        }
+      ]
+    },
+    "resources": {
+      "description": "Resource limits (CPU, memory).",
+      "default": {
+        "cpu_percent": null,
+        "memory_mb": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResourceConfig"
+        }
+      ]
+    },
+    "strict": {
+      "description": "Strict mode: fail hard instead of degrading gracefully.\n\nWhen true, any setup failure (filesystem isolation, seccomp, cgroups) is a fatal error instead of a warning. Seccomp uses KILL_PROCESS instead of ERRNO. Intended for CI / production use.",
+      "default": false,
+      "type": "boolean"
+    },
+    "syscalls": {
+      "description": "Seccomp syscall overrides and enforcement mode.",
+      "default": {
+        "allow": [],
+        "allow_extra": [],
+        "deny": [],
+        "deny_extra": [],
+        "notifier": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/SyscallConfig"
+        }
+      ]
+    },
+    "unsafe": {
+      "description": "The isolation-weakening settings in effect (ADR-0022).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/UnsafeConfig"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ContractMode": {
+      "description": "Mode for hosts that have no matching `[[host]]` entry.",
+      "oneOf": [
+        {
+          "description": "Refuse any request to a host without a matching `[[host]]` entry. The default. Matches the project's default-deny posture (seccomp, network, mounts all default-deny).",
+          "type": "string",
+          "enum": [
+            "strict"
+          ]
+        },
+        {
+          "description": "Allow requests to unknown hosts; emit a structured `unknown_host_contract` tracing event per request. Opt-in for prototyping / exploration workflows.",
+          "type": "string",
+          "enum": [
+            "relaxed"
+          ]
+        }
+      ]
+    },
+    "DlpConfig": {
+      "description": "Data Loss Prevention configuration for the egress proxy.\n\nWhen enabled, the proxy scans outbound requests for credential patterns (GitHub PATs, npm tokens, AWS keys, etc.) and enforces per-detector domain scoping: each token type can only flow to its home service.",
+      "type": "object",
+      "properties": {
+        "bind_credentials": {
+          "description": "Refuse a request to a host a credential is scoped to when it carries a credential other than the fake the sandbox was given: one the workload brought itself (ADR-0030). Default: false. Any layer turning it on wins.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "canary_tokens": {
+          "description": "Inject canary tokens (fake credentials) into the sandbox environment to detect exfiltration attempts. Default: true when DLP is enabled.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "decompress": {
+          "description": "Decompress request bodies (gzip/deflate/brotli) before scanning. Default: true.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "dns_entropy_threshold": {
+          "description": "Normalised per-label entropy ratio for DNS exfiltration detection. A label's Shannon entropy is divided by `log2(len)` to get a value in `[0.0, 1.0]`; the FQDN trips when two or more labels exceed this ratio. Default: 0.92. (Pre-2026-05 configs used absolute bits — those values are now clamped to 1.0 and effectively disable the check.)",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "enabled": {
+          "description": "Enable DLP scanning. Implicitly enabled in `--strict` mode when `egress = \"proxy-only\"`.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "external_canaries": {
+          "description": "Canaries supplied from outside the sandbox — values an orchestrator planted in the workload's input data, each tagged with the class of data it stands for and the destinations that are allowed to see it. Unlike generated canary tokens, these are never injected into the environment: `can` only learns to recognize them on egress. See ADR-0012.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ExternalCanary"
+          }
+        },
+        "fake_secrets": {
+          "description": "Env-var secrets the sandbox should never see in cleartext. For each entry the sandbox is given a *fake* value (matching the named credential's format); the proxy swaps it for the real host value only on egress to a host authorized for that credential (`[[host]] allow_credentials` / the detector's home domains). A secret the sandbox encrypts and exfiltrates therefore only ever leaks the useless fake. See `docs/refusals.md`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FakeSecret"
+          }
+        },
+        "max_decode_depth": {
+          "description": "Maximum encoding chain recursion depth (base64, hex, percent-encoding). Default: 32.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "session_entropy_budget": {
+          "description": "Cumulative high-entropy bytes allowed per sandbox session before requests are blocked. Default: 8192.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "EgressMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "none",
+            "proxy"
+          ]
+        },
+        {
+          "description": "Unfiltered/direct egress. Not deserializable from `[network] egress` (recipes use `[unsafe] unfiltered_egress`); constructed at resolve time. Serializes as `direct` for diagnostics.",
+          "type": "string",
+          "enum": [
+            "direct"
+          ]
+        }
+      ]
+    },
+    "ExecMode": {
+      "oneOf": [
+        {
+          "description": "Any binary may be exec'd. The effective default today (full child-exec restriction needs the USER_NOTIF supervisor).",
+          "type": "string",
+          "enum": [
+            "any"
+          ]
+        },
+        {
+          "description": "Only the sandbox entrypoint command may exec. Child execs are denied (enforced once USER_NOTIF execve-blocking lands; today the schema records the intent and the initial command is allowed).",
+          "type": "string",
+          "enum": [
+            "entrypoint-only"
+          ]
+        }
+      ]
+    },
+    "ExecPolicy": {
+      "description": "Which binaries the sandboxed process may `exec`.\n\nReplaces the old `allow_execve = []`-means-\"any\" footgun with a stated choice: an empty/absent list no longer silently means \"exec anything.\"",
+      "anyOf": [
+        {
+          "description": "`exec = \"any\"` | `\"entrypoint-only\"`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExecMode"
+            }
+          ]
+        },
+        {
+          "description": "`exec = [\"/usr/bin/node\", \"/nix/store/*\"]` — explicit allow list (entries ending in `/*` are prefix rules).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "ExternalCanary": {
+      "description": "One externally supplied canary.\n\n`allowed_hosts` lists the destinations for which an appearance of this value is expected rather than a leak: the fire is recorded with `allowed: true` and the request proceeds. Any other destination is a leak — blocked outside monitor mode, always recorded. An empty `allowed_hosts` means \"this value may not leave at all\".",
+      "type": "object",
+      "required": [
+        "data_class",
+        "value"
+      ],
+      "properties": {
+        "allowed_hosts": {
+          "description": "Destinations allowed to receive this data class. Matching is case-insensitive and covers subdomains.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "data_class": {
+          "description": "Class of data this value stands for (`ahv`, `iban_ch`, ...). Free text: `can` treats it as an opaque label.",
+          "type": "string"
+        },
+        "value": {
+          "description": "The literal value to watch for.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FakeSecret": {
+      "description": "One env-var secret to fake-and-swap. `env` is the variable name the real secret normally arrives in (e.g. `GITHUB_TOKEN`); `credential` is the DLP detector id (e.g. `github_pat`) that classifies it. The detector governs both fake generation (the fake matches its pattern) and swap authorization (the fake is swapped wherever that detector is in scope).",
+      "type": "object",
+      "required": [
+        "credential",
+        "env"
+      ],
+      "properties": {
+        "credential": {
+          "type": "string"
+        },
+        "env": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FilesystemConfig": {
+      "type": "object",
+      "properties": {
+        "decoy": {
+          "description": "Tripwires: paths where an empty decoy file is placed, read-only, so that any access to it is reported as an `fs_access` event (ADR-0019). Meant for well-known credential locations (`$HOME/.ssh/id_ed25519`, `$HOME/.aws/credentials`). A real grant always wins: a decoy is never placed where a `read` or `write` path, or the working directory, already provides something.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "Paths explicitly denied (checked before `read` and `write`).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mask": {
+          "description": "Paths to mask inside the sandbox (bind `/dev/null` over them).\n\nUsed to hide files that would otherwise be visible through the CWD bind-mount. For example, `canister.toml` is auto-masked when running via `can up` to prevent the sandboxed process from reading the security policy.\n\nThis field is set programmatically by the CLI layer and is not expected in recipe TOML files.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "read": {
+          "description": "Paths the sandboxed process may **read** (bind-mounted read-only). Read access still matters: a readable secret is exactly what the DLP layer exists to stop from leaving — name it honestly.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workdir": {
+          "description": "Whether the working directory is mounted writable (ADR-0024). `write` (default) lets the sandboxed process change project files; `read` mounts it read-only, so only `write` entries are writable, including ones inside the working directory.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkdirAccess"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "write": {
+          "description": "Paths bind-mounted **writable** into the sandbox.\n\nUse this for directories the sandboxed process must write to (e.g., database files, caches, state directories). These paths are mounted writable — **changes persist on the host**.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HostBlock": {
+      "description": "Per-host egress contract. See module docs.",
+      "type": "object",
+      "required": [
+        "domain"
+      ],
+      "properties": {
+        "allow_credentials": {
+          "description": "DLP detector ids whose findings on this host downgrade from `Block` to `Warn`. Co-located here so the full \"what is this upstream\" picture (connect permission + shape + credential scope) lives in one block.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "content_types": {
+          "description": "Content-Type values this host accepts on request bodies. Matched against the leading `mime/subtype` portion of the Content-Type header (parameters like `; charset=utf-8` are ignored). Empty = any content type.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contract_mode": {
+          "description": "Optional per-host override of the global [`super::network::NetworkConfig::contract_mode`]. Mainly used to carve out one known-weird upstream as `Relaxed` while keeping the rest of the recipe `Strict`. `None` = inherit the global default.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContractMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "domain": {
+          "description": "FQDN this contract applies to. Wildcards (`*.github.com`) match any single subdomain level; bare suffixes (`github.com`) match only the exact host. Precedence is most-specific-wins when multiple wildcards match a single request — same rule as elsewhere in the policy layer.",
+          "type": "string"
+        },
+        "max_request_bytes": {
+          "description": "Maximum request-body byte size accepted. `None` = no per-host cap (the global `max_streamed_body_bytes` still applies as a backstop).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "methods": {
+          "description": "HTTP methods this host accepts. Empty (the default) = any method. Method matching is case-insensitive.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "paths": {
+          "description": "Path prefixes that requests must start with. Empty = any path. Useful for an upstream where only a subtree is a legitimate target (e.g. `[\"/repos/\", \"/user/\"]` for GitHub).",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "session_entropy_budget": {
+          "description": "Session entropy budget for this host, in place of `[network.dlp] session_entropy_budget` (ADR-0020). Meant for a provider the policy already trusts with a credential, so it requires a non-empty `allow_credentials` in the same block. `None` = the session default. Omitted from serialization when unset, so policies that don't use it hash as before.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "upstream": {
+          "description": "Route requests for this host to a service on the *host's* loopback instead of the real destination, as `loopback:<port>` (ADR-0013). The sandboxed workload still calls `https://<domain>/...` and the proxy still terminates TLS with its dynamic CA, applies the contract and scans with DLP; only the dial target changes, and the hop to the mock is plain HTTP over loopback. Requires `[unsafe] host_loopback = true`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "NetworkConfig": {
+      "type": "object",
+      "properties": {
+        "contract_mode": {
+          "description": "Global default for per-host contract enforcement when no matching `[[host]]` entry exists. `Strict` refuses unknown hosts; `Relaxed` allows them with a tracing event. Default: `Strict`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContractMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dlp": {
+          "description": "Data Loss Prevention configuration for the egress proxy.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DlpConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "egress": {
+          "description": "Egress mode controls outbound networking behavior.\n\n- `proxy` (default): outbound traffic must go through the local proxy - `none`: no outbound networking\n\nThe third runtime mode, `Direct` (unfiltered), is **not** settable here — it bypasses DLP and contract gates, so it is authored as `[unsafe] unfiltered_egress` and folded in at resolve time.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EgressMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overlay_ca_bundles": {
+          "description": "Add the sandbox CA to the trust bundles a client reads without `SSL_CERT_FILE` (ADR-0028): OpenSSL's default bundle and `certifi`'s, overlaid with copies that include it. Rendered in the resolved policy only when on.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "transparent": {
+          "description": "Route a workload that ignores `HTTP_PROXY` through the proxy anyway (ADR-0027): names resolve to the proxy, which serves ports 443 (by TLS SNI) and 80 (by `Host`) in the workload's network namespace. Rendered in the resolved policy only when on.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "undeclared_hosts": {
+          "description": "What the proxy does with a request for a host no `[[host]]` block declares (ADR-0018). `refuse` (default) turns it away at the connect gate; `sink` accepts it, runs it through the DLP and canary detectors, and answers it locally. Neither forwards anything upstream.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UndeclaredHosts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PortMapping": {
+      "description": "A port forwarding rule mapping a host port to a container port.\n\nFollows Docker/Podman syntax: `[ip:]hostPort:containerPort[/protocol]`\n\nExamples: - `8080:80` — TCP, host 8080 → container 80 - `8080:80/udp` — UDP, host 8080 → container 80 - `127.0.0.1:8080:80` — TCP, bind to 127.0.0.1, host 8080 → container 80 - `8080:8080` or just `8080` (shorthand) — TCP, same port both sides",
+      "type": "object",
+      "required": [
+        "container_port",
+        "host_port"
+      ],
+      "properties": {
+        "container_port": {
+          "description": "Port inside the container/sandbox.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "host_ip": {
+          "description": "Optional IP address to bind on the host side.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "ip"
+        },
+        "host_port": {
+          "description": "Port on the host.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "protocol": {
+          "description": "Protocol (tcp or udp). Defaults to tcp.",
+          "default": "tcp",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PortProtocol"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PortProtocol": {
+      "description": "Protocol for port forwarding.",
+      "type": "string",
+      "enum": [
+        "tcp",
+        "udp"
+      ]
+    },
+    "ProcessConfig": {
+      "type": "object",
+      "properties": {
+        "env": {
+          "description": "Environment variables to set in the sandbox. These are evaluated after passthrough.",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "env_passthrough": {
+          "description": "Environment variables to pass through from the host. All others are stripped.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exec": {
+          "description": "Which binaries may be exec'd: `\"any\"`, `\"entrypoint-only\"`, or an explicit list of paths. `None` resolves to the default (`\"any\"`).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExecPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_pids": {
+          "description": "Maximum number of child PIDs allowed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProxyConfig": {
+      "type": "object",
+      "properties": {
+        "max_buffered_body_bytes": {
+          "description": "Maximum bytes buffered for DLP body scanning via the full whole-buffer pipeline (decode chains, decompression, unescape). Requests at or under this size get the strongest analysis. Default 8 MiB. Requests above this size up to [`Self::max_streamed_body_bytes`] are still scanned but via the chunked streaming path (regex only, no decode chain).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_streamed_body_bytes": {
+          "description": "Hard upper bound on request body size. Beyond this, the proxy returns 413. Defaults to 64 MiB. Requests between [`Self::max_buffered_body_bytes`] and this cap are scanned by the streaming detector: regex passes with a 256-byte overlap window, no decompression / decode chain.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "upstream_request_timeout_ms": {
+          "description": "Upstream request total timeout in milliseconds. Defaults to 30 000 ms.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "upstream_scheme": {
+          "description": "Force the upstream request scheme. Accepts `\"http\"` or `\"h2c\"`. When unset (the default), the scheme is inferred from the inbound request URI. Prior versions consulted a client-controlled `x-canister-upstream-scheme` header for this — that was a footgun (the sandboxed process picked the proxy's egress protocol) and is no longer honoured. h2c also requires the `experimental-h2c` build feature; without it, setting this to `\"h2c\"` returns an upstream error.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResourceConfig": {
+      "type": "object",
+      "properties": {
+        "cpu_percent": {
+          "description": "CPU limit as a percentage (e.g., 50 = 50% of one core).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "memory_mb": {
+          "description": "Memory limit in megabytes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SyscallConfig": {
+      "description": "Syscall customization.\n\nTwo mutually exclusive modes:\n\n**Baseline mode** (`allow` + `deny`): absolute syscall lists that define the entire policy. Only used by `default.toml` — the canonical baseline.\n\n**Override mode** (`allow_extra` + `deny_extra`): relative adjustments layered on top of the baseline. Used by all regular recipes.\n\nA recipe MUST NOT mix absolute and relative fields. If both are present, parsing succeeds but `validate()` returns an error.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Absolute allow list — the complete set of permitted syscalls. Only valid in `default.toml`. Mutually exclusive with `allow_extra`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_extra": {
+          "description": "Syscalls to add to the allow list (on top of the default baseline).\n\nExample: `[\"ptrace\", \"io_uring_setup\", \"io_uring_enter\", \"io_uring_register\"]`",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "Absolute deny list — syscalls always blocked. Only valid in `default.toml`. Mutually exclusive with `deny_extra`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny_extra": {
+          "description": "Syscalls to add to the deny list (also removed from allow list).\n\nExample: `[\"personality\"]` to block multilib switching.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notifier": {
+          "description": "Enable the SECCOMP_RET_USER_NOTIF supervisor for argument-level syscall filtering (connect, clone, socket, execve).\n\nRequires Linux 5.9+. When `None`, auto-detected based on kernel version. Set to `false` to explicitly disable.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "UndeclaredHosts": {
+      "description": "Handling of a request whose host no `[[host]]` block declares (ADR-0018). Both modes keep the request from leaving the proxy; they differ in how much of it the proxy looks at.",
+      "oneOf": [
+        {
+          "description": "Refuse at the connect gate: no TLS termination, no body read.",
+          "type": "string",
+          "enum": [
+            "refuse"
+          ]
+        },
+        {
+          "description": "Terminate TLS with the sandbox CA, scan the request with the DLP and canary detectors, then answer it locally. Never forwarded.",
+          "type": "string",
+          "enum": [
+            "sink"
+          ]
+        }
+      ]
+    },
+    "UnsafeConfig": {
+      "type": "object",
+      "properties": {
+        "expose_ports": {
+          "description": "Forward host ports into the sandbox (inbound exposure). `[ip:]hostPort:containerPort[/protocol]`. Was `[network] ports`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PortMapping"
+          }
+        },
+        "extra_syscalls": {
+          "description": "High-risk syscalls to add to the allow list. These widen the kernel attack surface (e.g. `ptrace`, `bpf`, `mount`, `io_uring_*`) and are rejected from `[syscalls] allow_extra` — they must be declared here so the cost is explicit. See [`super::syscalls::DANGEROUS_SYSCALLS`].",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "host_loopback": {
+          "description": "Let the sandbox reach host loopback services via the `host.canister.local` alias — opens host-local daemons (DBs, sockets) to sandboxed code. Was `[network] allow_host_loopback`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "reachable_ips": {
+          "description": "IP addresses / CIDRs the sandbox may reach directly. IP-literal egress carries no service identity and bypasses the per-host contract and DLP gates. Was `[network] allow_ips`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "seccomp_default_allow": {
+          "description": "Flip seccomp to **default-allow** (deny-list): every syscall is permitted unless explicitly denied — the inverse of the secure default. Was `[syscalls] seccomp_mode = \"deny-list\"`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "unfiltered_egress": {
+          "description": "Bypass the L7 egress proxy: outbound is direct, so **DLP and per-host contract gates do not run**. Only the IP/policy layer applies. Was `[network] egress = \"direct\"`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WorkdirAccess": {
+      "description": "How the working directory is mounted into the sandbox (ADR-0024).",
+      "oneOf": [
+        {
+          "description": "Writable: changes to project files persist on the host.",
+          "type": "string",
+          "enum": [
+            "write"
+          ]
+        },
+        {
+          "description": "Read-only: only `write` entries are writable.",
+          "type": "string",
+          "enum": [
+            "read"
+          ]
+        },
+        {
+          "description": "Only the `read` and `write` entries inside it are visible; the rest of the checkout is absent, and the directory itself is read-only (ADR-0032).",
+          "type": "string",
+          "enum": [
+            "listed"
+          ]
+        }
+      ]
+    }
+  }
+}

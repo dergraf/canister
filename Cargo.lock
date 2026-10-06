@@ -276,6 +276,7 @@ dependencies = [
  "can-sandbox",
  "clap",
  "nix",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
