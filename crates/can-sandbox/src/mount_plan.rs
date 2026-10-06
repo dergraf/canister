@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use can_policy::config::{DecoyMount, FilesystemConfig};
+use can_policy::config::{DecoyMount, FilesystemConfig, WorkdirAccess};
 
 use crate::overlay::{
     DecoyPlacement, decoy_placement, denied_within_mounts, workdir_writable, writable_within,
@@ -49,6 +49,18 @@ pub(crate) enum SkipReason {
     Denied,
 }
 
+/// How the working directory is mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkdirMount {
+    /// Bound writable.
+    Writable,
+    /// Bound read-only (ADR-0024).
+    ReadOnly,
+    /// An empty tmpfs that only the entries listed inside it are mounted
+    /// into, sealed read-only after them (ADR-0032).
+    Listed,
+}
+
 /// One step of the configured filesystem, in the order it is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -67,12 +79,15 @@ pub(crate) enum Step {
     },
     /// The sandbox's own `/tmp`.
     Tmp { noexec: bool },
-    /// The working directory, bound at its own path.
+    /// The working directory, at its own path.
     Workdir {
         cwd: PathBuf,
-        writable: bool,
+        mount: WorkdirMount,
         noexec: bool,
     },
+    /// Make a listed working directory read-only, once the entries inside
+    /// it are mounted.
+    SealWorkdir { cwd: PathBuf },
     /// Hide a denied path that lies inside a mounted one.
     Hide { path: PathBuf },
     /// Mask a path with an empty file or directory, if it exists.
@@ -96,28 +111,52 @@ pub(crate) fn plan(
     host: &dyn HostProbe,
 ) -> MountPlan {
     let mut steps = Vec::new();
+    let workdir = host_cwd.map(|cwd| (cwd, workdir_mount(config, cwd)));
 
-    for source in &config.read {
+    // A listed working directory is an empty tmpfs; an entry inside it
+    // mounted before it would be hidden, so it is mounted after it.
+    let listed_inside = |source: &Path| matches!(workdir, Some((cwd, WorkdirMount::Listed)) if source.starts_with(cwd));
+    let (reads_inside, reads): (Vec<_>, Vec<_>) =
+        config.read.iter().partition(|source| listed_inside(source));
+    let (writes_inside, writes): (Vec<_>, Vec<_>) = config
+        .write
+        .iter()
+        .partition(|source| listed_inside(source));
+
+    for source in reads {
         steps.push(bind(config, source, Access::Read, noexec, host));
     }
-    for source in &config.write {
+    for source in writes {
         steps.push(bind(config, source, Access::Write, noexec, host));
     }
 
     steps.push(Step::Tmp { noexec });
 
-    if let Some(cwd) = host_cwd {
-        let writable = workdir_writable(config, cwd);
+    if let Some((cwd, mount)) = workdir {
         steps.push(Step::Workdir {
             cwd: cwd.to_path_buf(),
-            writable,
+            mount,
             noexec,
         });
-        // Mounted before a read-only working directory, these would be
-        // hidden by it, so they are mounted again on top (ADR-0024).
-        if !writable {
-            for source in writable_within(config, cwd) {
-                steps.push(bind(config, &source, Access::Write, noexec, host));
+        match mount {
+            WorkdirMount::Writable => {}
+            // Mounted before a read-only working directory, these would be
+            // hidden by it, so they are mounted again on top (ADR-0024).
+            WorkdirMount::ReadOnly => {
+                for source in writable_within(config, cwd) {
+                    steps.push(bind(config, &source, Access::Write, noexec, host));
+                }
+            }
+            WorkdirMount::Listed => {
+                for source in reads_inside {
+                    steps.push(bind(config, source, Access::Read, noexec, host));
+                }
+                for source in writes_inside {
+                    steps.push(bind(config, source, Access::Write, noexec, host));
+                }
+                steps.push(Step::SealWorkdir {
+                    cwd: cwd.to_path_buf(),
+                });
             }
         }
     }
@@ -139,6 +178,18 @@ pub(crate) fn plan(
     }
 
     steps
+}
+
+/// A `write` entry covering the working directory makes it writable
+/// whatever `workdir` says (ADR-0024); otherwise `workdir` decides.
+fn workdir_mount(config: &FilesystemConfig, cwd: &Path) -> WorkdirMount {
+    if workdir_writable(config, cwd) {
+        WorkdirMount::Writable
+    } else if config.workdir() == WorkdirAccess::Listed {
+        WorkdirMount::Listed
+    } else {
+        WorkdirMount::ReadOnly
+    }
 }
 
 fn bind(
@@ -238,7 +289,7 @@ mod tests {
                 Step::Tmp { noexec: false },
                 Step::Workdir {
                     cwd: "/work".into(),
-                    writable: true,
+                    mount: WorkdirMount::Writable,
                     noexec: false
                 },
             ]
@@ -306,7 +357,7 @@ mod tests {
                 matches!(
                     s,
                     Step::Workdir {
-                        writable: false,
+                        mount: WorkdirMount::ReadOnly,
                         ..
                     }
                 )
@@ -334,10 +385,117 @@ mod tests {
             plan.last(),
             Some(&Step::Workdir {
                 cwd: "/work".into(),
-                writable: true,
+                mount: WorkdirMount::Writable,
                 noexec: false
             })
         );
+    }
+
+    fn listed(read: &[&str], write: &[&str]) -> FilesystemConfig {
+        FilesystemConfig {
+            workdir: Some(WorkdirAccess::Listed),
+            ..config(read, write, &[])
+        }
+    }
+
+    #[test]
+    fn a_listed_working_directory_mounts_its_entries_after_it_then_seals_it() {
+        let host = FakeHost::with(&[
+            ("/usr", true),
+            ("/work/src", true),
+            ("/work/README.md", false),
+            ("/work/notes", true),
+            ("/data", true),
+        ]);
+        let plan = plan(
+            &listed(
+                &["/usr", "/work/src", "/work/README.md"],
+                &["/work/notes", "/data"],
+            ),
+            Some(Path::new("/work")),
+            false,
+            &host,
+        );
+
+        assert_eq!(
+            plan,
+            vec![
+                bind_of("/usr", Access::Read, true, false),
+                bind_of("/data", Access::Write, true, false),
+                Step::Tmp { noexec: false },
+                Step::Workdir {
+                    cwd: "/work".into(),
+                    mount: WorkdirMount::Listed,
+                    noexec: false
+                },
+                bind_of("/work/src", Access::Read, true, false),
+                bind_of("/work/README.md", Access::Read, false, false),
+                bind_of("/work/notes", Access::Write, true, false),
+                Step::SealWorkdir {
+                    cwd: "/work".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listed_entry_that_is_missing_or_denied_is_skipped_inside_it() {
+        let host = FakeHost::with(&[("/work/.env", false)]);
+        let config = FilesystemConfig {
+            deny: paths(&["/work/.env"]),
+            ..listed(&["/work/gone", "/work/.env"], &[])
+        };
+        let plan = plan(&config, Some(Path::new("/work")), false, &host);
+
+        assert!(matches!(
+            plan[2..4],
+            [
+                Step::Skipped {
+                    reason: SkipReason::Missing,
+                    ..
+                },
+                Step::Skipped {
+                    reason: SkipReason::Denied,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(
+            plan[4],
+            Step::SealWorkdir {
+                cwd: "/work".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_write_entry_covering_a_listed_working_directory_makes_it_writable() {
+        let host = FakeHost::with(&[("/work", true)]);
+        let plan = plan(
+            &listed(&[], &["/work"]),
+            Some(Path::new("/work")),
+            false,
+            &host,
+        );
+
+        assert!(plan.contains(&Step::Workdir {
+            cwd: "/work".into(),
+            mount: WorkdirMount::Writable,
+            noexec: false
+        }));
+        assert!(!plan.iter().any(|s| matches!(s, Step::SealWorkdir { .. })));
+    }
+
+    #[test]
+    fn an_entry_outside_a_listed_working_directory_keeps_its_place() {
+        let host = FakeHost::with(&[("/workspace", true)]);
+        let plan = plan(
+            &listed(&["/workspace"], &[]),
+            Some(Path::new("/work")),
+            false,
+            &host,
+        );
+        assert_eq!(plan[0], bind_of("/workspace", Access::Read, true, false));
     }
 
     #[test]

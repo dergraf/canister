@@ -338,7 +338,7 @@ paths and essential system paths are bind-mounted read-only.
 |-------|------|---------|-------------|
 | `read` | `string[]` | `[]` | Paths bind-mounted **read-only** into the sandbox |
 | `write` | `string[]` | `[]` | Paths bind-mounted **writable** — changes persist on the host |
-| `workdir` | `"write"` \| `"read"` | `"write"` | How the working directory is mounted. `read` mounts it read-only: only `write` entries are writable, including ones inside it. An explicit `read` in any recipe wins when recipes are composed (ADR-0024). |
+| `workdir` | `"write"` \| `"read"` \| `"listed"` | `"write"` | How the working directory is mounted. `read` mounts it read-only: only `write` entries are writable, including ones inside it (ADR-0024). `listed` shows only the `read` and `write` entries inside it: the rest of the checkout, `.git` and untracked files included, is absent, and nothing else can be created there (ADR-0032). The narrower value in any recipe wins when recipes are composed (`listed`, then `read`). A `write` entry covering the working directory makes it writable whatever this says. |
 | `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** `read`/`write`) |
 | `decoy` | `string[]` | `[]` | Tripwires: an empty read-only decoy file is placed at each path, and any access to it is reported as an `fs_access` event (ADR-0019). Never replaces a path that `read`, `write` or the working directory provides. `recipes = ["tripwires"]` covers the usual credential locations. |
 
