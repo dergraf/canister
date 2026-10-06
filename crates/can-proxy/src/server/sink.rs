@@ -4,13 +4,13 @@
 //! `[[host]]` block declares is not refused at the connect gate. The
 //! proxy terminates TLS with the sandbox CA as it does for a declared
 //! host, runs the request through the same DLP and canary detectors, and
-//! answers it itself with a fixed 403.
+//! answers it itself with a fixed 403, or a 404 for `robots.txt` (ADR-0029).
 //!
 //! The invariant a reviewer should check here: nothing in this module
 //! resolves a name, opens a socket or calls into `upstream`. The only way
 //! out of [`answer`] is [`ProxyError::sinked`].
 
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response, Uri};
 
 use super::capture::ExchangeRecorder;
 use super::dlp_ctx::DlpCtx;
@@ -45,7 +45,8 @@ pub(super) fn takes(host: &str, policy: &OutboundPolicy, contracts: &ContractTab
 
 /// Scan a sunk request exactly as a declared host's request is scanned,
 /// then answer it locally. Detector findings surface as their usual
-/// `dlp_block` / `canary_fire` events; the answer itself never varies.
+/// `dlp_block` / `canary_fire` events; the answer depends only on the
+/// request line ([`sink_response`]).
 pub(super) async fn answer(
     req: Request<hyper::body::Incoming>,
     host: &str,
@@ -93,7 +94,21 @@ pub(super) async fn answer(
         );
     }
 
-    ProxyError::sinked(host).into_response()
+    sink_response(&parts.method, &parts.uri, host)
+}
+
+/// A fixed 403, except for a `robots.txt` check, which gets a 404: by
+/// RFC 9309 an unavailable `robots.txt` allows everything, so a client
+/// that checks first goes on to make the request the sink exists to see,
+/// instead of giving up on a 403 (ADR-0029).
+fn sink_response(method: &Method, uri: &Uri, host: &str) -> Response<ProxyBody> {
+    let robots_check =
+        (method == Method::GET || method == Method::HEAD) && uri.path() == "/robots.txt";
+    if robots_check {
+        ProxyError::sinked_robots_check(host).into_response()
+    } else {
+        ProxyError::sinked(host).into_response()
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +209,35 @@ mod tests {
         let (mut policy, contracts) = setup(Some(UndeclaredHosts::Sink), &[], ContractMode::Strict);
         policy.host_loopback_target = Some("169.254.1.2".parse().expect("ip"));
         assert!(!takes(HOST_LOOPBACK_ALIAS, &policy, &contracts));
+    }
+
+    #[test]
+    fn a_robots_check_is_answered_not_found_so_the_client_goes_on() {
+        use hyper::{Method, StatusCode, Uri};
+
+        let status = |method: Method, uri: &str| {
+            let uri: Uri = uri.parse().expect("uri");
+            sink_response(&method, &uri, "evil.example").status()
+        };
+
+        assert_eq!(status(Method::GET, "/robots.txt"), StatusCode::NOT_FOUND);
+        assert_eq!(status(Method::HEAD, "/robots.txt"), StatusCode::NOT_FOUND);
+        assert_eq!(
+            status(Method::GET, "https://evil.example/robots.txt"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(status(Method::GET, "/in?iban=CH93"), StatusCode::FORBIDDEN);
+        assert_eq!(status(Method::POST, "/robots.txt"), StatusCode::FORBIDDEN);
+        assert_eq!(status(Method::GET, "/a/robots.txt"), StatusCode::FORBIDDEN);
+
+        let robots = sink_response(&Method::GET, &"/robots.txt".parse().expect("uri"), "e");
+        assert_eq!(
+            robots
+                .headers()
+                .get("x-canister-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("undeclared-host-sink")
+        );
     }
 
     #[test]

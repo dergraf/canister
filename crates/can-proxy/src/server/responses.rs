@@ -70,6 +70,7 @@ pub(super) enum ErrorKind {
     /// sink (ADR-0018). Identical whatever the detectors found, so the
     /// workload cannot use the sink to probe them.
     Sinked,
+    SinkedRobotsCheck,
     ForeignCredential,
 }
 
@@ -113,6 +114,10 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn sinked(host: &'a str) -> Self {
         Self::new(ErrorKind::Sinked, host)
+    }
+
+    pub(super) fn sinked_robots_check(host: &'a str) -> Self {
+        Self::new(ErrorKind::SinkedRobotsCheck, host)
     }
 
     pub(super) fn foreign_credential(host: &'a str) -> Self {
@@ -256,6 +261,11 @@ impl<'a> ProxyError<'a> {
             ),
             ErrorKind::Sinked => (
                 StatusCode::FORBIDDEN,
+                SINK_BODY.to_string(),
+                "undeclared-host-sink",
+            ),
+            ErrorKind::SinkedRobotsCheck => (
+                StatusCode::NOT_FOUND,
                 SINK_BODY.to_string(),
                 "undeclared-host-sink",
             ),

@@ -282,6 +282,64 @@ async fn the_sink_answers_an_undeclared_https_request_locally() {
     );
 }
 
+// A client that checks robots.txt first (an MCP fetch server does) gives
+// up on a 403 and never makes the request the sink exists to see.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_robots_check_is_answered_not_found_and_the_request_after_it_is_seen() {
+    let _exclusive = EVENT_STREAM.lock().await;
+    let events = EventCapture::install("r-sink-robots");
+    let (upstream, accepted) = start_counting_upstream().await;
+    let proxy = start_proxy(
+        EgressMode::ProxyOnly,
+        Some(UndeclaredHosts::Sink),
+        vec![host("declared.example")],
+    )
+    .await;
+    let client = client(proxy);
+
+    let robots = client
+        .get(format!("https://localhost:{}/robots.txt", upstream.port()))
+        .send()
+        .await
+        .expect("the sink answers the robots check");
+    assert_eq!(robots.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        robots.headers()["x-canister-error"]
+            .to_str()
+            .expect("header"),
+        "undeclared-host-sink"
+    );
+
+    let request = client
+        .get(format!(
+            "https://localhost:{}/in?iban=CH93",
+            upstream.port()
+        ))
+        .send()
+        .await
+        .expect("the sink answers the request");
+    assert_eq!(request.status(), StatusCode::FORBIDDEN);
+
+    let events = events.finish();
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "the sink must never dial"
+    );
+    let paths: Vec<_> = events_of(&events, "egress_request")
+        .iter()
+        .filter(|e| e["data"]["method"] == "GET")
+        .map(|e| (e["data"]["path"].clone(), e["data"]["reason"].clone()))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            ("/robots.txt".into(), "sink".into()),
+            ("/in".into(), "sink".into())
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sink_answers_an_undeclared_plain_http_request_locally() {
     let _exclusive = EVENT_STREAM.lock().await;
