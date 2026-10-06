@@ -20,4 +20,5 @@ tokio = { version = "1.37", features = ["rt", "net"] }
 libc.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 serde_json.workspace = true

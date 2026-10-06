@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::io::{Read as _, Write as _};
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::sched::{CloneFlags, unshare};
@@ -918,6 +918,13 @@ fn child_entry(
         match std::fs::write(ca_path, &ca.ca_cert_pem) {
             Ok(_) => ca_cert_path = Some(ca_path.to_string()),
             Err(e) => tracing::warn!("failed to write CA cert to {}: {}", ca_path, e),
+        }
+
+        // For clients that never read SSL_CERT_FILE (ADR-0028). Needs
+        // CAP_SYS_ADMIN, so before the capabilities are dropped below.
+        if config.network.overlay_ca_bundles() {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            crate::ca_trust::overlay_bundles(&ca.ca_cert_pem, host_cwd.as_deref(), home.as_deref());
         }
     }
 

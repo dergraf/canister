@@ -41,6 +41,13 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
 
+    /// Add the sandbox CA to the trust bundles a client reads without
+    /// `SSL_CERT_FILE` (ADR-0028): OpenSSL's default bundle and `certifi`'s,
+    /// overlaid with copies that include it. Rendered in the resolved
+    /// policy only when on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_ca_bundles: Option<bool>,
+
     /// Allowed IP addresses / CIDRs (runtime-resolved). IP-literal egress
     /// carries no service identity and bypasses the per-host contract and
     /// DLP gates, so it is authored under `[unsafe] reachable_ips`.
@@ -79,7 +86,8 @@ impl NetworkConfig {
                 self.undeclared_hosts,
                 overlay.undeclared_hosts,
             ),
-            transparent: merge_transparent(self.transparent, overlay.transparent),
+            transparent: merge_opt_in(self.transparent, overlay.transparent),
+            overlay_ca_bundles: merge_opt_in(self.overlay_ca_bundles, overlay.overlay_ca_bundles),
             allow_ips: union_vecs(self.allow_ips, overlay.allow_ips),
             ports: union_vecs(self.ports, overlay.ports),
             allow_host_loopback: self.allow_host_loopback || overlay.allow_host_loopback,
@@ -101,6 +109,11 @@ impl NetworkConfig {
     pub fn transparent(&self) -> bool {
         self.transparent.unwrap_or(false)
     }
+
+    /// Whether the sandbox CA is added to the known trust bundles (off unless set).
+    pub fn overlay_ca_bundles(&self) -> bool {
+        self.overlay_ca_bundles.unwrap_or(false)
+    }
 }
 
 /// Handling of a request whose host no `[[host]]` block declares
@@ -117,10 +130,10 @@ pub enum UndeclaredHosts {
     Sink,
 }
 
-/// Any layer turning transparent egress on wins: it changes nothing about
-/// what may leave, only that a workload ignoring the proxy settings is
-/// still seen.
-fn merge_transparent(base: Option<bool>, overlay: Option<bool>) -> Option<bool> {
+/// Any layer turning an opt-in observation switch (`transparent`,
+/// `overlay_ca_bundles`) on wins: it changes nothing about what may leave,
+/// only that a workload ignoring the proxy settings is still seen.
+fn merge_opt_in(base: Option<bool>, overlay: Option<bool>) -> Option<bool> {
     match (base, overlay) {
         (Some(true), _) | (_, Some(true)) => Some(true),
         (Some(false), _) | (_, Some(false)) => Some(false),
@@ -290,6 +303,38 @@ mod tests {
         assert_eq!(merged(Some(true), Some(false)), Some(true));
         assert_eq!(merged(Some(false), Some(true)), Some(true));
         assert_eq!(merged(Some(false), None), Some(false));
+    }
+
+    #[test]
+    fn ca_bundle_overlay_is_off_unless_a_layer_turns_it_on() {
+        assert!(!network("").overlay_ca_bundles());
+        assert!(network("overlay_ca_bundles = true").overlay_ca_bundles());
+        assert!(!network("overlay_ca_bundles = false").overlay_ca_bundles());
+
+        let merged = |a: Option<bool>, b: Option<bool>| {
+            NetworkConfig {
+                overlay_ca_bundles: a,
+                ..Default::default()
+            }
+            .merge(NetworkConfig {
+                overlay_ca_bundles: b,
+                ..Default::default()
+            })
+            .overlay_ca_bundles
+        };
+        assert_eq!(merged(None, None), None);
+        assert_eq!(merged(Some(true), Some(false)), Some(true));
+        assert_eq!(merged(Some(false), Some(true)), Some(true));
+        assert_eq!(merged(None, Some(false)), Some(false));
+    }
+
+    #[test]
+    fn ca_bundle_overlay_is_rendered_only_when_on() {
+        let off = toml::to_string(&network("")).expect("serialize");
+        let on = toml::to_string(&network("overlay_ca_bundles = true")).expect("serialize");
+
+        assert!(!off.contains("overlay_ca_bundles"), "{off}");
+        assert!(on.contains("overlay_ca_bundles = true"), "{on}");
     }
 
     #[test]
