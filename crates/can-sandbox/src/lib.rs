@@ -1,6 +1,7 @@
 pub mod capabilities;
 pub mod cgroups;
 pub mod mac;
+mod mount_plan;
 pub mod namespace;
 pub mod notifier;
 pub mod overlay;
