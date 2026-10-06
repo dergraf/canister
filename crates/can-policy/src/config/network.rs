@@ -238,6 +238,39 @@ mod tests {
     }
 
     #[test]
+    fn bound_credentials_are_off_unless_a_layer_turns_them_on() {
+        let bind = |src: &str| network(src).dlp.is_some_and(|d| d.bind_credentials());
+        assert!(!bind(""));
+        assert!(!bind("[dlp]\nenabled = true"));
+        assert!(bind("[dlp]\nbind_credentials = true"));
+        assert!(!bind("[dlp]\nbind_credentials = false"));
+
+        let merged = |a: &str, b: &str| {
+            network(a)
+                .merge(network(b))
+                .dlp
+                .is_some_and(|d| d.bind_credentials())
+        };
+        assert!(merged(
+            "[dlp]\nbind_credentials = true",
+            "[dlp]\nbind_credentials = false"
+        ));
+        assert!(merged(
+            "[dlp]\nbind_credentials = false",
+            "[dlp]\nbind_credentials = true"
+        ));
+        assert!(merged("[dlp]\nbind_credentials = true", ""));
+    }
+
+    #[test]
+    fn bound_credentials_are_rendered_only_when_set() {
+        let off = toml::to_string(&network("[dlp]\nenabled = true")).expect("serialize");
+        let on = toml::to_string(&network("[dlp]\nbind_credentials = true")).expect("serialize");
+        assert!(!off.contains("bind_credentials"), "{off}");
+        assert!(on.contains("bind_credentials = true"), "{on}");
+    }
+
+    #[test]
     fn transparent_egress_is_off_unless_a_layer_turns_it_on() {
         assert!(!network("").transparent());
         assert!(network("transparent = true").transparent());

@@ -50,6 +50,7 @@ fn egress(host: &str) -> Event {
         path: "/v1/messages".to_string(),
         decision: Decision::Allowed,
         reason: None,
+        credential: None,
     })
 }
 
@@ -433,4 +434,34 @@ fn a_run_start_from_before_working_dir_still_parses() {
     let old = r#"{"can_version":"0.2.1","command":["agent"],"monitor":false,"strict":false}"#;
     let parsed: RunStart = serde_json::from_str(old).expect("older run_start parses");
     assert_eq!(parsed.working_dir, None);
+}
+
+#[test]
+fn egress_credential_is_named_in_snake_case_and_absent_unless_classified() {
+    let mut event = EgressRequest {
+        host: "api.anthropic.com".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/messages".to_string(),
+        decision: Decision::Allowed,
+        reason: None,
+        credential: None,
+    };
+    let absent = serde_json::to_value(&event).expect("serialize");
+    assert!(absent.get("credential").is_none(), "{absent}");
+
+    for (credential, name) in [
+        (crate::schema::CredentialUse::Swapped, "swapped"),
+        (crate::schema::CredentialUse::Foreign, "foreign"),
+        (crate::schema::CredentialUse::None, "none"),
+    ] {
+        event.credential = Some(credential);
+        assert_eq!(
+            serde_json::to_value(&event).expect("serialize")["credential"],
+            name
+        );
+    }
+
+    let older = r#"{"host":"h","method":"GET","path":"/","decision":"allowed"}"#;
+    let parsed: EgressRequest = serde_json::from_str(older).expect("an older stream still parses");
+    assert_eq!(parsed.credential, None);
 }
