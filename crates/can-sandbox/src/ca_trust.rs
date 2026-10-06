@@ -30,6 +30,12 @@ const BUNDLE_LOCATIONS: &[BundleLocation] = &[
         pattern: "/etc/pki/tls/certs/ca-bundle.crt",
         read_by: "OpenSSL, Go, curl on Fedora, RHEL",
     },
+    // A symlink on the host, but mounted on its own it is a file of its
+    // own in the sandbox, so it is overlaid on its own too.
+    BundleLocation {
+        pattern: "/etc/pki/tls/cert.pem",
+        read_by: "OpenSSL's default bundle on Fedora, RHEL",
+    },
     BundleLocation {
         pattern: "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
         read_by: "OpenSSL, Go, curl on Fedora, RHEL",
