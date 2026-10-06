@@ -94,6 +94,7 @@ fn all_events() -> Vec<(&'static str, Event)> {
                 path: "/v1/messages".to_string(),
                 decision: Decision::Allowed,
                 reason: None,
+                credential: None,
             }),
         ),
         (
@@ -104,6 +105,7 @@ fn all_events() -> Vec<(&'static str, Event)> {
                 path: "/collect".to_string(),
                 decision: Decision::Blocked,
                 reason: Some("policy".to_string()),
+                credential: None,
             }),
         ),
         (

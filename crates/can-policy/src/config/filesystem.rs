@@ -73,15 +73,22 @@ pub enum WorkdirAccess {
     Write,
     /// Read-only: only `write` entries are writable.
     Read,
+    /// Only the `read` and `write` entries inside it are visible; the rest
+    /// of the checkout is absent, and the directory itself is read-only
+    /// (ADR-0032).
+    Listed,
 }
 
-/// An explicit `read` in any layer wins: it is the narrower access, so a
+/// The narrower access in any layer wins (`listed`, then `read`), so a
 /// layer that pins it cannot be widened by a later one.
 fn merge_workdir(
     base: Option<WorkdirAccess>,
     overlay: Option<WorkdirAccess>,
 ) -> Option<WorkdirAccess> {
     match (base, overlay) {
+        (Some(WorkdirAccess::Listed), _) | (_, Some(WorkdirAccess::Listed)) => {
+            Some(WorkdirAccess::Listed)
+        }
         (Some(WorkdirAccess::Read), _) | (_, Some(WorkdirAccess::Read)) => {
             Some(WorkdirAccess::Read)
         }
@@ -277,6 +284,38 @@ mod tests {
         );
         assert!(toml::from_str::<FilesystemConfig>("workdir = \"none\"").is_err());
         assert!(toml::from_str::<FilesystemConfig>("workdir = false").is_err());
+    }
+
+    #[test]
+    fn workdir_listed_parses() {
+        assert_eq!(
+            filesystem("workdir = \"listed\"").workdir(),
+            WorkdirAccess::Listed
+        );
+    }
+
+    #[test]
+    fn listed_wins_over_read_and_write_in_any_layer() {
+        use WorkdirAccess::{Listed, Read, Write};
+        let cases = [
+            (Some(Listed), None, Some(Listed)),
+            (None, Some(Listed), Some(Listed)),
+            (Some(Listed), Some(Write), Some(Listed)),
+            (Some(Write), Some(Listed), Some(Listed)),
+            (Some(Listed), Some(Read), Some(Listed)),
+            (Some(Read), Some(Listed), Some(Listed)),
+        ];
+        for (base, overlay, expected) in cases {
+            let merged = FilesystemConfig {
+                workdir: base,
+                ..Default::default()
+            }
+            .merge(FilesystemConfig {
+                workdir: overlay,
+                ..Default::default()
+            });
+            assert_eq!(merged.workdir, expected, "{base:?} merged with {overlay:?}");
+        }
     }
 
     #[test]

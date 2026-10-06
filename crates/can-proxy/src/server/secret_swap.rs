@@ -19,6 +19,11 @@ use hyper::HeaderMap;
 use hyper::header::{HeaderName, HeaderValue};
 
 use can_dlp::DlpScanner;
+pub(crate) use can_events::schema::CredentialUse;
+
+/// Headers a credential travels in. A credential anywhere else (another
+/// header, the query, the body) is not classified (ADR-0030).
+const CREDENTIAL_HEADERS: &[&str] = &["authorization", "x-api-key", "api-key", "x-goog-api-key"];
 
 /// One fake→real substitution. `real` is sensitive and deliberately kept
 /// out of `Debug` output and logs.
@@ -107,6 +112,39 @@ pub(super) fn swap_in_body(
     }
 }
 
+/// Which credential a request carries, on a host at least one swap is
+/// authorized for; `None` on any other host. Classified as the workload
+/// sent it, before the swap: a credential header carrying an authorized
+/// fake is `Swapped`, one carrying anything else makes the request
+/// `Foreign`, and no non-empty credential header is `None`.
+pub(crate) fn classify_credential(
+    swaps: &[SecretSwap],
+    scanner: &DlpScanner,
+    host: &str,
+    headers: &HeaderMap,
+) -> Option<CredentialUse> {
+    let authorized = authorized_swaps(swaps, scanner, host);
+    if authorized.is_empty() {
+        return None;
+    }
+
+    let values: Vec<&str> = CREDENTIAL_HEADERS
+        .iter()
+        .flat_map(|name| headers.get_all(*name))
+        .filter_map(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .collect();
+
+    let carries_fake = |value: &&str| authorized.iter().any(|sw| value.contains(&sw.fake));
+    Some(if values.is_empty() {
+        CredentialUse::None
+    } else if values.iter().all(carries_fake) {
+        CredentialUse::Swapped
+    } else {
+        CredentialUse::Foreign
+    })
+}
+
 fn authorized_swaps<'a>(
     swaps: &'a [SecretSwap],
     scanner: &DlpScanner,
@@ -193,6 +231,89 @@ mod tests {
         assert_eq!(
             headers.get(hyper::header::AUTHORIZATION).unwrap(),
             &format!("Bearer {real}")
+        );
+    }
+
+    const FAKE: &str = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn classified(host: &str, headers: &[(&str, &str)]) -> Option<CredentialUse> {
+        let scanner = DlpScanner::new(vec![], &Default::default(), 32, true, false).unwrap();
+        let swaps = vec![swap(
+            FAKE,
+            "ghp_RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+            "github_pat",
+        )];
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        classify_credential(&swaps, &scanner, host, &map)
+    }
+
+    #[test]
+    fn the_fake_in_any_credential_header_is_the_swapped_credential() {
+        let bearer = format!("Bearer {FAKE}");
+        for header in ["authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+            assert_eq!(
+                classified("github.com", &[(header, &bearer)]),
+                Some(CredentialUse::Swapped),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_credential_on_a_scoped_host_is_foreign() {
+        assert_eq!(
+            classified(
+                "github.com",
+                &[(
+                    "authorization",
+                    "Bearer ghp_OTHEROTHEROTHEROTHEROTHEROTHEROTHER"
+                )]
+            ),
+            Some(CredentialUse::Foreign)
+        );
+        assert_eq!(
+            classified("github.com", &[("x-api-key", "sk-ant-mine")]),
+            Some(CredentialUse::Foreign)
+        );
+    }
+
+    #[test]
+    fn the_fake_next_to_a_foreign_credential_is_still_foreign() {
+        let bearer = format!("Bearer {FAKE}");
+        assert_eq!(
+            classified(
+                "github.com",
+                &[("authorization", &bearer), ("x-api-key", "sk-mine")]
+            ),
+            Some(CredentialUse::Foreign)
+        );
+    }
+
+    #[test]
+    fn no_credential_header_is_none_and_other_headers_do_not_count() {
+        assert_eq!(classified("github.com", &[]), Some(CredentialUse::None));
+        assert_eq!(
+            classified("github.com", &[("user-agent", "x"), ("x-request-id", FAKE)]),
+            Some(CredentialUse::None)
+        );
+        assert_eq!(
+            classified("github.com", &[("authorization", "")]),
+            Some(CredentialUse::None),
+            "an empty header carries no credential"
+        );
+    }
+
+    #[test]
+    fn a_host_no_credential_is_scoped_to_is_not_classified() {
+        assert_eq!(
+            classified("example.com", &[("authorization", "Bearer anything")]),
+            None
         );
     }
 

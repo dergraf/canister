@@ -338,7 +338,7 @@ paths and essential system paths are bind-mounted read-only.
 |-------|------|---------|-------------|
 | `read` | `string[]` | `[]` | Paths bind-mounted **read-only** into the sandbox |
 | `write` | `string[]` | `[]` | Paths bind-mounted **writable** — changes persist on the host |
-| `workdir` | `"write"` \| `"read"` | `"write"` | How the working directory is mounted. `read` mounts it read-only: only `write` entries are writable, including ones inside it. An explicit `read` in any recipe wins when recipes are composed (ADR-0024). |
+| `workdir` | `"write"` \| `"read"` \| `"listed"` | `"write"` | How the working directory is mounted. `read` mounts it read-only: only `write` entries are writable, including ones inside it (ADR-0024). `listed` shows only the `read` and `write` entries inside it: the rest of the checkout, `.git` and untracked files included, is absent, and nothing else can be created there (ADR-0032). The narrower value in any recipe wins when recipes are composed (`listed`, then `read`). A `write` entry covering the working directory makes it writable whatever this says. |
 | `deny` | `string[]` | `[]` | Paths explicitly denied (checked **before** `read`/`write`) |
 | `decoy` | `string[]` | `[]` | Tripwires: an empty read-only decoy file is placed at each path, and any access to it is reported as an `fs_access` event (ADR-0019). Never replaces a path that `read`, `write` or the working directory provides. `recipes = ["tripwires"]` covers the usual credential locations. |
 
@@ -517,7 +517,9 @@ For a request to an undeclared host name, the proxy then
    declared host's request — headers, URI, body, trailers — emitting
    `dlp_block` and `canary_fire` events as usual;
 3. answers it itself with `403`, `x-canister-error: undeclared-host-sink`
-   and a fixed body, whatever the detectors found;
+   and a fixed body, whatever the detectors found. A `robots.txt` check
+   gets `404` instead, so a client that checks first goes on to the request
+   it meant to make (ADR-0029);
 4. **never** resolves the name or opens a connection to it.
 
 Every request (and every accepted `CONNECT`) to an undeclared host emits
@@ -757,6 +759,7 @@ allow_credentials = ["github_pat"]
 | `session_entropy_budget` | `u64` | `8192` | High-entropy bytes each destination host may be sent in one sandbox session before requests to it are blocked. Bytes a host was already sent are not charged again. Override per host with `[[host]] session_entropy_budget`. See [DLP](DLP.md#session-entropy-budget). |
 | `external_canaries` | `{ value, data_class, allowed_hosts }[]` | `[]` | Values planted in the workload's *input data* by an orchestrator, each tagged with the class of data it stands for and the destinations allowed to see it. Recognised on egress like generated canaries, but a hit on an allowed host is recorded (`canary_fire` with `allowed: true`) instead of blocked; any other host is a leak. Never injected into the sandbox environment. Also settable per run with `--canaries-file`. See [ADR-0012](adr/0012-external-tagged-canaries.md). |
 | `fake_secrets` | `{ env, credential }[]` | `[]` | Env-var secrets the sandbox never sees in cleartext: it receives a fake matching `credential`'s pattern, and the proxy swaps in the real host value only on egress to a host authorised for that credential. `credential` must be a detector with a generatable pattern (`github_pat`, `npm_token`, `openai_key`, `anthropic_key`, `slack_token`, `stripe_key`). Dropped for untrusted recipes, like `allow_credentials`. See [DLP](DLP.md#fake-secret-swap). |
+| `bind_credentials` | `bool` | `false` | On a host a credential is scoped to, refuse a request carrying a credential other than the fake the sandbox was given (`403 foreign-credential`), so a workload cannot use the host with a key of its own. Every request to such a host records which credential it carried (`egress_request.credential`: `swapped`, `foreign` or `none`), with or without this flag. Credentials are looked for in `authorization`, `x-api-key`, `api-key` and `x-goog-api-key`. Any layer turning it on wins. See [ADR-0030](adr/0030-credentials-bound-to-their-host.md). |
 
 ```toml
 # Watch for a planted AHV number and record where it goes.

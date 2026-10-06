@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use can_events::schema::{Decision, Event, Location};
+use can_events::schema::{CredentialUse, Decision, Event, Location};
 use sha2::{Digest, Sha256};
 
 /// Sink for DLP events. Production code writes to stderr; tests substitute
@@ -79,43 +79,66 @@ pub fn dlp_block(
     emit(payload.to_string());
 }
 
-/// Emit `egress_request` for a request that reached the proxy, deriving
-/// the decision from the proxy's own refusal header. No-op unless an
-/// event stream is installed, so default `can` output is unchanged.
+/// The decision a proxy-built response stands for, carried in its
+/// extensions so `egress_request` records it as a value (ADR-0031).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedDecision {
+    pub(crate) decision: Decision,
+    pub(crate) reason: Option<String>,
+}
+
+/// Emit `egress_request` for a request that reached the proxy. A response
+/// the proxy built carries its decision; any other came from upstream,
+/// which policy let the request reach. No-op unless an event stream is
+/// installed, so default `can` output is unchanged.
 pub(crate) fn egress_request<B>(
     host: &str,
     method: &str,
     path: &str,
     duration_ms: u64,
     resp: &hyper::Response<B>,
+    credential: Option<CredentialUse>,
 ) {
-    let error = resp
-        .headers()
-        .get("x-canister-error")
-        .and_then(|v| v.to_str().ok());
-    let detector = resp
-        .headers()
-        .get("x-canister-dlp-detector")
-        .and_then(|v| v.to_str().ok());
-
-    // Upstream failures are not refusals: policy let the request out and
-    // the destination (or the network) failed afterwards.
-    let (decision, reason) = match error {
-        None => (Decision::Allowed, None),
-        Some("upstream-timeout") => (Decision::Allowed, Some("upstream-timeout".to_string())),
-        Some("upstream-error") => (Decision::Allowed, Some("upstream-error".to_string())),
-        Some("policy-blocked") => (Decision::Blocked, Some("policy".to_string())),
-        Some("contract-refused") => (Decision::Blocked, Some("contract".to_string())),
-        Some("undeclared-host-sink") => (Decision::Blocked, Some(SINK_REASON.to_string())),
-        Some("dlp-blocked") => (
-            Decision::Blocked,
-            Some(detector.unwrap_or("dlp").to_string()),
-        ),
-        Some(other) => (Decision::Blocked, Some(other.to_string())),
-    };
+    let RecordedDecision { decision, reason } = resp
+        .extensions()
+        .get::<RecordedDecision>()
+        .cloned()
+        .unwrap_or(RecordedDecision {
+            decision: Decision::Allowed,
+            reason: None,
+        });
 
     crate::server::stats::record_request(decision, duration_ms);
-    emit_egress(host, method, path, decision, reason);
+    emit_egress(host, method, path, decision, reason, credential);
+}
+
+/// `egress_request.reason` for a request to a credential-scoped host that
+/// carried a credential other than the swapped fake (ADR-0030).
+pub(crate) const FOREIGN_CREDENTIAL_REASON: &str = "foreign_credential";
+
+/// Why a connection was refused before there was a request to answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectRefusal {
+    /// The connect gate refused the host.
+    Policy,
+    /// The undeclared-host sink accepted the `CONNECT` (ADR-0018).
+    Sink,
+    /// A transparent TLS connection named no host (ADR-0027).
+    NoSni,
+    /// A transparent client aborted the handshake, typically because it
+    /// does not trust the sandbox CA (ADR-0027).
+    ClientRejectedCa,
+}
+
+impl ConnectRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Sink => SINK_REASON,
+            Self::NoSni => "no_sni",
+            Self::ClientRejectedCa => "client_rejected_ca",
+        }
+    }
 }
 
 /// `egress_request.reason` for a request (or CONNECT) to an undeclared
@@ -124,18 +147,26 @@ pub(crate) const SINK_REASON: &str = "sink";
 
 /// Emit `egress_request` for a refusal raised before there is a response
 /// to classify — the CONNECT policy gate, and a CONNECT the sink accepted.
-pub(crate) fn egress_blocked(host: &str, method: &str, path: &str, reason: &str) {
+pub(crate) fn egress_blocked(host: &str, method: &str, path: &str, refusal: ConnectRefusal) {
     crate::server::stats::record_request(Decision::Blocked, 0);
     emit_egress(
         host,
         method,
         path,
         Decision::Blocked,
-        Some(reason.to_string()),
+        Some(refusal.reason().to_string()),
+        None,
     );
 }
 
-fn emit_egress(host: &str, method: &str, path: &str, decision: Decision, reason: Option<String>) {
+fn emit_egress(
+    host: &str,
+    method: &str,
+    path: &str,
+    decision: Decision,
+    reason: Option<String>,
+    credential: Option<CredentialUse>,
+) {
     if !can_events::enabled() {
         return;
     }
@@ -145,6 +176,7 @@ fn emit_egress(host: &str, method: &str, path: &str, decision: Decision, reason:
         path: path.to_string(),
         decision,
         reason,
+        credential,
     }));
 }
 
