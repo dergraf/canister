@@ -29,7 +29,7 @@ use nix::unistd::pivot_root;
 
 use can_policy::config::{DecoyMount, FilesystemConfig, WorkdirAccess};
 
-use crate::mount_plan::{self, Access, SkipReason, Step};
+use crate::mount_plan::{self, Access, SkipReason, Step, WorkdirMount};
 
 /// Errors from filesystem setup.
 #[derive(Debug, thiserror::Error)]
@@ -275,28 +275,45 @@ fn apply_step(root: &Path, step: &Step) -> Result<(), OverlayError> {
             }
         }
         Step::Tmp { noexec } => mount_tmpfs(&root.join("tmp"), *noexec)?,
-        Step::Workdir {
-            cwd,
-            writable,
-            noexec,
-        } => {
+        Step::Workdir { cwd, mount, noexec } => {
             let target = in_root(root, cwd);
             if let Some(parent) = target.parent() {
                 mkdir_p(parent)?;
             }
             mkdir_p(&target)?;
-            if *writable {
-                bind_mount_rw(cwd, &target, *noexec)?;
-            } else {
-                bind_mount_ro(cwd, &target)?;
+            match mount {
+                WorkdirMount::Writable => bind_mount_rw(cwd, &target, *noexec)?,
+                WorkdirMount::ReadOnly => bind_mount_ro(cwd, &target)?,
+                // The listed entries are mounted into it next; it is sealed
+                // read-only after them (`Step::SealWorkdir`).
+                WorkdirMount::Listed => mount_tmpfs(&target, true)?,
             }
             tracing::info!(
                 source = %cwd.display(),
                 target = %target.display(),
-                writable,
+                ?mount,
                 noexec,
-                "CWD bind-mounted"
+                "CWD mounted"
             );
+        }
+        Step::SealWorkdir { cwd } => {
+            let target = in_root(root, cwd);
+            mount(
+                None::<&str>,
+                &target,
+                None::<&str>,
+                MsFlags::MS_REMOUNT
+                    | MsFlags::MS_RDONLY
+                    | MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .map_err(|source| OverlayError::Mount {
+                path: format!("{} (seal read-only)", target.display()),
+                source,
+            })?;
+            tracing::info!(target = %target.display(), "listed working directory sealed read-only");
         }
         Step::Hide { path } => hide_denied(root, std::slice::from_ref(path))?,
         Step::Mask { path } => mask(root, path),
