@@ -63,6 +63,12 @@ pub struct EventFlags {
     /// entered and never enters the child's environment.
     #[arg(long, value_name = "PATH")]
     pub events_sign_key: Option<PathBuf>,
+
+    /// Print the resolved policy this run would enforce, with the
+    /// `policy_sha256` its `policy_resolved` event would carry, as one
+    /// line of JSON, and exit without starting a sandbox (ADR-0033).
+    #[arg(long)]
+    pub print_policy: bool,
 }
 
 /// Frequent enough to show a run progressing, rare enough to stay out of
@@ -82,6 +88,7 @@ impl Default for EventFlags {
             capture_readable_encodings: false,
             stats_interval_ms: DEFAULT_STATS_INTERVAL_MS,
             events_sign_key: None,
+            print_policy: false,
         }
     }
 }

@@ -332,6 +332,10 @@ pub fn up(args: UpArgs<'_>) -> Result<i32> {
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty command in sandbox '{sandbox_name}'"))?;
 
+    if event_flags.print_policy {
+        return crate::policy_event::print(&config);
+    }
+
     let events = event_flags.init()?;
 
     let mut opts = SandboxOpts {
@@ -589,6 +593,10 @@ pub fn run(
         .ok_or_else(|| anyhow::anyhow!("no command specified"))?;
 
     tracing::debug!("effective egress mode: {:?}", config.network.egress());
+
+    if event_flags.print_policy {
+        return crate::policy_event::print(&config);
+    }
 
     let events = event_flags.init()?;
 
