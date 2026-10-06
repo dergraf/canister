@@ -41,6 +41,12 @@ pub enum OverlayError {
         source: std::io::Error,
     },
 
+    #[error("{path}: {source}")]
+    File {
+        path: String,
+        source: std::io::Error,
+    },
+
     #[error("pivot_root failed: {0}")]
     PivotRoot(nix::Error),
 
@@ -856,7 +862,7 @@ fn do_pivot_root(new_root: &Path) -> Result<(), OverlayError> {
 /// The kernel rejects remounts that would drop flags set on the source.
 /// We read the source mount flags via /proc/self/mountinfo and include
 /// them in the remount call.
-fn bind_mount_ro(source: &Path, target: &Path) -> Result<(), OverlayError> {
+pub(crate) fn bind_mount_ro(source: &Path, target: &Path) -> Result<(), OverlayError> {
     // First bind mount (needs MS_BIND).
     mount(
         Some(source),

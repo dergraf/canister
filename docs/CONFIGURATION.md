@@ -470,6 +470,28 @@ the workload cannot serve on 80 or 443 on loopback itself. A client that also
 ignores `SSL_CERT_FILE` rejects the sandbox CA; the attempt is then recorded as
 `egress_request` with `reason: client_rejected_ca`.
 
+### The sandbox CA in the default trust bundles
+
+A client that never reads `SSL_CERT_FILE` trusts only the bundle it finds by
+itself: OpenSSL's default bundle, or `certifi`'s copy in a Python environment
+(`httpx`, `requests`). `overlay_ca_bundles = true` adds the sandbox CA to those
+bundles (ADR-0028):
+
+```toml
+[network]
+egress = "proxy"
+transparent = true
+overlay_ca_bundles = true
+```
+
+Each known bundle that exists in the sandbox is overlaid with a copy that holds
+its own anchors and the sandbox CA. The known places are the system bundles of
+Debian, Ubuntu, Alpine, Arch, Fedora, RHEL and openSUSE, and `certifi` in the
+system Python, under `/usr/local`, in `~/.local`, in tools run with `uvx`, and
+in the working directory's `.venv` or `venv`. The host's files do not change.
+Clients with compiled-in roots (Node.js) or their own keystore (Java) are not
+covered.
+
 ### Undeclared hosts
 
 By default a request for a host with no `[[host]]` block is refused at

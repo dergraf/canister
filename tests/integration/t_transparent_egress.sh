@@ -11,6 +11,10 @@
 #      carried is recorded
 #   5. A client that also ignores SSL_CERT_FILE rejects the sandbox CA; the
 #      attempt is recorded with its host instead of vanishing
+#   6. With overlay_ca_bundles (ADR-0028), a client with no environment
+#      trusts the sandbox CA through OpenSSL's default bundle
+#   7. ... and through a project virtualenv's certifi bundle, which the host
+#      keeps unchanged
 # ============================================================================
 
 source "$(dirname "$0")/lib.sh"
@@ -54,7 +58,9 @@ TOML
 }
 PLAIN=$(recipe "")
 TRANSPARENT=$(recipe "transparent = true")
-_TMPFILES+=("$PLAIN" "$TRANSPARENT")
+OVERLAID=$(recipe "transparent = true
+overlay_ca_bundles = true")
+_TMPFILES+=("$PLAIN" "$TRANSPARENT" "$OVERLAID")
 
 # No proxy variables at all, as a stdio MCP server started by the MCP SDK.
 NO_PROXY_ENV=(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy)
@@ -112,5 +118,31 @@ PY
 )
 assert_contains "$RUN_STDOUT" "failed:"
 assert_eq "mock.example" "$REJECTED"
+
+# No environment at all, and only the trust a client finds by itself.
+BUNDLE_FETCH='import ssl, sys, urllib.request
+context = ssl.create_default_context(cafile=sys.argv[1] if len(sys.argv) > 1 else None)
+try:
+    print(urllib.request.urlopen("https://mock.example/x", timeout=10, context=context).read().decode().strip())
+except Exception as e:
+    print("failed:", type(e).__name__)'
+
+begin_test "with overlay_ca_bundles, OpenSSL's default bundle trusts the sandbox CA"
+run_can run --recipe "$OVERLAID" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH"
+assert_eq "from-the-host" "$RUN_STDOUT"
+
+begin_test "and so does a project virtualenv's certifi bundle, unchanged on the host"
+PROJECT="$WORK/project"
+CERTIFI="$PROJECT/.venv/lib/python3.12/site-packages/certifi/cacert.pem"
+mkdir -p "$(dirname "$CERTIFI")"
+python3 -c 'import ssl, shutil, sys; paths = ssl.get_default_verify_paths(); shutil.copy(paths.cafile or paths.openssl_cafile, sys.argv[1])' "$CERTIFI"
+BEFORE=$(sha256sum < "$CERTIFI")
+pushd "$PROJECT" >/dev/null
+run_can run --recipe "$TRANSPARENT" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH" "$CERTIFI"
+assert_contains "$RUN_STDOUT" "failed:"
+run_can run --recipe "$OVERLAID" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH" "$CERTIFI"
+popd >/dev/null
+assert_eq "from-the-host" "$RUN_STDOUT"
+assert_eq "$BEFORE" "$(sha256sum < "$CERTIFI")"
 
 summary
