@@ -1,3 +1,4 @@
+pub mod ca_trust;
 pub mod capabilities;
 pub mod cgroups;
 pub mod mac;
