@@ -495,6 +495,13 @@
             }
           ]
         },
+        "overlay_ca_bundles": {
+          "description": "Add the sandbox CA to the trust bundles a client reads without `SSL_CERT_FILE` (ADR-0028): OpenSSL's default bundle and `certifi`'s, overlaid with copies that include it. Rendered in the resolved policy only when on.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "transparent": {
           "description": "Route a workload that ignores `HTTP_PROXY` through the proxy anyway (ADR-0027): names resolve to the proxy, which serves ports 443 (by TLS SNI) and 80 (by `Host`) in the workload's network namespace. Rendered in the resolved policy only when on.",
           "type": [
