@@ -4,6 +4,7 @@
 //! and the request takes the same path a proxied one does: the connect
 //! gate, the undeclared-host sink, TLS termination, DLP, capture, events.
 
+use crate::events::ConnectRefusal;
 use std::sync::Arc;
 
 use hyper::server::conn::http1;
@@ -20,11 +21,6 @@ use super::request::{TunnelGate, handle_proxy_request, tunnel_gate};
 use super::tunnel::{serve_tls, server_config};
 use crate::ca::DynamicCa;
 use crate::policy::OutboundPolicy;
-
-/// `egress_request.reason` for a transparent TLS connection whose client
-/// aborted the handshake, typically because it does not trust the sandbox
-/// CA (it read neither `SSL_CERT_FILE` nor the proxy settings).
-pub const CLIENT_REJECTED_CA: &str = "client_rejected_ca";
 
 /// The sockets transparent egress serves, bound in the workload's network
 /// namespace: TLS on 443, plain HTTP on 80, the stub resolver on 53.
@@ -76,12 +72,12 @@ async fn tls_connection(tcp: TcpStream, shared: Shared) {
     };
 
     let Some(host) = start.client_hello().server_name().map(str::to_string) else {
-        crate::events::egress_blocked("", "CONNECT", "", "no_sni");
+        crate::events::egress_blocked("", "CONNECT", "", ConnectRefusal::NoSni);
         return;
     };
 
     let Some(dlp) = shared.dlp.clone() else {
-        crate::events::egress_blocked(&host, "CONNECT", "", "policy");
+        crate::events::egress_blocked(&host, "CONNECT", "", ConnectRefusal::Policy);
         return;
     };
 
@@ -99,7 +95,12 @@ async fn tls_connection(tcp: TcpStream, shared: Shared) {
         let tls = match start.into_stream(config).await {
             Ok(tls) => tls,
             Err(e) => {
-                crate::events::egress_blocked(&host, "CONNECT", "", CLIENT_REJECTED_CA);
+                crate::events::egress_blocked(
+                    &host,
+                    "CONNECT",
+                    "",
+                    ConnectRefusal::ClientRejectedCa,
+                );
                 return Err(e);
             }
         };
