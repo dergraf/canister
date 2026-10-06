@@ -8,7 +8,22 @@
 use anyhow::{Context, Result};
 use can_policy::SandboxConfig;
 use can_policy::config::UnsafeConfig;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// The shape of the resolved policy: the `policy` of `policy_resolved`
+/// and of `can run --print-policy`. Published as
+/// `docs/policy-schema-v1.json` (ADR-0033); a test checks that every
+/// resolved policy reads and writes back through it unchanged.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct PolicyDocument {
+    #[serde(flatten)]
+    pub config: SandboxConfig,
+    /// The isolation-weakening settings in effect (ADR-0022).
+    #[serde(rename = "unsafe")]
+    pub unsafe_in_effect: UnsafeConfig,
+}
 
 /// Resolve the effective policy: the same document `can recipe show`
 /// prints, with `Option` fields replaced by the values that will actually
@@ -36,14 +51,12 @@ pub fn resolved(config: &SandboxConfig) -> SandboxConfig {
 /// no trace of it in the evidence.
 pub fn canonical(config: &SandboxConfig) -> Result<(serde_json::Value, String)> {
     let resolved = resolved(config);
-    let unsafe_in_effect = serde_json::to_value(UnsafeConfig::in_effect(&resolved))
-        .context("serializing the unsafe settings in effect as JSON")?;
-    let mut value =
-        serde_json::to_value(resolved).context("serializing the resolved policy as JSON")?;
-    value
-        .as_object_mut()
-        .context("the resolved policy serializes as a JSON object")?
-        .insert("unsafe".to_string(), unsafe_in_effect);
+    let document = PolicyDocument {
+        unsafe_in_effect: UnsafeConfig::in_effect(&resolved),
+        config: resolved,
+    };
+    let value =
+        serde_json::to_value(document).context("serializing the resolved policy as JSON")?;
     let canonical = serde_json::to_string(&value).context("canonicalizing the resolved policy")?;
 
     let mut hasher = Sha256::new();
@@ -57,6 +70,19 @@ pub fn canonical(config: &SandboxConfig) -> Result<(serde_json::Value, String)> 
     }
 
     Ok((value, hex))
+}
+
+/// What `policy_resolved` will carry for `config`: the resolved policy
+/// and its digest, computed by the same function (ADR-0033).
+pub fn preview(config: &SandboxConfig) -> Result<serde_json::Value> {
+    let (policy, policy_sha256) = canonical(config)?;
+    Ok(serde_json::json!({ "policy_sha256": policy_sha256, "policy": policy }))
+}
+
+/// Print `preview` as one line of JSON, for `--print-policy`.
+pub fn print(config: &SandboxConfig) -> Result<i32> {
+    println!("{}", preview(config)?);
+    Ok(0)
 }
 
 /// Emit `policy_resolved`. A no-op unless an event stream is installed.
@@ -79,6 +105,85 @@ pub fn emit(config: &SandboxConfig) -> Result<()> {
 mod tests {
     use super::*;
     use can_policy::config::EgressMode;
+
+    #[test]
+    fn the_preview_is_the_policy_resolved_event_data() {
+        let (policy, digest) = canonical(&config()).expect("canonical");
+        let preview = preview(&config()).expect("preview");
+
+        assert_eq!(preview["policy_sha256"], digest.as_str());
+        assert_eq!(preview["policy"], policy);
+    }
+
+    #[test]
+    fn the_published_document_type_reads_every_resolved_policy() {
+        let mut loose = SandboxConfig::default_deny();
+        loose.network.egress = Some(EgressMode::ProxyOnly);
+        loose.filesystem.read = vec!["/usr".into()];
+
+        for config in [config(), loose, SandboxConfig::default_deny()] {
+            let (policy, _) = canonical(&config).expect("canonical");
+            let document: PolicyDocument =
+                serde_json::from_value(policy.clone()).expect("the schema type reads the policy");
+            assert_eq!(
+                serde_json::to_value(document).expect("serialize"),
+                policy,
+                "and writes it back unchanged"
+            );
+        }
+    }
+
+    /// The document is serialized through `PolicyDocument` since
+    /// ADR-0033; before, the config was serialized and `unsafe` inserted
+    /// into it. Every consumer's baseline holds digests of the old form,
+    /// so the bytes must not change.
+    #[test]
+    fn the_digest_is_unchanged_by_serializing_through_the_document_type() {
+        let mut loose = SandboxConfig::default_deny();
+        loose.network.egress = Some(EgressMode::ProxyOnly);
+        loose.filesystem.read = vec!["/usr".into()];
+
+        for config in [config(), loose, SandboxConfig::default_deny()] {
+            let resolved = resolved(&config);
+            let mut before = serde_json::to_value(&resolved).expect("serialize");
+            before.as_object_mut().expect("object").insert(
+                "unsafe".to_string(),
+                serde_json::to_value(UnsafeConfig::in_effect(&resolved)).expect("serialize"),
+            );
+            let (now, _) = canonical(&config).expect("canonical");
+            assert_eq!(
+                serde_json::to_string(&now).expect("compact"),
+                serde_json::to_string(&before).expect("compact")
+            );
+        }
+    }
+
+    #[test]
+    fn published_policy_schema_is_up_to_date() {
+        let rendered = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&schemars::schema_for!(PolicyDocument))
+                .expect("serialize schema")
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/policy-schema-v1.json");
+
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(&path, &rendered).expect("write schema");
+            return;
+        }
+
+        let published = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "missing {}: {e}\nRegenerate with UPDATE_GOLDEN=1 cargo test -p can-cli",
+                path.display()
+            )
+        });
+        assert_eq!(
+            published, rendered,
+            "docs/policy-schema-v1.json is stale; regenerate with UPDATE_GOLDEN=1"
+        );
+    }
 
     fn config() -> SandboxConfig {
         let mut config = SandboxConfig::default_deny();

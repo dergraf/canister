@@ -54,6 +54,13 @@ pub struct DlpConfig {
     #[serde(default)]
     pub fake_secrets: Vec<FakeSecret>,
 
+    /// Refuse a request to a host a credential is scoped to when it
+    /// carries a credential other than the fake the sandbox was given:
+    /// one the workload brought itself (ADR-0030). Default: false. Any
+    /// layer turning it on wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_credentials: Option<bool>,
+
     /// Canaries supplied from outside the sandbox — values an
     /// orchestrator planted in the workload's input data, each tagged
     /// with the class of data it stands for and the destinations that
@@ -119,6 +126,10 @@ impl DlpConfig {
         self.enabled.unwrap_or(false)
     }
 
+    pub fn bind_credentials(&self) -> bool {
+        self.bind_credentials.unwrap_or(false)
+    }
+
     pub fn canary_tokens(&self) -> bool {
         self.canary_tokens.unwrap_or(true)
     }
@@ -158,6 +169,7 @@ impl DlpConfig {
                 .session_entropy_budget
                 .or(self.session_entropy_budget),
             fake_secrets: merge_fake_secrets(self.fake_secrets, overlay.fake_secrets),
+            bind_credentials: merge_or_bool(self.bind_credentials, overlay.bind_credentials),
             external_canaries: merge_external_canaries(
                 self.external_canaries,
                 overlay.external_canaries,

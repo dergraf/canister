@@ -76,6 +76,19 @@ pub enum Decision {
     Blocked,
 }
 
+/// Which credential a request to a credential-scoped host carried, as the
+/// workload sent it (ADR-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialUse {
+    /// The fake the sandbox was given, swapped for the real value.
+    Swapped,
+    /// A credential that is not the fake: one the workload brought.
+    Foreign,
+    /// No credential header.
+    None,
+}
+
 /// Where in a request a detector matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +152,10 @@ pub struct EgressRequest {
     /// forwarding (ADR-0018). Absent when allowed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// On a host a credential is scoped to: which credential the request
+    /// carried (ADR-0030). Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialUse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

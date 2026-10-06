@@ -1179,6 +1179,7 @@ what weakened its sandbox (ADR-0022).
 | `--stats-interval-ms <ms>` | Cumulative `stats` cadence, default 5000, `0` to disable (ADR-0015). |
 | `--canaries-file <path>` | External, tagged canaries for this run (ADR-0012). |
 | `--events-sign-key <path>` | Sign each stream's closing seal with this Ed25519 key (ADR-0016). |
+| `--print-policy` | Print the resolved policy the run would enforce and the `policy_sha256` its `policy_resolved` event would carry, as one line of JSON, and exit without starting a sandbox. Its shape is published as `docs/policy-schema-v1.json` (ADR-0033). |
 
 `can up` also takes `--recipe <path>`, repeatable, merged after the
 manifest's own recipes and overrides — for policy a caller generates per

@@ -33,6 +33,9 @@ pub(super) struct DlpCtx {
     /// Externally supplied canaries, keyed by value, with the data class
     /// and destinations each is allowed to reach (ADR-0012).
     pub(super) external_canaries: Arc<ExternalCanaryTable>,
+    /// Refuse a request to a credential-scoped host that carries a
+    /// credential other than the swapped fake (ADR-0030).
+    pub(super) bind_credentials: bool,
 }
 
 impl DlpCtx {
@@ -107,6 +110,7 @@ impl DlpCtx {
             max_decode_depth: max_depth,
             swaps: Arc::new(config.secret_swaps.clone()),
             external_canaries: Arc::new(external_canaries),
+            bind_credentials: dlp_cfg.is_some_and(|d| d.bind_credentials()),
         }))
     }
 }
