@@ -125,13 +125,14 @@ context = ssl.create_default_context(cafile=sys.argv[1] if len(sys.argv) > 1 els
 try:
     print(urllib.request.urlopen("https://mock.example/x", timeout=10, context=context).read().decode().strip())
 except Exception as e:
-    print("failed:", type(e).__name__)'
+    print("failed:", type(e).__name__)
+    print(e, ssl.OPENSSL_VERSION, file=sys.stderr)'
 
 begin_test "with overlay_ca_bundles, OpenSSL's default bundle trusts the sandbox CA"
 run_can run --recipe "$OVERLAID" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH"
 assert_eq "from-the-host" "$RUN_STDOUT"
 if [ "$RUN_STDOUT" != "from-the-host" ]; then
-    echo "$RUN_STDERR" | grep -iE "bundle|trust|overlay" | sed 's/^/       can: /'
+    echo "$RUN_STDERR" | grep -iE "bundle|trust|overlay|ssl|certificate|error|openssl" | sed 's/^/       can: /'
 fi
 
 begin_test "and so does a project virtualenv's certifi bundle, unchanged on the host"
