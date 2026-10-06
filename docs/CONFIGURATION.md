@@ -495,7 +495,9 @@ For a request to an undeclared host name, the proxy then
    declared host's request — headers, URI, body, trailers — emitting
    `dlp_block` and `canary_fire` events as usual;
 3. answers it itself with `403`, `x-canister-error: undeclared-host-sink`
-   and a fixed body, whatever the detectors found;
+   and a fixed body, whatever the detectors found. A `robots.txt` check
+   gets `404` instead, so a client that checks first goes on to the request
+   it meant to make (ADR-0029);
 4. **never** resolves the name or opens a connection to it.
 
 Every request (and every accepted `CONNECT`) to an undeclared host emits
