@@ -1,4 +1,4 @@
-# ADR-0032: The Sandbox's Mounts Are Planned as Data, Then Applied
+# ADR-0032: The Configured Mounts Are Planned as Data, Then Applied
 
 ## Status
 Accepted
@@ -8,77 +8,87 @@ Accepted
 
 ## Context
 
-`overlay::setup_filesystem` builds the sandbox's filesystem imperatively, in one
-ordered sequence: a tmpfs root, the directory skeleton, read-only binds of allowed
-paths, writable binds, a tmpfs `/tmp`, the working directory (writable, or read-only
-with writable paths mounted again inside it, ADR-0024), denied paths hidden inside
-mounted ones, masked files, decoys (ADR-0019), `/proc`, `/dev`, `pivot_root`. The
-decisions (what goes where, what wins, what is skipped) are interleaved with the
-`mount(2)` calls that carry them out.
+`overlay::setup_filesystem` builds the sandbox's filesystem in one ordered sequence:
+a tmpfs root, the directory skeleton, read-only binds of `read` entries, writable binds
+of `write` entries, a tmpfs `/tmp`, the working directory (writable, or read-only with
+the `write` entries inside it mounted again on top, ADR-0024), denied paths hidden
+inside mounted ones, masked files, decoys (ADR-0019), `/proc`, `/dev`, `pivot_root`.
 
-Each recent change added a step whose interactions with the others can only be
-checked in a real mount namespace: a deny below an allowed path, decoys that must
-not land under a writable mount, a read-only working directory with writable holes.
-The next ones are already known: a working directory mounted as only the paths a
-policy lists inside it, and overlays of trust bundles. Tests of the ordering rules
-today need user namespaces and run in the integration suite only.
+Several of its decisions are already pure, tested helpers: whether the working
+directory is writable, which `write` entries lie inside it, which denied paths lie
+inside a mount, where a decoy may go. What they lack is one place that states the
+order and the outcome of every configured entry. The order is what the next feature
+depends on: mounting the working directory as only the paths listed inside it means
+every entry inside it has to be mounted *after* the working directory, or the
+directory hides it.
+
+Some checks can only run against the sandbox being built: whether a masked path, a
+decoy target or a denied path exists inside the new root, and whether a denied path
+is a symlink there. Planning those as data would mean modelling the sandbox's view of
+the host in the planner, which is more risk in this code than it is worth.
 
 ## Options Considered
 
-### Option 1: A pure `MountPlan`, then an executor (chosen)
-**Description**: A function computes a `MountPlan` from the filesystem config, the
-working directory and what exists on the host (a probe passed in, so tests can fake
-it): an ordered list of steps, each a target, a source and a kind (tmpfs, bind
-read-only, bind writable, bind writable no-exec, mask with `/dev/null`, decoy,
-directory). Skipped entries are in the plan too, with the reason. A second function
-applies a plan with `mount(2)` and changes nothing about it. `can check` can print
-the plan.
+### Option 1: Plan the configured mounts; keep the checks on the new root in the executor (chosen)
+**Description**: A pure function computes a `MountPlan` from the filesystem config,
+the working directory, whether the writable mounts are `noexec`, and a host probe
+(does a host path exist, is it a directory), which tests replace with a fake. The plan
+is an ordered list of steps: bind read-only, bind writable, the `/tmp` tmpfs, the
+working directory, hide a denied path, mask, place a decoy. A `read` or `write` entry
+that will not be mounted is a skipped step with its reason (missing, denied). A
+second function applies the plan; it alone calls `mount(2)` and it alone checks the
+new root (existence, symlinks), as today. The fixed parts (root, skeleton, `/proc`,
+`/dev`, `pivot_root`) stay outside the plan.
 **Pros**:
-- The ordering rules (parents before children, a real grant before a decoy, a deny
-  inside a mount hidden after it) become unit tests on data, without namespaces.
-- A reviewer reads one function that decides, and one that only executes.
-- The next filesystem feature is a rule in the planner, not another step in a
-  sequence.
-- The plan shows a user why a path is or is not visible.
+- The order and outcome of every configured entry are one value, tested without
+  namespaces.
+- A filesystem feature that depends on order is a rule in the planner.
+- No model of the sandbox's view is needed; those checks stay where they are.
 **Cons**:
-- A large refactor of a security-critical file. It has to preserve behaviour
-  exactly, checked by the existing integration tests.
-**Estimated effort**: Medium to high.
+- A refactor of mount code. It must issue the same mounts in the same order, which
+  the existing integration tests check.
+**Estimated effort**: Medium.
 
-### Option 2: Keep the sequence, add integration tests per interaction
-**Description**: Leave the code, test more combinations in namespaces.
+### Option 2: Plan everything, including the checks on the new root
+**Description**: Model which host paths each sandbox path comes from, and decide
+masks, decoys and hidden paths in the planner too.
 **Pros**:
-- No refactor risk.
+- The whole filesystem as data.
 **Cons**:
-- The tests grow with the square of the features, and run only where user
-  namespaces do.
-**Estimated effort**: Medium, recurring.
+- The model of the sandbox's view is new code with the same failure modes as the
+  mounts it describes.
+**Estimated effort**: High.
 
 ## Decision
 
-Option 1, in two steps. First the refactor: the planner and executor reproduce
-today's mounts exactly, the existing integration tests pass unchanged, and the
-planner gets unit tests for every ordering rule `setup_filesystem` encodes today.
-Then features build on it: a working directory mounted as only the paths listed
-inside it is a planner rule.
+Option 1, in two steps.
 
-`/proc`, `/dev` and `pivot_root` stay as they are; they do not depend on
-configuration.
+1. **Refactor.** The planner and the executor issue today's mounts in today's order;
+   the existing unit and integration tests pass unchanged, and the planner gets tests
+   for each rule it encodes.
+2. **`[filesystem] workdir = "listed"`.** The working directory becomes an empty
+   tmpfs. The `read` and `write` entries inside it are mounted into it, after it, and
+   it is then made read-only, so nothing else from the checkout is visible: no `.git`,
+   no untracked files. A file the workload creates in the working directory outside a
+   `write` entry fails as it would in a read-only checkout. When recipes compose, an
+   explicit `listed` wins over `read` and `write`, since it is the narrowest. The
+   resolved policy states it as any other value of `workdir`.
 
 ## Consequences
 
 ### Positive
-- Filesystem rules are tested as data, on any machine.
-- `can check` can explain what the sandbox will see.
+- The order of configured mounts is tested as data.
+- A tool that compiles a closed-world policy can hand `can` exactly the paths a
+  workload may see inside its checkout.
 
 ### Negative
-- A refactor of mount code with no new feature of its own.
+- `listed` needs every path the workload reads inside its checkout to be listed;
+  a missing one is absent, not an error.
 
 ### Neutral
-- No change to what a sandbox sees.
+- `/proc`, `/dev` and `pivot_root` are unchanged.
 
 ## Follow-up Actions
 - [ ] `MountPlan`, the planner with a host probe, the executor
-- [ ] Unit tests for each ordering rule; the integration tests unchanged
+- [ ] `workdir = "listed"`
 - [ ] `can check` prints the plan
-- [ ] `workdir = "listed"`: only the paths listed inside the working directory
