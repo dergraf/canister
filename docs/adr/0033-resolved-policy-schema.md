@@ -27,10 +27,13 @@ an untyped `serde_json::Value` in it.
 ### Option 1: Publish the resolved policy's schema, preview it as JSON with its digest (chosen)
 **Description**: `docs/policy-schema-v1.json` is generated from the config types,
 like the event schema, and checked by the same kind of golden test.
-`can recipe show --format json` prints the resolved policy as the `policy_resolved`
-event will carry it, with the same `policy_sha256`. A tool resolves its recipes
-before the run, compares the result with what it compiled, and later finds the same
-digest in the evidence.
+`can run --print-policy` (and `can up`) prints the resolved policy as the
+`policy_resolved` event will carry it, with the same `policy_sha256`, and exits
+without starting a sandbox. It sits in the run's own path, after what `can run` adds
+itself (the canaries file, `--port`, the masked `canister.toml`), which a
+`can recipe show` preview would miss. A tool resolves its recipes before the run,
+compares the result with what it compiled, and later finds the same digest in the
+evidence.
 **Pros**:
 - Recipes, their trust rules and the merge stay as they are.
 - A tool can verify its compilation against `can`'s own resolution, by digest.
@@ -53,7 +56,8 @@ digest in the evidence.
 ## Decision
 
 Option 1. The digest of the preview and of the event are computed by the same
-function over the same canonical serialization. The schema is versioned with the
+function over the same canonical serialization, through one type that is also the
+published schema. The schema is versioned with the
 file name; a change to it is a golden-test diff in review.
 
 ## Consequences
@@ -69,5 +73,5 @@ file name; a change to it is a golden-test diff in review.
 - Nothing changes for people who write recipes by hand.
 
 ## Follow-up Actions
-- [ ] `docs/policy-schema-v1.json` and its golden test
-- [ ] `can recipe show --format json`, with `policy_sha256`
+- [x] `docs/policy-schema-v1.json` and its golden test
+- [x] `can run --print-policy` and `can up --print-policy`, with `policy_sha256`
