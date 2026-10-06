@@ -130,6 +130,9 @@ except Exception as e:
 begin_test "with overlay_ca_bundles, OpenSSL's default bundle trusts the sandbox CA"
 run_can run --recipe "$OVERLAID" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH"
 assert_eq "from-the-host" "$RUN_STDOUT"
+if [ "$RUN_STDOUT" != "from-the-host" ]; then
+    echo "$RUN_STDERR" | grep -iE "bundle|trust|overlay" | sed 's/^/       can: /'
+fi
 
 begin_test "and so does a project virtualenv's certifi bundle, unchanged on the host"
 PROJECT="$WORK/project"
