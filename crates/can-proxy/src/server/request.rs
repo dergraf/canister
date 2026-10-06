@@ -8,6 +8,7 @@
 //! `Refused(resp)` for an early exit. The dispatcher itself is just a
 //! chain of `?`-style early exits.
 
+use crate::events::ConnectRefusal;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -217,10 +218,10 @@ pub(super) fn tunnel_gate(
         return TunnelGate::Open;
     }
     if dlp_on && super::sink::takes(host, outbound_policy, contracts) {
-        crate::events::egress_blocked(host, "CONNECT", "", crate::events::SINK_REASON);
+        crate::events::egress_blocked(host, "CONNECT", "", ConnectRefusal::Sink);
         TunnelGate::Sunk
     } else {
-        crate::events::egress_blocked(host, "CONNECT", "", "policy");
+        crate::events::egress_blocked(host, "CONNECT", "", ConnectRefusal::Policy);
         TunnelGate::Refused
     }
 }
