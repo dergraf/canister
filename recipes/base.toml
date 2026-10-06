@@ -23,7 +23,7 @@ version = "2"
 # - Shared data files (/usr/share)
 # - Dynamic linker cache and configuration (/etc/ld.so.*)
 # - DNS and network resolution (/etc/resolv.conf, /etc/nsswitch.conf, /etc/hosts)
-# - TLS certificates (/etc/ssl, /etc/ca-certificates)
+# - TLS certificates (/etc/ssl, /etc/ca-certificates, Fedora's /etc/pki trust store)
 # - Timezone data (/etc/localtime)
 # - Alternatives system (/etc/alternatives)
 # - User/group databases (/etc/passwd, /etc/group) — needed by Go, Python, etc.
@@ -49,6 +49,11 @@ read = [
     "/etc/hosts",
     "/etc/ssl",
     "/etc/ca-certificates",
+    # Fedora and RHEL keep the trust store here; /etc/ssl links into it.
+    # Only the trust store: /etc/pki also holds the host's private keys.
+    "/etc/pki/tls/certs",
+    "/etc/pki/tls/cert.pem",
+    "/etc/pki/ca-trust/extracted",
     "/etc/localtime",
     "/etc/alternatives",
     "/etc/passwd",

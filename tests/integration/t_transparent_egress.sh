@@ -146,6 +146,9 @@ assert_contains "$RUN_STDOUT" "failed:"
 run_can run --recipe "$OVERLAID" -- env -i PATH=/usr/bin:/bin python3 -c "$BUNDLE_FETCH" "$CERTIFI"
 popd >/dev/null
 assert_eq "from-the-host" "$RUN_STDOUT"
+if [ "$RUN_STDOUT" != "from-the-host" ]; then
+    echo "$RUN_STDERR" | grep -iE "bundle|trust|overlay|Traceback|Error" | sed 's/^/       can: /'
+fi
 assert_eq "$BEFORE" "$(sha256sum < "$CERTIFI")"
 
 summary
