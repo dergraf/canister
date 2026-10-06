@@ -36,17 +36,25 @@ pub(super) struct ProxyError<'a> {
 pub(super) enum ErrorKind {
     /// Connection-gate refusal. Body mentions whether a domain or an
     /// IP literal was rejected.
-    PolicyBlocked { reason: &'static str },
+    PolicyBlocked {
+        reason: &'static str,
+    },
     /// Request body exceeded `max_streamed_body_bytes` (or
     /// `max_buffered_body_bytes` on the response side).
-    BodyTooLarge { limit: usize },
+    BodyTooLarge {
+        limit: usize,
+    },
     /// Upstream did not respond within the timeout.
-    GatewayTimeout { timeout: Duration },
+    GatewayTimeout {
+        timeout: Duration,
+    },
     /// DLP detector fired. `detector` (set via `with_detector`) populates
     /// `x-canister-dlp-detector`.
     DlpBlocked,
     /// Upstream returned a transport error (TLS, DNS, connect, …).
-    BadGateway { message: String },
+    BadGateway {
+        message: String,
+    },
     /// Generic 400 for malformed inbound requests we can't even parse.
     BadRequest,
     /// Per-destination contract refusal. Body carries the `[[host]]`
@@ -62,6 +70,7 @@ pub(super) enum ErrorKind {
     /// sink (ADR-0018). Identical whatever the detectors found, so the
     /// workload cannot use the sink to probe them.
     Sinked,
+    SinkedRobotsCheck,
 }
 
 impl<'a> ProxyError<'a> {
@@ -104,6 +113,10 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn sinked(host: &'a str) -> Self {
         Self::new(ErrorKind::Sinked, host)
+    }
+
+    pub(super) fn sinked_robots_check(host: &'a str) -> Self {
+        Self::new(ErrorKind::SinkedRobotsCheck, host)
     }
 
     /// Build a contract refusal from a [`crate::contracts::ContractViolation`].
@@ -243,6 +256,11 @@ impl<'a> ProxyError<'a> {
             ),
             ErrorKind::Sinked => (
                 StatusCode::FORBIDDEN,
+                SINK_BODY.to_string(),
+                "undeclared-host-sink",
+            ),
+            ErrorKind::SinkedRobotsCheck => (
+                StatusCode::NOT_FOUND,
                 SINK_BODY.to_string(),
                 "undeclared-host-sink",
             ),
