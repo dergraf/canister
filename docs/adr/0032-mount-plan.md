@@ -89,6 +89,6 @@ Option 1, in two steps.
 - `/proc`, `/dev` and `pivot_root` are unchanged.
 
 ## Follow-up Actions
-- [ ] `MountPlan`, the planner with a host probe, the executor
-- [ ] `workdir = "listed"`
+- [x] `MountPlan`, the planner with a host probe, the executor
+- [x] `workdir = "listed"`
 - [ ] `can check` prints the plan
