@@ -71,6 +71,7 @@ pub(super) enum ErrorKind {
     /// workload cannot use the sink to probe them.
     Sinked,
     SinkedRobotsCheck,
+    ForeignCredential,
 }
 
 impl<'a> ProxyError<'a> {
@@ -117,6 +118,10 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn sinked_robots_check(host: &'a str) -> Self {
         Self::new(ErrorKind::SinkedRobotsCheck, host)
+    }
+
+    pub(super) fn foreign_credential(host: &'a str) -> Self {
+        Self::new(ErrorKind::ForeignCredential, host)
     }
 
     /// Build a contract refusal from a [`crate::contracts::ContractViolation`].
@@ -264,6 +269,15 @@ impl<'a> ProxyError<'a> {
                 SINK_BODY.to_string(),
                 "undeclared-host-sink",
             ),
+            ErrorKind::ForeignCredential => (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "canister: {} takes only the credential the sandbox was given; \
+                     this request carried another one (ADR-0030).\n",
+                    self.host
+                ),
+                "foreign-credential",
+            ),
             ErrorKind::ContractRefused {
                 reason,
                 detail,
@@ -325,6 +339,7 @@ fn static_str(kind: &str) -> &'static str {
         "bad-request" => "bad-request",
         "contract-refused" => "contract-refused",
         "undeclared-host-sink" => "undeclared-host-sink",
+        "foreign-credential" => "foreign-credential",
         _ => "proxy-error",
     }
 }

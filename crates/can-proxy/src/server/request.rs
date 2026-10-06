@@ -250,6 +250,9 @@ pub(super) async fn handle_inner_request(
     let host = extract_host(&req);
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
+    let credential = dlp.as_ref().and_then(|ctx| {
+        super::secret_swap::classify_credential(&ctx.swaps, &ctx.scanner, &host, req.headers())
+    });
     let mut recorder = capture.map(|ctx| ExchangeRecorder::new(ctx, &host));
     let started = std::time::Instant::now();
 
@@ -273,6 +276,7 @@ pub(super) async fn handle_inner_request(
         &path,
         started.elapsed().as_millis() as u64,
         &response,
+        credential,
     );
     if let Some(recorder) = recorder {
         recorder.emit();
@@ -405,6 +409,15 @@ async fn run_request_stages(
     // (which sees the fake) and only on authorized hosts, so the real
     // secret never reaches an unauthorized destination.
     if let Some(ctx) = dlp.as_ref() {
+        // A credential-scoped host takes only the swapped credential
+        // (ADR-0030). Refused here, after the scan and the capture above,
+        // so what the request carried is still evidence.
+        let foreign =
+            super::secret_swap::classify_credential(&ctx.swaps, &ctx.scanner, host, &parts.headers)
+                == Some(super::secret_swap::CredentialUse::Foreign);
+        if ctx.bind_credentials && foreign {
+            return Ok(ProxyError::foreign_credential(host).into_response());
+        }
         super::secret_swap::swap_in_headers(&ctx.swaps, &ctx.scanner, host, &mut parts.headers);
     }
 

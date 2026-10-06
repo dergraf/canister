@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use can_events::schema::{Decision, Event, Location};
+use can_events::schema::{CredentialUse, Decision, Event, Location};
 use sha2::{Digest, Sha256};
 
 /// Sink for DLP events. Production code writes to stderr; tests substitute
@@ -88,6 +88,7 @@ pub(crate) fn egress_request<B>(
     path: &str,
     duration_ms: u64,
     resp: &hyper::Response<B>,
+    credential: Option<CredentialUse>,
 ) {
     let error = resp
         .headers()
@@ -107,6 +108,10 @@ pub(crate) fn egress_request<B>(
         Some("policy-blocked") => (Decision::Blocked, Some("policy".to_string())),
         Some("contract-refused") => (Decision::Blocked, Some("contract".to_string())),
         Some("undeclared-host-sink") => (Decision::Blocked, Some(SINK_REASON.to_string())),
+        Some("foreign-credential") => (
+            Decision::Blocked,
+            Some(FOREIGN_CREDENTIAL_REASON.to_string()),
+        ),
         Some("dlp-blocked") => (
             Decision::Blocked,
             Some(detector.unwrap_or("dlp").to_string()),
@@ -115,8 +120,12 @@ pub(crate) fn egress_request<B>(
     };
 
     crate::server::stats::record_request(decision, duration_ms);
-    emit_egress(host, method, path, decision, reason);
+    emit_egress(host, method, path, decision, reason, credential);
 }
+
+/// `egress_request.reason` for a request to a credential-scoped host that
+/// carried a credential other than the swapped fake (ADR-0030).
+pub(crate) const FOREIGN_CREDENTIAL_REASON: &str = "foreign_credential";
 
 /// `egress_request.reason` for a request (or CONNECT) to an undeclared
 /// host that the sink answered locally (ADR-0018).
@@ -132,10 +141,18 @@ pub(crate) fn egress_blocked(host: &str, method: &str, path: &str, reason: &str)
         path,
         Decision::Blocked,
         Some(reason.to_string()),
+        None,
     );
 }
 
-fn emit_egress(host: &str, method: &str, path: &str, decision: Decision, reason: Option<String>) {
+fn emit_egress(
+    host: &str,
+    method: &str,
+    path: &str,
+    decision: Decision,
+    reason: Option<String>,
+    credential: Option<CredentialUse>,
+) {
     if !can_events::enabled() {
         return;
     }
@@ -145,6 +162,7 @@ fn emit_egress(host: &str, method: &str, path: &str, decision: Decision, reason:
         path: path.to_string(),
         decision,
         reason,
+        credential,
     }));
 }
 
