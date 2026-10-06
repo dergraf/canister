@@ -110,6 +110,11 @@ value. What you observe at the proxy depends on the destination:
   refused with `451 dlp-blocked`, the same as a real credential would
   be. The real value never leaves the proxy.
 
+- **Authorised host, another credential** (with `bind_credentials = true`):
+  a request that carries a credential other than the fake, such as a key the
+  workload brought itself, is refused with `403 foreign-credential`. The host
+  takes only the credential the sandbox was given (ADR-0030).
+
 So a `451 dlp-blocked` naming a faked credential means the sandbox tried
 to send its (fake) token somewhere it isn't authorised. The fix is the
 same as above — add the host to `allow_credentials` if the credential

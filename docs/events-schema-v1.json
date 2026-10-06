@@ -368,6 +368,32 @@
         }
       }
     },
+    "CredentialUse": {
+      "description": "Which credential a request to a credential-scoped host carried, as the workload sent it (ADR-0030).",
+      "oneOf": [
+        {
+          "description": "The fake the sandbox was given, swapped for the real value.",
+          "type": "string",
+          "enum": [
+            "swapped"
+          ]
+        },
+        {
+          "description": "A credential that is not the fake: one the workload brought.",
+          "type": "string",
+          "enum": [
+            "foreign"
+          ]
+        },
+        {
+          "description": "No credential header.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
     "Decision": {
       "description": "Whether the enforcement layer let something through.",
       "type": "string",
@@ -420,6 +446,17 @@
         "path"
       ],
       "properties": {
+        "credential": {
+          "description": "On a host a credential is scoped to: which credential the request carried (ADR-0030). Absent elsewhere.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CredentialUse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "decision": {
           "$ref": "#/definitions/Decision"
         },

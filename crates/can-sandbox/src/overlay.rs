@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::unistd::pivot_root;
 
-use can_policy::config::{FilesystemConfig, WorkdirAccess};
+use can_policy::config::{DecoyMount, FilesystemConfig, WorkdirAccess};
+
+use crate::mount_plan::{self, Access, SkipReason, Step, WorkdirMount};
 
 /// Errors from filesystem setup.
 #[derive(Debug, thiserror::Error)]
@@ -166,65 +168,13 @@ pub fn setup_filesystem(
     // 3. Create the directory skeleton.
     create_skeleton(&sandbox_root)?;
 
-    // 4. Bind-mount all allowed paths (read-only).
-    //    This includes essential OS paths (from base.toml), auto-detected
-    //    package manager paths, and user-specified paths — all merged into
-    //    config.allow via recipe composition.
-    bind_mount_allowed(&sandbox_root, config)?;
-
-    // 4b. Bind-mount writable paths.
-    //     These are paths the sandboxed process must write to (e.g., database
-    //     files, caches, state directories). Changes persist on the host.
-    bind_mount_writable_paths(&sandbox_root, config, writable_noexec)?;
-
-    // 5. Create a writable /tmp inside the sandbox.
-    let sandbox_tmp = sandbox_root.join("tmp");
-    mount_tmpfs(&sandbox_tmp, writable_noexec)?;
-
-    // 5b. Bind-mount the host CWD so the sandboxed process can read and
-    //     write project files (e.g., `mix new`, `cargo build`). With
-    //     `workdir = "read"` (ADR-0024) it is read-only, and the `write`
-    //     entries inside it are mounted again over it so they stay writable.
-    if let Some(cwd) = host_cwd {
-        let rel = cwd.strip_prefix("/").unwrap_or(cwd);
-        let target = sandbox_root.join(rel);
-        if let Some(parent) = target.parent() {
-            mkdir_p(parent)?;
-        }
-        mkdir_p(&target)?;
-        let writable = workdir_writable(config, cwd);
-        if writable {
-            bind_mount_rw(cwd, &target, writable_noexec)?;
-        } else {
-            bind_mount_ro(cwd, &target)?;
-            for source in writable_within(config, cwd) {
-                bind_mount_writable(&sandbox_root, &source, config, writable_noexec)?;
-            }
-        }
-        tracing::info!(
-            source = %cwd.display(),
-            target = %target.display(),
-            writable,
-            noexec = writable_noexec,
-            "CWD bind-mounted"
-        );
+    // 4–5d. The configured mounts (ADR-0032): read and write entries,
+    //       `/tmp`, the working directory, denied paths hidden inside
+    //       mounts, masks, decoys — planned as data, then applied.
+    let plan = mount_plan::plan(config, host_cwd, writable_noexec, &mount_plan::RealHost);
+    for step in &plan {
+        apply_step(&sandbox_root, step)?;
     }
-
-    // 5b'. Hide denied paths that lie inside a mounted path. Mounting skips
-    //      a source that is denied or lies under a denied path, but a denied
-    //      path *below* a mounted one would otherwise come along with its
-    //      parent (`read = ["$HOME"]`, `deny = ["$HOME/.ssh"]`).
-    hide_denied(&sandbox_root, &denied_within_mounts(config, host_cwd))?;
-
-    // 5c. Mask files that should be hidden inside the sandbox.
-    //     This must happen AFTER the CWD bind-mount so the target files
-    //     exist at their expected paths, but BEFORE pivot_root so we still
-    //     have access to /dev/null on the host.
-    mask_files(&sandbox_root, config)?;
-
-    // 5d. Place decoy files (tripwires, ADR-0019) after every real mount,
-    //     so a real grant always wins. Empty list (the default): no-op.
-    bind_mount_decoys(&sandbox_root, config, host_cwd);
 
     // 6. Mount a fresh /proc for PID namespace.
     mount_proc(&sandbox_root)?;
@@ -275,110 +225,118 @@ fn create_skeleton(root: &Path) -> Result<(), OverlayError> {
     Ok(())
 }
 
-/// Bind-mount allowed paths into the sandbox.
-///
-/// This handles all paths in `config.allow`, which includes:
-/// - Essential OS paths (from base.toml)
-/// - Auto-detected package manager paths (from matched recipes)
-/// - User-specified paths (from explicit recipe arguments)
-///
-/// All are merged into a single list via recipe composition.
-fn bind_mount_allowed(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
-    for source in &config.read {
-        if !source.exists() {
-            tracing::warn!(path = %source.display(), "allowed path not found, skipping");
-            continue;
+/// Apply one step of the configured filesystem (ADR-0032). Bind, `/tmp`,
+/// working-directory and hide failures are fatal; a mask or a decoy that
+/// cannot be placed is logged and skipped, as each always was.
+fn apply_step(root: &Path, step: &Step) -> Result<(), OverlayError> {
+    match step {
+        Step::Bind {
+            source,
+            access,
+            is_dir,
+            noexec,
+        } => {
+            let target = in_root(root, source);
+            if let Some(parent) = target.parent() {
+                mkdir_p(parent)?;
+            }
+            if *is_dir {
+                mkdir_p(&target)?;
+            } else {
+                touch(&target)?;
+            }
+            match access {
+                Access::Read => {
+                    bind_mount_ro(source, &target)?;
+                    tracing::debug!(source = %source.display(), target = %target.display(), "allowed path mounted");
+                }
+                Access::Write => {
+                    bind_mount_rw(source, &target, *noexec)?;
+                    tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
+                }
+            }
         }
-
-        // Check if this path is denied.
-        let denied = config.deny.iter().any(|d| source.starts_with(d));
-        if denied {
-            tracing::warn!(path = %source.display(), "allowed path is also in deny list, skipping");
-            continue;
+        Step::Skipped {
+            path,
+            access,
+            reason,
+        } => {
+            let what = match access {
+                Access::Read => "allowed",
+                Access::Write => "writable",
+            };
+            match reason {
+                SkipReason::Missing => {
+                    tracing::warn!(path = %path.display(), "{what} path not found, skipping")
+                }
+                SkipReason::Denied => {
+                    tracing::warn!(path = %path.display(), "{what} path is also in deny list, skipping")
+                }
+            }
         }
-
-        let rel = source.strip_prefix("/").unwrap_or(source);
-        let target = root.join(rel);
-
-        if let Some(parent) = target.parent() {
-            mkdir_p(parent)?;
-        }
-
-        if source.is_dir() {
+        Step::Tmp { noexec } => mount_tmpfs(&root.join("tmp"), *noexec)?,
+        Step::Workdir { cwd, mount, noexec } => {
+            let target = in_root(root, cwd);
+            if let Some(parent) = target.parent() {
+                mkdir_p(parent)?;
+            }
             mkdir_p(&target)?;
-        } else {
-            touch(&target)?;
+            match mount {
+                WorkdirMount::Writable => bind_mount_rw(cwd, &target, *noexec)?,
+                WorkdirMount::ReadOnly => bind_mount_ro(cwd, &target)?,
+                // The listed entries are mounted into it next; it is sealed
+                // read-only after them (`Step::SealWorkdir`).
+                WorkdirMount::Listed => mount_tmpfs(&target, true)?,
+            }
+            tracing::info!(
+                source = %cwd.display(),
+                target = %target.display(),
+                ?mount,
+                noexec,
+                "CWD mounted"
+            );
         }
-
-        bind_mount_ro(source, &target)?;
-        tracing::debug!(source = %source.display(), target = %target.display(), "allowed path mounted");
+        Step::SealWorkdir { cwd } => {
+            let target = in_root(root, cwd);
+            mount(
+                None::<&str>,
+                &target,
+                None::<&str>,
+                MsFlags::MS_REMOUNT
+                    | MsFlags::MS_RDONLY
+                    | MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )
+            .map_err(|source| OverlayError::Mount {
+                path: format!("{} (seal read-only)", target.display()),
+                source,
+            })?;
+            tracing::info!(target = %target.display(), "listed working directory sealed read-only");
+        }
+        Step::Hide { path } => hide_denied(root, std::slice::from_ref(path))?,
+        Step::Mask { path } => mask(root, path),
+        Step::Decoy { decoy, placement } => place_decoy(root, decoy, *placement),
     }
     Ok(())
 }
 
-/// Bind-mount writable paths from `config.allow_write`.
-///
-/// These paths are mounted read-write so the sandboxed process can
-/// persist changes (e.g., databases, caches, state directories).
-/// Denied paths are still checked and skipped.
-fn bind_mount_writable_paths(
-    root: &Path,
-    config: &FilesystemConfig,
-    noexec: bool,
-) -> Result<(), OverlayError> {
-    for source in &config.write {
-        bind_mount_writable(root, source, config, noexec)?;
-    }
-    Ok(())
-}
-
-/// Mount one `write` entry writable, skipping one that does not exist or
-/// that a `deny` entry covers.
-fn bind_mount_writable(
-    root: &Path,
-    source: &Path,
-    config: &FilesystemConfig,
-    noexec: bool,
-) -> Result<(), OverlayError> {
-    if !source.exists() {
-        tracing::warn!(path = %source.display(), "writable path not found, skipping");
-        return Ok(());
-    }
-
-    let denied = config.deny.iter().any(|d| source.starts_with(d));
-    if denied {
-        tracing::warn!(path = %source.display(), "writable path is also in deny list, skipping");
-        return Ok(());
-    }
-
-    let rel = source.strip_prefix("/").unwrap_or(source);
-    let target = root.join(rel);
-
-    if let Some(parent) = target.parent() {
-        mkdir_p(parent)?;
-    }
-
-    if source.is_dir() {
-        mkdir_p(&target)?;
-    } else {
-        touch(&target)?;
-    }
-
-    bind_mount_rw(source, &target, noexec)?;
-    tracing::debug!(source = %source.display(), target = %target.display(), noexec, "writable path mounted");
-    Ok(())
+/// Where a host path appears inside the sandbox root.
+fn in_root(root: &Path, path: &Path) -> PathBuf {
+    root.join(path.strip_prefix("/").unwrap_or(path))
 }
 
 /// Whether the working directory is mounted writable: unless
 /// `workdir = "read"` (ADR-0024), or a `write` entry covers it anyway.
-fn workdir_writable(config: &FilesystemConfig, cwd: &Path) -> bool {
+pub(crate) fn workdir_writable(config: &FilesystemConfig, cwd: &Path) -> bool {
     config.workdir() == WorkdirAccess::Write || config.write.iter().any(|w| cwd.starts_with(w))
 }
 
 /// The `write` entries strictly inside a read-only working directory:
 /// mounted before it, they would be hidden by it, so they are mounted
 /// again on top.
-fn writable_within(config: &FilesystemConfig, cwd: &Path) -> Vec<PathBuf> {
+pub(crate) fn writable_within(config: &FilesystemConfig, cwd: &Path) -> Vec<PathBuf> {
     config
         .write
         .iter()
@@ -390,7 +348,10 @@ fn writable_within(config: &FilesystemConfig, cwd: &Path) -> Vec<PathBuf> {
 /// Deny entries that lie strictly inside a path that will be mounted: a
 /// `read` or `write` entry, or the working directory. Mount sources that
 /// are themselves denied are skipped by the mount loops and do not count.
-fn denied_within_mounts(config: &FilesystemConfig, host_cwd: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn denied_within_mounts(
+    config: &FilesystemConfig,
+    host_cwd: Option<&Path>,
+) -> Vec<PathBuf> {
     let is_denied = |path: &Path| config.deny.iter().any(|d| path.starts_with(d));
     let mounted: Vec<&Path> = config
         .read
@@ -469,14 +430,14 @@ fn hide_denied(root: &Path, denied: &[PathBuf]) -> Result<(), OverlayError> {
 /// working directory would create its parent directories *on the host*
 /// (the mount is a live bind), and under a read-only mount `mkdir` fails;
 /// in both cases the path is the real grant's to fill, not the decoy's.
-#[derive(Debug, PartialEq, Eq)]
-enum DecoyPlacement {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecoyPlacement {
     Place,
     UnderWritable,
     UnderReadable,
 }
 
-fn decoy_placement(
+pub(crate) fn decoy_placement(
     target: &Path,
     config: &FilesystemConfig,
     host_cwd: Option<&Path>,
@@ -496,57 +457,49 @@ fn decoy_placement(
     }
 }
 
-/// Bind-mount each materialised decoy read-only at its sandbox path, so
-/// that the host side can watch it (ADR-0019). Skips, with a log line,
-/// rather than fails: a tripwire that cannot be placed must not stop the
-/// run, and the CLI reports which decoys it watches.
-fn bind_mount_decoys(root: &Path, config: &FilesystemConfig, host_cwd: Option<&Path>) {
-    for decoy in &config.decoys {
-        let rel = decoy.target.strip_prefix("/").unwrap_or(&decoy.target);
-        let target = root.join(rel);
+/// Bind-mount a materialised decoy read-only at its sandbox path, so that
+/// the host side can watch it (ADR-0019). Skips, with a log line, rather
+/// than fails: a tripwire that cannot be placed must not stop the run,
+/// and the CLI reports which decoys it watches.
+fn place_decoy(root: &Path, decoy: &DecoyMount, placement: DecoyPlacement) {
+    let target = in_root(root, &decoy.target);
 
-        if std::fs::symlink_metadata(&target).is_ok() {
-            tracing::debug!(path = %decoy.target.display(), "a real path exists; decoy not placed");
-            continue;
-        }
+    if std::fs::symlink_metadata(&target).is_ok() {
+        tracing::debug!(path = %decoy.target.display(), "a real path exists; decoy not placed");
+        return;
+    }
 
-        match decoy_placement(&decoy.target, config, host_cwd) {
-            DecoyPlacement::Place => {}
-            placement => {
-                tracing::warn!(path = %decoy.target.display(), ?placement, "decoy not placed");
-                continue;
-            }
-        }
+    if placement != DecoyPlacement::Place {
+        tracing::warn!(path = %decoy.target.display(), ?placement, "decoy not placed");
+        return;
+    }
 
-        let placed = target
-            .parent()
-            .map_or(Ok(()), mkdir_p)
-            .and_then(|()| touch(&target))
-            .and_then(|()| bind_mount_ro(&decoy.source, &target));
+    let placed = target
+        .parent()
+        .map_or(Ok(()), mkdir_p)
+        .and_then(|()| touch(&target))
+        .and_then(|()| bind_mount_ro(&decoy.source, &target));
 
-        match placed {
-            Ok(()) => tracing::info!(path = %decoy.target.display(), "decoy placed"),
-            Err(e) => {
-                tracing::warn!(path = %decoy.target.display(), error = %e, "decoy not placed")
-            }
+    match placed {
+        Ok(()) => tracing::info!(path = %decoy.target.display(), "decoy placed"),
+        Err(e) => {
+            tracing::warn!(path = %decoy.target.display(), error = %e, "decoy not placed")
         }
     }
 }
 
-/// Mask files inside the sandbox by bind-mounting `/dev/null` over them.
+/// Mask a file inside the sandbox by bind-mounting `/dev/null` over it,
+/// or a directory with an empty tmpfs. Non-fatal: a mask that cannot be
+/// applied is logged.
 ///
 /// This is used for anti-detection: files like `canister.toml` that exist
 /// inside the CWD bind-mount are hidden from the sandboxed process. The
 /// file appears to exist (as an empty special file) but returns EOF on read,
 /// preventing the sandboxed process from discovering the sandbox policy.
 ///
-/// Must be called AFTER the CWD bind-mount (so the files exist at their
-/// target paths) and BEFORE `pivot_root`.
-fn mask_files(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError> {
-    if config.mask.is_empty() {
-        return Ok(());
-    }
-
+/// Applied AFTER the CWD bind-mount (so the files exist at their target
+/// paths) and BEFORE `pivot_root`; the plan orders it so.
+fn mask(root: &Path, path: &Path) {
     let dev_null = root.join("dev/null");
     // Fall back to host /dev/null if sandbox /dev isn't set up yet.
     let dev_null = if dev_null.exists() {
@@ -555,73 +508,68 @@ fn mask_files(root: &Path, config: &FilesystemConfig) -> Result<(), OverlayError
         PathBuf::from("/dev/null")
     };
 
-    for path in &config.mask {
-        let rel = path.strip_prefix("/").unwrap_or(path);
-        let target = root.join(rel);
+    let target = in_root(root, path);
 
-        if !target.exists() {
-            tracing::debug!(
-                path = %path.display(),
-                target = %target.display(),
-                "mask target does not exist, skipping"
-            );
-            continue;
-        }
+    if !target.exists() {
+        tracing::debug!(
+            path = %path.display(),
+            target = %target.display(),
+            "mask target does not exist, skipping"
+        );
+        return;
+    }
 
-        if target.is_dir() {
-            // Mask directories by mounting an empty tmpfs over them, making
-            // the contents invisible to the sandboxed process.
-            match mount(
-                None::<&str>,
-                &target,
-                Some("tmpfs"),
-                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-                Some("size=0"),
-            ) {
-                Ok(()) => {
-                    tracing::info!(
-                        path = %path.display(),
-                        target = %target.display(),
-                        "masked directory (empty tmpfs)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        target = %target.display(),
-                        error = %e,
-                        "failed to mask directory (non-fatal)"
-                    );
-                }
+    if target.is_dir() {
+        // Mask directories by mounting an empty tmpfs over them, making
+        // the contents invisible to the sandboxed process.
+        match mount(
+            None::<&str>,
+            &target,
+            Some("tmpfs"),
+            MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            Some("size=0"),
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "masked directory (empty tmpfs)"
+                );
             }
-        } else {
-            match mount(
-                Some(&dev_null),
-                &target,
-                None::<&str>,
-                MsFlags::MS_BIND,
-                None::<&str>,
-            ) {
-                Ok(()) => {
-                    tracing::info!(
-                        path = %path.display(),
-                        target = %target.display(),
-                        "masked file (bind /dev/null)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        target = %target.display(),
-                        error = %e,
-                        "failed to mask file (non-fatal)"
-                    );
-                }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    error = %e,
+                    "failed to mask directory (non-fatal)"
+                );
+            }
+        }
+    } else {
+        match mount(
+            Some(&dev_null),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    "masked file (bind /dev/null)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    target = %target.display(),
+                    error = %e,
+                    "failed to mask file (non-fatal)"
+                );
             }
         }
     }
-
-    Ok(())
 }
 
 /// Mount /proc inside the sandbox for the new PID namespace.

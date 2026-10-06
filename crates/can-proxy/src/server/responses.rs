@@ -19,6 +19,10 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Response, StatusCode};
 use tracing::warn;
 
+use can_events::schema::Decision;
+
+use crate::events::{FOREIGN_CREDENTIAL_REASON, RecordedDecision, SINK_REASON};
+
 pub(super) type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// Builder for a proxy-originated HTTP response. Each variant of
@@ -36,17 +40,25 @@ pub(super) struct ProxyError<'a> {
 pub(super) enum ErrorKind {
     /// Connection-gate refusal. Body mentions whether a domain or an
     /// IP literal was rejected.
-    PolicyBlocked { reason: &'static str },
+    PolicyBlocked {
+        reason: &'static str,
+    },
     /// Request body exceeded `max_streamed_body_bytes` (or
     /// `max_buffered_body_bytes` on the response side).
-    BodyTooLarge { limit: usize },
+    BodyTooLarge {
+        limit: usize,
+    },
     /// Upstream did not respond within the timeout.
-    GatewayTimeout { timeout: Duration },
+    GatewayTimeout {
+        timeout: Duration,
+    },
     /// DLP detector fired. `detector` (set via `with_detector`) populates
     /// `x-canister-dlp-detector`.
     DlpBlocked,
     /// Upstream returned a transport error (TLS, DNS, connect, …).
-    BadGateway { message: String },
+    BadGateway {
+        message: String,
+    },
     /// Generic 400 for malformed inbound requests we can't even parse.
     BadRequest,
     /// Per-destination contract refusal. Body carries the `[[host]]`
@@ -62,6 +74,46 @@ pub(super) enum ErrorKind {
     /// sink (ADR-0018). Identical whatever the detectors found, so the
     /// workload cannot use the sink to probe them.
     Sinked,
+    SinkedRobotsCheck,
+    ForeignCredential,
+}
+
+impl ErrorKind {
+    /// The `x-canister-error` value a client sees.
+    pub(super) fn header(&self) -> &'static str {
+        match self {
+            Self::PolicyBlocked { .. } => "policy-blocked",
+            Self::BodyTooLarge { .. } => "body-too-large",
+            Self::GatewayTimeout { .. } => "upstream-timeout",
+            Self::DlpBlocked => "dlp-blocked",
+            Self::BadGateway { .. } => "upstream-error",
+            Self::BadRequest => "bad-request",
+            Self::Sinked | Self::SinkedRobotsCheck => "undeclared-host-sink",
+            Self::ForeignCredential => "foreign-credential",
+            Self::ContractRefused { .. } => "contract-refused",
+        }
+    }
+
+    /// What `egress_request` records for a response of this kind.
+    /// Upstream failures are not refusals: policy let the request out and
+    /// the destination (or the network) failed afterwards.
+    pub(super) fn recorded(&self, detector: Option<&str>) -> RecordedDecision {
+        let (decision, reason) = match self {
+            Self::GatewayTimeout { .. } => (Decision::Allowed, "upstream-timeout"),
+            Self::BadGateway { .. } => (Decision::Allowed, "upstream-error"),
+            Self::PolicyBlocked { .. } => (Decision::Blocked, "policy"),
+            Self::ContractRefused { .. } => (Decision::Blocked, "contract"),
+            Self::Sinked | Self::SinkedRobotsCheck => (Decision::Blocked, SINK_REASON),
+            Self::ForeignCredential => (Decision::Blocked, FOREIGN_CREDENTIAL_REASON),
+            Self::DlpBlocked => (Decision::Blocked, detector.unwrap_or("dlp")),
+            Self::BodyTooLarge { .. } => (Decision::Blocked, "body-too-large"),
+            Self::BadRequest => (Decision::Blocked, "bad-request"),
+        };
+        RecordedDecision {
+            decision,
+            reason: Some(reason.to_string()),
+        }
+    }
 }
 
 impl<'a> ProxyError<'a> {
@@ -104,6 +156,14 @@ impl<'a> ProxyError<'a> {
 
     pub(super) fn sinked(host: &'a str) -> Self {
         Self::new(ErrorKind::Sinked, host)
+    }
+
+    pub(super) fn sinked_robots_check(host: &'a str) -> Self {
+        Self::new(ErrorKind::SinkedRobotsCheck, host)
+    }
+
+    pub(super) fn foreign_credential(host: &'a str) -> Self {
+        Self::new(ErrorKind::ForeignCredential, host)
     }
 
     /// Build a contract refusal from a [`crate::contracts::ContractViolation`].
@@ -195,24 +255,21 @@ impl<'a> ProxyError<'a> {
     }
 
     pub(super) fn into_response(self) -> Response<ProxyBody> {
-        let (status, body, header_kind) = match &self.kind {
+        let (status, body) = match &self.kind {
             ErrorKind::PolicyBlocked { reason } => {
                 warn!("policy refusal: {} for {}", reason, self.host);
                 (
                     StatusCode::BAD_GATEWAY,
                     format!("Bad Gateway: {reason} not allowed by policy"),
-                    "policy-blocked",
                 )
             }
             ErrorKind::BodyTooLarge { limit } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Payload too large: buffered body exceeded {limit} bytes"),
-                "body-too-large",
             ),
             ErrorKind::GatewayTimeout { timeout } => (
                 StatusCode::GATEWAY_TIMEOUT,
                 format!("Gateway Timeout: upstream did not respond within {timeout:?}"),
-                "upstream-timeout",
             ),
             ErrorKind::DlpBlocked => {
                 let detector = self.detector.unwrap_or("dlp");
@@ -228,23 +285,21 @@ impl<'a> ProxyError<'a> {
                 (
                     StatusCode::from_u16(451).unwrap_or(StatusCode::FORBIDDEN),
                     format!("Unavailable For Legal Reasons: DLP policy violation ({detector})"),
-                    "dlp-blocked",
                 )
             }
-            ErrorKind::BadGateway { message } => (
-                StatusCode::BAD_GATEWAY,
-                format!("Bad Gateway: {message}"),
-                "upstream-error",
-            ),
-            ErrorKind::BadRequest => (
-                StatusCode::BAD_REQUEST,
-                "Bad Request".to_string(),
-                "bad-request",
-            ),
-            ErrorKind::Sinked => (
+            ErrorKind::BadGateway { message } => {
+                (StatusCode::BAD_GATEWAY, format!("Bad Gateway: {message}"))
+            }
+            ErrorKind::BadRequest => (StatusCode::BAD_REQUEST, "Bad Request".to_string()),
+            ErrorKind::Sinked => (StatusCode::FORBIDDEN, SINK_BODY.to_string()),
+            ErrorKind::SinkedRobotsCheck => (StatusCode::NOT_FOUND, SINK_BODY.to_string()),
+            ErrorKind::ForeignCredential => (
                 StatusCode::FORBIDDEN,
-                SINK_BODY.to_string(),
-                "undeclared-host-sink",
+                format!(
+                    "canister: {} takes only the credential the sandbox was given; \
+                     this request carried another one (ADR-0030).\n",
+                    self.host
+                ),
             ),
             ErrorKind::ContractRefused {
                 reason,
@@ -271,7 +326,7 @@ impl<'a> ProxyError<'a> {
                 } else {
                     StatusCode::UNSUPPORTED_MEDIA_TYPE
                 };
-                (status, body, "contract-refused")
+                (status, body)
             }
         };
 
@@ -279,8 +334,11 @@ impl<'a> ProxyError<'a> {
         *resp.status_mut() = status;
         resp.headers_mut().insert(
             HeaderName::from_static("x-canister-error"),
-            HeaderValue::from_static(static_str(header_kind)),
+            HeaderValue::from_static(self.kind.header()),
         );
+        // What `egress_request` records, carried as a value (ADR-0031).
+        resp.extensions_mut()
+            .insert(self.kind.recorded(self.detector));
         if let Some(det) = self.detector {
             if let Ok(val) = HeaderValue::from_str(det) {
                 resp.headers_mut()
@@ -294,22 +352,6 @@ impl<'a> ProxyError<'a> {
 /// Body of every sink answer. Fixed, so it carries nothing about the
 /// request or about what the detectors found.
 pub(super) const SINK_BODY: &str = "Forbidden: host not declared; request not forwarded";
-
-/// Map an error-kind string to its `'static str` form. We have a closed
-/// set of variants here so a `match` is simpler than runtime interning.
-fn static_str(kind: &str) -> &'static str {
-    match kind {
-        "policy-blocked" => "policy-blocked",
-        "body-too-large" => "body-too-large",
-        "upstream-timeout" => "upstream-timeout",
-        "dlp-blocked" => "dlp-blocked",
-        "upstream-error" => "upstream-error",
-        "bad-request" => "bad-request",
-        "contract-refused" => "contract-refused",
-        "undeclared-host-sink" => "undeclared-host-sink",
-        _ => "proxy-error",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Body builders
@@ -325,4 +367,107 @@ pub(super) fn body_from<T: Into<Bytes>>(chunk: T) -> ProxyBody {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    /// Every refusal, its header and what `egress_request` records: one
+    /// table, so a change to any of them is a visible diff (ADR-0031).
+    #[test]
+    fn each_kind_states_its_header_and_its_recorded_decision() {
+        let blocked = |reason: &str| (Decision::Blocked, Some(reason.to_string()));
+        let allowed = |reason: &str| (Decision::Allowed, Some(reason.to_string()));
+        let contract = ErrorKind::ContractRefused {
+            reason: "path-not-allowed",
+            detail: String::new(),
+            patch: String::new(),
+        };
+        let table = [
+            (
+                ErrorKind::PolicyBlocked { reason: "domain" },
+                None,
+                "policy-blocked",
+                blocked("policy"),
+            ),
+            (
+                ErrorKind::BodyTooLarge { limit: 1 },
+                None,
+                "body-too-large",
+                blocked("body-too-large"),
+            ),
+            (
+                ErrorKind::GatewayTimeout {
+                    timeout: Duration::from_secs(1),
+                },
+                None,
+                "upstream-timeout",
+                allowed("upstream-timeout"),
+            ),
+            (
+                ErrorKind::DlpBlocked,
+                Some("github_pat"),
+                "dlp-blocked",
+                blocked("github_pat"),
+            ),
+            (ErrorKind::DlpBlocked, None, "dlp-blocked", blocked("dlp")),
+            (
+                ErrorKind::BadGateway {
+                    message: String::new(),
+                },
+                None,
+                "upstream-error",
+                allowed("upstream-error"),
+            ),
+            (
+                ErrorKind::BadRequest,
+                None,
+                "bad-request",
+                blocked("bad-request"),
+            ),
+            (
+                ErrorKind::Sinked,
+                None,
+                "undeclared-host-sink",
+                blocked("sink"),
+            ),
+            (
+                ErrorKind::SinkedRobotsCheck,
+                None,
+                "undeclared-host-sink",
+                blocked("sink"),
+            ),
+            (
+                ErrorKind::ForeignCredential,
+                None,
+                "foreign-credential",
+                blocked("foreign_credential"),
+            ),
+            (contract, None, "contract-refused", blocked("contract")),
+        ];
+
+        for (kind, detector, header, (decision, reason)) in table {
+            assert_eq!(kind.header(), header);
+            let recorded = kind.recorded(detector);
+            assert_eq!(
+                (recorded.decision, recorded.reason),
+                (decision, reason),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_built_response_carries_its_decision_and_its_header() {
+        let resp = ProxyError::foreign_credential("api.example").into_response();
+        assert_eq!(resp.headers()["x-canister-error"], "foreign-credential");
+        assert_eq!(
+            resp.extensions().get::<RecordedDecision>(),
+            Some(&RecordedDecision {
+                decision: Decision::Blocked,
+                reason: Some("foreign_credential".to_string()),
+            })
+        );
+    }
 }
