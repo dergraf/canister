@@ -136,6 +136,13 @@
       "description": "Data Loss Prevention configuration for the egress proxy.\n\nWhen enabled, the proxy scans outbound requests for credential patterns (GitHub PATs, npm tokens, AWS keys, etc.) and enforces per-detector domain scoping: each token type can only flow to its home service.",
       "type": "object",
       "properties": {
+        "bind_credentials": {
+          "description": "Refuse a request to a host a credential is scoped to when it carries a credential other than the fake the sandbox was given: one the workload brought itself (ADR-0030). Default: false. Any layer turning it on wins.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "canary_tokens": {
           "description": "Inject canary tokens (fake credentials) into the sandbox environment to detect exfiltration attempts. Default: true when DLP is enabled.",
           "default": null,
@@ -795,6 +802,13 @@
           "type": "string",
           "enum": [
             "read"
+          ]
+        },
+        {
+          "description": "Only the `read` and `write` entries inside it are visible; the rest of the checkout is absent, and the directory itself is read-only (ADR-0032).",
+          "type": "string",
+          "enum": [
+            "listed"
           ]
         }
       ]
